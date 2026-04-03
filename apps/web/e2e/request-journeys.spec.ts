@@ -11,7 +11,9 @@ test.describe("Request browser journeys", () => {
     const title = `Browser Journey ${suffix}`;
 
     await loginAsPlatformAdmin(page);
-    await page.goto("/requests/new?template=tmpl_assessment@1.4.0");
+    await page.goto("/requests/new");
+    await expect(page.getByRole("heading", { name: "Select Request Template" })).toBeVisible();
+    await page.getByRole("link", { name: /Assessment Revision/i }).click();
 
     await page.getByLabel("Title").fill(title);
     await page.getByLabel("Summary").fill("Validate browser request creation and drill-down.");

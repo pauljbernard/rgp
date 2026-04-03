@@ -109,7 +109,6 @@ The goal is not merely feature breadth. It is to guarantee that governed work re
 
 RGP is most valuable where work is high-consequence and cross-functional, for example:
 
-- curriculum and assessment governance
 - regulated operational changes
 - governed AI and automation rollouts
 - multi-team release and approval workflows
