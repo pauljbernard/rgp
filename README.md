@@ -97,3 +97,16 @@ Commercial use is not permitted under the public repository licenses.
 
 This is a noncommercial source-available posture, not an OSI-approved open-source software
 license. See [LICENSE.md](/Volumes/data/development/rgp/LICENSE.md).
+
+## Contributions And Commercial Rights
+
+Outside contributions are accepted only under the repository's contributor policy and CLA:
+
+- [CONTRIBUTING.md](/Volumes/data/development/rgp/CONTRIBUTING.md)
+- [CLA.md](/Volumes/data/development/rgp/CLA.md)
+
+In substance:
+
+- all commercial-use rights are reserved under the public repository licenses
+- commercial exceptions are granted only by the copyright holder
+- contributions are accepted only under terms that preserve the maintainer's right to offer separate commercial licenses and other commercial exceptions in the future

@@ -55,3 +55,14 @@ under an OSI-approved open-source software license.
 
 If you need commercial use rights, obtain separate written permission from
 the copyright holder(s).
+
+## Contributions And Commercial Exceptions
+
+All commercial-use rights in the public repository are reserved except where separately granted in writing by the copyright holder.
+
+Commercial exceptions, separate commercial licenses, and any future relicensing decisions are controlled exclusively by the copyright holder(s) or their authorized designee(s).
+
+Outside contributions are accepted only under terms that preserve those rights. See:
+
+- [CONTRIBUTING.md](/Volumes/data/development/rgp/CONTRIBUTING.md)
+- [CLA.md](/Volumes/data/development/rgp/CLA.md)
