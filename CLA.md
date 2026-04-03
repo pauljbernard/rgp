@@ -2,13 +2,15 @@
 
 This Contributor License Agreement governs contributions to the Request Governance Platform (RGP).
 
+For avoidance of doubt, the grantee of the rights described in this agreement is **Paul Bernard**, acting as the project maintainer and copyright controller for the Project, together with any legal entity he may designate as successor maintainer or rights holder.
+
 ## 1. Definitions
 
 For this agreement:
 
 - **Project** means the Request Governance Platform repository and related materials.
 - **Contribution** means any code, documentation, design, specification, test, example, asset, or other material submitted for inclusion in the Project.
-- **Maintainer** means the copyright holder or entity controlling the Project and accepting contributions.
+- **Maintainer** means **Paul Bernard**, or a legal entity designated by Paul Bernard to control, maintain, license, or commercialize the Project.
 - **You** means the individual or legal entity making the Contribution.
 
 ## 2. Your Representations
@@ -25,7 +27,7 @@ You retain ownership of your Contribution, subject to the rights granted below.
 
 ## 4. License Grant To Maintainer
 
-You grant to the Maintainer a perpetual, worldwide, non-exclusive, irrevocable, transferable, sublicensable, royalty-free license to:
+You grant to Paul Bernard, as Maintainer, a perpetual, worldwide, non-exclusive, irrevocable, transferable, sublicensable, royalty-free license to:
 
 - use
 - reproduce
@@ -41,27 +43,27 @@ You grant to the Maintainer a perpetual, worldwide, non-exclusive, irrevocable, 
 
 the Contribution, in whole or in part, in any medium and under any license terms, including proprietary, source-available, noncommercial, commercial, and dual-license arrangements.
 
-This grant is intended to preserve the Maintainer's exclusive ability to offer separate commercial exceptions and commercial licenses for the Project.
+This grant is intended to preserve Paul Bernard's exclusive ability to offer separate commercial exceptions, commercial licenses, sublicenses, and future relicensing arrangements for the Project.
 
 ## 5. Patent Grant
 
-To the extent you hold any patent claims necessarily infringed by your Contribution alone or by combination of your Contribution with the Project as it existed when submitted, you grant the Maintainer and recipients of the Contribution through the Project a perpetual, worldwide, non-exclusive, irrevocable, royalty-free patent license to make, have made, use, sell, offer for sale, import, and otherwise transfer the Contribution.
+To the extent you hold any patent claims necessarily infringed by your Contribution alone or by combination of your Contribution with the Project as it existed when submitted, you grant Paul Bernard, as Maintainer, and recipients of the Contribution through the Project a perpetual, worldwide, non-exclusive, irrevocable, royalty-free patent license to make, have made, use, sell, offer for sale, import, and otherwise transfer the Contribution.
 
 ## 6. Public Repository Licensing
 
 You understand and agree that:
 
 - the public repository is distributed under noncommercial public licenses
-- all commercial-use rights are reserved unless separately granted in writing by the copyright holder
-- the Maintainer may grant commercial exceptions or offer separate commercial licenses without being required to extend those rights generally to the public or to all contributors
+- all commercial-use rights are reserved unless separately granted in writing by Paul Bernard or his authorized designee
+- Paul Bernard may grant commercial exceptions or offer separate commercial licenses without being required to extend those rights generally to the public or to all contributors
 
 ## 7. Moral Rights And Waivers
 
-To the extent permitted by applicable law, you waive or agree not to assert any moral rights, droit moral, or similar rights against the Maintainer or its licensees to the extent necessary to exercise the rights granted under this agreement.
+To the extent permitted by applicable law, you waive or agree not to assert any moral rights, droit moral, or similar rights against Paul Bernard, any designated successor Maintainer, or their licensees to the extent necessary to exercise the rights granted under this agreement.
 
 ## 8. No Obligation To Accept Contributions
 
-Nothing in this agreement obligates the Maintainer to accept, use, distribute, or continue to use any Contribution.
+Nothing in this agreement obligates Paul Bernard, any designated successor Maintainer, or the Project to accept, use, distribute, or continue to use any Contribution.
 
 ## 9. Submission As Acceptance
 

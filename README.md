@@ -108,5 +108,5 @@ Outside contributions are accepted only under the repository's contributor polic
 In substance:
 
 - all commercial-use rights are reserved under the public repository licenses
-- commercial exceptions are granted only by the copyright holder
-- contributions are accepted only under terms that preserve the maintainer's right to offer separate commercial licenses and other commercial exceptions in the future
+- commercial exceptions are granted only by Paul Bernard or his authorized designee
+- contributions are accepted only under terms that preserve Paul Bernard's right to offer separate commercial licenses and other commercial exceptions in the future
