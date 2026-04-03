@@ -417,9 +417,27 @@ export type AgentTrendPoint = {
 
 export type UserRecord = {
   id: string;
+  tenant_id: string;
   display_name: string;
   email: string;
   role_summary: string[];
+  status: string;
+  has_password: boolean;
+  password_reset_required: boolean;
+  registration_request_id?: string | null;
+};
+
+export type TenantRecord = {
+  id: string;
+  name: string;
+  status: string;
+  organization_count: number;
+};
+
+export type OrganizationRecord = {
+  id: string;
+  tenant_id: string;
+  name: string;
   status: string;
 };
 
@@ -432,6 +450,9 @@ export type TeamMemberRecord = {
 
 export type TeamRecord = {
   id: string;
+  tenant_id: string;
+  organization_id: string;
+  organization_name: string;
   name: string;
   kind: string;
   status: string;
@@ -441,10 +462,37 @@ export type TeamRecord = {
 
 export type PortfolioRecord = {
   id: string;
+  tenant_id: string;
   name: string;
   status: string;
   owner_team_id: string;
   scope_keys: string[];
+};
+
+export type PublicTenantOption = {
+  id: string;
+  name: string;
+  status: string;
+};
+
+export type PublicOrganizationOption = {
+  id: string;
+  name: string;
+  status: string;
+};
+
+export type PublicTeamOption = {
+  id: string;
+  organization_id: string;
+  name: string;
+  kind: string;
+  status: string;
+};
+
+export type RegistrationOptions = {
+  tenants: PublicTenantOption[];
+  organizations: PublicOrganizationOption[];
+  teams: PublicTeamOption[];
 };
 
 export type PortfolioSummary = {
@@ -465,6 +513,9 @@ export type CreateUserInput = {
   email: string;
   role_summary?: string[];
   status?: string;
+  password?: string;
+  password_reset_required?: boolean;
+  registration_request_id?: string | null;
 };
 
 export type UpdateUserInput = {
@@ -472,18 +523,52 @@ export type UpdateUserInput = {
   email: string;
   role_summary?: string[];
   status?: string;
+  password?: string;
+  password_reset_required?: boolean | null;
+  reset_password?: boolean;
 };
 
 export type CreateTeamInput = {
   id: string;
+  organization_id: string;
   name: string;
   kind?: string;
   status?: string;
 };
 
 export type UpdateTeamInput = {
+  organization_id: string;
   name: string;
   kind?: string;
+  status?: string;
+};
+
+export type CreateOrganizationInput = {
+  id: string;
+  tenant_id?: string | null;
+  name: string;
+  status?: string;
+};
+
+export type CreateTenantInput = {
+  id: string;
+  name: string;
+  status?: string;
+};
+
+export type UpdateTenantInput = {
+  name: string;
+  status?: string;
+};
+
+export type Principal = {
+  user_id: string;
+  tenant_id: string;
+  roles: string[];
+};
+
+export type UpdateOrganizationInput = {
+  name: string;
   status?: string;
 };
 

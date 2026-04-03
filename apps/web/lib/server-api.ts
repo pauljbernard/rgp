@@ -11,8 +11,10 @@ import type {
   CapabilityDetail,
   CapabilityRecord,
   CreateIntegrationInput,
+  CreateOrganizationInput,
   CreatePortfolioInput,
   CreateTeamInput,
+  CreateTenantInput,
   CreateUserInput,
   DeliveryDoraRow,
   DeliveryForecastPoint,
@@ -29,8 +31,10 @@ import type {
   PerformanceRouteSummary,
   PerformanceSloSummary,
   PerformanceTrendPoint,
+  Principal,
   PromotionAction,
   PromotionDetail,
+  RegistrationOptions,
   RequestDetail,
   RequestPriority,
   RequestRecord,
@@ -38,14 +42,18 @@ import type {
   ReviewDecision,
   ReviewQueueItem,
   TeamRecord,
+  TenantRecord,
   UpdateTeamInput,
+  UpdateTenantInput,
   RunDetail,
   RunRecord,
   RunCommand,
   TemplateRecord,
   TemplateValidationResult,
   IntegrationRecord,
+  OrganizationRecord,
   UpdateIntegrationInput,
+  UpdateOrganizationInput,
   UpdateUserInput,
   AuditEntry,
   UserRecord,
@@ -149,6 +157,11 @@ async function requestWithOptions<T>(path: string, init: RequestInit): Promise<T
     redirect("/login");
   }
 
+  if (response.status === 403) {
+    const from = encodeURIComponent(path);
+    redirect(`/forbidden?from=${from}`);
+  }
+
   if (!response.ok) {
     let detail = `Request failed: ${response.status}`;
     try {
@@ -167,6 +180,16 @@ async function requestWithOptions<T>(path: string, init: RequestInit): Promise<T
 
 async function request<T>(path: string): Promise<T> {
   return requestWithOptions<T>(path, {});
+}
+
+async function publicRequest<T>(path: string): Promise<T> {
+  const response = await fetch(`${apiBaseUrl}${path}`, {
+    cache: "no-store"
+  });
+  if (!response.ok) {
+    throw new Error(`Request failed: ${response.status}`);
+  }
+  return (await response.json()) as T;
 }
 
 export function listRequests(params: RequestListParams = {}) {
@@ -191,6 +214,14 @@ export function createRequestDraft(payload: CreateRequestDraftInput) {
 
 export function listTemplates() {
   return request<TemplateRecord[]>("/api/v1/templates");
+}
+
+export function listPublicRegistrationOptions(tenantId = "tenant_demo") {
+  return publicRequest<RegistrationOptions>(withQuery("/api/v1/auth/registration-options", { tenant_id: tenantId }));
+}
+
+export function getCurrentPrincipal() {
+  return request<Principal>("/api/v1/auth/me");
 }
 
 export function getRequest(requestId: string) {
@@ -688,6 +719,42 @@ export function deleteIntegration(integrationId: string) {
 
 export function listAdminUsers() {
   return request<UserRecord[]>("/api/v1/admin/org/users");
+}
+
+export function listAdminTenants() {
+  return request<TenantRecord[]>("/api/v1/admin/org/tenants");
+}
+
+export function createAdminTenant(payload: CreateTenantInput) {
+  return requestWithOptions<TenantRecord>("/api/v1/admin/org/tenants", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function updateAdminTenant(tenantId: string, payload: UpdateTenantInput) {
+  return requestWithOptions<TenantRecord>(`/api/v1/admin/org/tenants/${tenantId}`, {
+    method: "PUT",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function listAdminOrganizations() {
+  return request<OrganizationRecord[]>("/api/v1/admin/org/organizations");
+}
+
+export function createAdminOrganization(payload: CreateOrganizationInput) {
+  return requestWithOptions<OrganizationRecord>("/api/v1/admin/org/organizations", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function updateAdminOrganization(organizationId: string, payload: UpdateOrganizationInput) {
+  return requestWithOptions<OrganizationRecord>(`/api/v1/admin/org/organizations/${organizationId}`, {
+    method: "PUT",
+    body: JSON.stringify(payload)
+  });
 }
 
 export function createAdminUser(payload: CreateUserInput) {

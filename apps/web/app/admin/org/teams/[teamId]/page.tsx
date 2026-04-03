@@ -1,4 +1,4 @@
-import { listAdminPortfolios, listAdminTeams, listAdminUsers } from "@/lib/server-api";
+import { listAdminOrganizations, listAdminPortfolios, listAdminTeams, listAdminUsers } from "@/lib/server-api";
 import { Button, PageShell, SectionHeading, Tabs, appShellProps } from "../../../../../components/ui-helpers";
 import { addTeamMembershipAction, createUserAndAddTeamMembershipAction, updateTeamAction } from "../../actions";
 
@@ -8,7 +8,7 @@ type TeamDetailPageProps = {
 
 export default async function AdminTeamDetailPage({ params }: TeamDetailPageProps) {
   const { teamId } = await params;
-  const [users, teams, portfolios] = await Promise.all([listAdminUsers(), listAdminTeams(), listAdminPortfolios()]);
+  const [users, organizations, teams, portfolios] = await Promise.all([listAdminUsers(), listAdminOrganizations(), listAdminTeams(), listAdminPortfolios()]);
   const team = teams.find((item) => item.id === teamId) ?? teams[0];
 
   if (!team) {
@@ -36,6 +36,7 @@ export default async function AdminTeamDetailPage({ params }: TeamDetailPageProp
             <div className="mt-3 space-y-2 text-sm text-slate-700">
               <div><span className="font-medium text-slate-900">{team.name}</span></div>
               <div className="font-mono text-xs text-slate-500">{team.id}</div>
+              <div>Organization: {team.organization_name}</div>
               <div>Kind: {team.kind}</div>
               <div>Status: {team.status}</div>
               <div>Members: {team.member_count}</div>
@@ -83,6 +84,21 @@ export default async function AdminTeamDetailPage({ params }: TeamDetailPageProp
                 <input name="roles" placeholder="observer" className="w-full rounded-lg border border-chrome bg-slate-50 px-3 py-2 text-sm text-slate-700" />
               </label>
               <label className="space-y-1 text-sm text-slate-700">
+                <span className="block text-xs font-medium text-slate-500">Account Status</span>
+                <select name="status" defaultValue="pending_activation" className="w-full rounded-lg border border-chrome bg-slate-50 px-3 py-2 text-sm text-slate-700">
+                  <option value="pending_activation">pending_activation</option>
+                  <option value="active">active</option>
+                  <option value="suspended">suspended</option>
+                </select>
+              </label>
+              <label className="space-y-1 text-sm text-slate-700">
+                <span className="block text-xs font-medium text-slate-500">Initial Password</span>
+                <input type="password" name="password" placeholder="Optional initial password" className="w-full rounded-lg border border-chrome bg-slate-50 px-3 py-2 text-sm text-slate-700" autoComplete="new-password" />
+              </label>
+              <label className="flex items-center gap-2 text-sm text-slate-700">
+                <input type="checkbox" name="requirePasswordReset" defaultChecked /> Require password reset
+              </label>
+              <label className="space-y-1 text-sm text-slate-700">
                 <span className="block text-xs font-medium text-slate-500">Team Role</span>
                 <input name="membershipRole" defaultValue="member" className="w-full rounded-lg border border-chrome bg-slate-50 px-3 py-2 text-sm text-slate-700" />
               </label>
@@ -110,6 +126,14 @@ export default async function AdminTeamDetailPage({ params }: TeamDetailPageProp
           <form action={updateTeamAction} className="space-y-4">
             <input type="hidden" name="teamId" value={team.id} />
             <div className="grid gap-3 md:grid-cols-2">
+              <label className="space-y-1 text-sm text-slate-700">
+                <span className="block text-xs font-medium text-slate-500">Organization</span>
+                <select name="organizationId" defaultValue={team.organization_id} className="w-full rounded-lg border border-chrome bg-slate-50 px-3 py-2 text-sm text-slate-700">
+                  {organizations.map((organization) => (
+                    <option key={organization.id} value={organization.id}>{organization.name}</option>
+                  ))}
+                </select>
+              </label>
               <label className="space-y-1 text-sm text-slate-700">
                 <span className="block text-xs font-medium text-slate-500">Team Name</span>
                 <input name="name" defaultValue={team.name} className="w-full rounded-lg border border-chrome bg-slate-50 px-3 py-2 text-sm text-slate-700" />

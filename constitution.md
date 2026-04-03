@@ -117,6 +117,10 @@ promotion decisions
 policy enforcement
 audit history
 workflow intelligence and analytics
+governed user and account onboarding lifecycle
+account activation, suspension, and credential-governance state
+explicit multitenant governance boundaries, where tenants contain organizations, organizations contain teams, and users can belong to one or more teams
+distinct administrative scopes, where platform administrators govern all tenants and tenant administrators are restricted to a single tenant
 
 
 
@@ -219,6 +223,7 @@ policy bundles
 template definitions
 runtime bindings
 Template definitions SHALL be authorable inside the platform through governed draft creation, editing, validation, comparison, preview, publishing, and controlled draft-removal workflows. A registry without a definition authoring surface is not sufficient.
+Externally initiated user registration and account lifecycle changes SHALL be modeled as governed work using request templates, approval or rejection flows, and auditable user provisioning side effects. A direct unmanaged account-creation path is not sufficient.
 
 
 

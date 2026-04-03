@@ -15,7 +15,7 @@ from app.models.security import AuthCodeClaims, Principal, PrincipalRole, TokenC
 
 
 DEFAULT_ROLES = [
-    PrincipalRole.ADMIN,
+    PrincipalRole.PLATFORM_ADMIN,
     PrincipalRole.OPERATOR,
     PrincipalRole.REVIEWER,
     PrincipalRole.SUBMITTER,
@@ -308,7 +308,13 @@ def try_get_request_principal(request: Request) -> Principal | None:
 
 
 def ensure_roles(principal: Principal, *required_roles: PrincipalRole) -> Principal:
-    if not set(required_roles).intersection(principal.roles):
+    principal_roles = set(principal.roles)
+    effective_roles = set(principal_roles)
+    if PrincipalRole.PLATFORM_ADMIN in principal_roles:
+        effective_roles.update({PrincipalRole.TENANT_ADMIN, PrincipalRole.ADMIN})
+    if PrincipalRole.TENANT_ADMIN in principal_roles:
+        effective_roles.add(PrincipalRole.ADMIN)
+    if not set(required_roles).intersection(effective_roles):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Requires one of roles: {', '.join(role.value for role in required_roles)}",

@@ -4,6 +4,16 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.db.base import Base
 
 
+class TenantTable(Base):
+    __tablename__ = "tenants"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class RequestTable(Base):
     __tablename__ = "requests"
 
@@ -57,6 +67,20 @@ class UserTable(Base):
     email: Mapped[str] = mapped_column(String(255), nullable=False)
     role_summary: Mapped[list[str]] = mapped_column(JSON, default=list)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    password_hash: Mapped[str | None] = mapped_column(Text)
+    password_reset_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    registration_request_id: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class OrganizationTable(Base):
+    __tablename__ = "organizations"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False, default="tenant_demo")
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
     created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
 
@@ -66,6 +90,7 @@ class TeamTable(Base):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(64), nullable=False, default="tenant_demo")
+    organization_id: Mapped[str] = mapped_column(String(64), nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     kind: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")

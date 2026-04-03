@@ -38,16 +38,22 @@ from app.models.governance import (
     CheckRunRecord,
     CompleteAgentSessionRequest,
     CreateIntegrationRequest,
+    CreateOrganizationRequest,
     CreatePortfolioRequest,
+    CreateTenantRequest,
     CreateTeamRequest,
     CreateUserRequest,
     EventLedgerRecord,
     EventOutboxRecord,
+    OrganizationRecord,
     RunCommandRequest,
     RuntimeRunCallbackRequest,
     AddTeamMembershipRequest,
     TeamRecord,
+    TenantRecord,
     UpdateIntegrationRequest,
+    UpdateOrganizationRequest,
+    UpdateTenantRequest,
     UpdateTeamRequest,
     UpdateUserRequest,
     UserRecord,
@@ -60,13 +66,17 @@ from app.models.governance import (
     RunRecord,
 )
 from app.models.request import RequestRecord
-from app.models.security import Principal
+from app.models.security import LocalLoginRequest, Principal, PrincipalRole, PublicRegistrationRequest, RegistrationSubmissionResponse
 from app.models.template import TemplateRecord
 from app.repositories.governance_repository import governance_repository
 from app.services.performance_metrics_service import performance_metrics_service
 
 
 class GovernanceService:
+    @staticmethod
+    def _admin_scope(principal: Principal) -> str | None:
+        return None if PrincipalRole.PLATFORM_ADMIN in principal.roles else principal.tenant_id
+
     def list_requests(
         self,
         page: int,
@@ -314,7 +324,7 @@ class GovernanceService:
         return governance_repository.list_promotion_check_runs(promotion_id, principal.tenant_id)
 
     def list_integrations(self, principal: Principal) -> list[IntegrationRecord]:
-        return governance_repository.list_integrations(principal.tenant_id)
+        return governance_repository.list_integrations(self._admin_scope(principal))
 
     def create_integration(self, payload: CreateIntegrationRequest, principal: Principal) -> IntegrationRecord:
         return governance_repository.create_integration(payload, principal.tenant_id)
@@ -326,7 +336,22 @@ class GovernanceService:
         governance_repository.delete_integration(integration_id, principal.tenant_id)
 
     def list_users(self, principal: Principal) -> list[UserRecord]:
-        return governance_repository.list_users(principal.tenant_id)
+        return governance_repository.list_users(self._admin_scope(principal))
+
+    def list_tenants(self, principal: Principal) -> list[TenantRecord]:
+        if PrincipalRole.PLATFORM_ADMIN not in principal.roles:
+            raise PermissionError("Tenant catalog requires platform administration scope")
+        return governance_repository.list_tenants()
+
+    def create_tenant(self, payload: CreateTenantRequest, principal: Principal) -> TenantRecord:
+        if PrincipalRole.PLATFORM_ADMIN not in principal.roles:
+            raise PermissionError("Tenant creation requires platform administration scope")
+        return governance_repository.create_tenant(payload)
+
+    def update_tenant(self, tenant_id: str, payload: UpdateTenantRequest, principal: Principal) -> TenantRecord:
+        if PrincipalRole.PLATFORM_ADMIN not in principal.roles:
+            raise PermissionError("Tenant updates require platform administration scope")
+        return governance_repository.update_tenant(tenant_id, payload)
 
     def create_user(self, payload: CreateUserRequest, principal: Principal) -> UserRecord:
         return governance_repository.create_user(payload, principal.tenant_id)
@@ -334,8 +359,28 @@ class GovernanceService:
     def update_user(self, user_id: str, payload: UpdateUserRequest, principal: Principal) -> UserRecord:
         return governance_repository.update_user(user_id, payload, principal.tenant_id)
 
+    def authenticate_local_user(self, payload: LocalLoginRequest) -> Principal:
+        return governance_repository.authenticate_local_user(payload.email, payload.password, payload.tenant_id)
+
+    def create_public_registration_request(self, payload: PublicRegistrationRequest) -> RegistrationSubmissionResponse:
+        return governance_repository.create_public_registration_request(payload)
+
+    def list_organizations(self, principal: Principal) -> list[OrganizationRecord]:
+        return governance_repository.list_organizations(self._admin_scope(principal))
+
+    def create_organization(self, payload: CreateOrganizationRequest, principal: Principal) -> OrganizationRecord:
+        if PrincipalRole.PLATFORM_ADMIN not in principal.roles:
+            payload = payload.model_copy(update={"tenant_id": principal.tenant_id})
+        return governance_repository.create_organization(payload, principal.tenant_id)
+
+    def update_organization(self, organization_id: str, payload: UpdateOrganizationRequest, principal: Principal) -> OrganizationRecord:
+        return governance_repository.update_organization(organization_id, payload, principal.tenant_id)
+
+    def list_public_registration_teams(self, tenant_id: str) -> list[TeamRecord]:
+        return governance_repository.list_teams(tenant_id)
+
     def list_teams(self, principal: Principal) -> list[TeamRecord]:
-        return governance_repository.list_teams(principal.tenant_id)
+        return governance_repository.list_teams(self._admin_scope(principal))
 
     def create_team(self, payload: CreateTeamRequest, principal: Principal) -> TeamRecord:
         return governance_repository.create_team(payload, principal.tenant_id)
@@ -347,7 +392,7 @@ class GovernanceService:
         return governance_repository.add_team_membership(payload, principal.tenant_id)
 
     def list_portfolios(self, principal: Principal) -> list[PortfolioRecord]:
-        return governance_repository.list_portfolios(principal.tenant_id)
+        return governance_repository.list_portfolios(self._admin_scope(principal))
 
     def create_portfolio(self, payload: CreatePortfolioRequest, principal: Principal) -> PortfolioRecord:
         return governance_repository.create_portfolio(payload, principal.tenant_id)

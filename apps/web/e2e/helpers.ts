@@ -9,6 +9,13 @@ export async function loginAsPlatformAdmin(page: Page) {
   await expect(page.getByRole("heading", { name: "Requests" })).toBeVisible();
 }
 
+export async function loginAsReviewer(page: Page) {
+  await page.goto("/login");
+  await page.locator('a[href="/login/start?profile=reviewer"]').click();
+  await page.waitForURL("**/requests");
+  await expect(page.getByRole("heading", { name: "Requests" })).toBeVisible();
+}
+
 export async function issueDevToken(request: APIRequestContext) {
   const response = await request.post(`${apiBaseUrl}/api/v1/auth/dev-token`, {
     data: {

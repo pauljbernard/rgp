@@ -17,6 +17,7 @@ import ArtifactsPage from "./artifacts/page";
 import ArtifactDetailPage from "./artifacts/[artifactId]/page";
 import CapabilitiesPage from "./capabilities/page";
 import CapabilityDetailPage from "./capabilities/[capabilityId]/page";
+import ForbiddenPage from "./forbidden/page";
 import HelpAnalyticsPage from "./help/analytics/page";
 import HelpAdminPage from "./help/admin/page";
 import HelpJourneysPage from "./help/journeys/page";
@@ -32,6 +33,7 @@ import RequestAgentSessionPage from "./requests/[requestId]/agents/[sessionId]/p
 import RunsPage from "./runs/page";
 import FailedRunsPage from "./runs/failed/page";
 import RunDetailPage from "./runs/[runId]/page";
+import RegisterPage from "./register/page";
 
 vi.mock("@/lib/server-api", () => {
   const requestRecord = {
@@ -141,6 +143,9 @@ vi.mock("@/lib/server-api", () => {
 
   const team = {
     id: "team_assessment_quality",
+    tenant_id: "tenant_demo",
+    organization_id: "org_assessment",
+    organization_name: "Assessment and Quality",
     name: "Assessment Quality",
     kind: "delivery",
     status: "active",
@@ -150,9 +155,36 @@ vi.mock("@/lib/server-api", () => {
       { user_id: "reviewer_nina", display_name: "Reviewer Nina", email: "nina@example.com", role: "reviewer" }
     ]
   };
+  const organization = { id: "org_assessment", tenant_id: "tenant_demo", name: "Assessment and Quality", status: "active" };
+  const tenant = { id: "tenant_demo", name: "Demo Tenant", status: "active", organization_count: 1 };
 
-  const user = { id: "user_demo", display_name: "Demo User", email: "demo@example.com", status: "active", roles: ["admin"], role_summary: ["admin"], team_ids: ["team_assessment_quality"] };
-  const portfolio = { id: "port_assessment", name: "Assessment Portfolio", owner_team_id: "team_assessment_quality", scope_keys: ["team_assessment_quality"], status: "active" };
+  const user = {
+    id: "user_demo",
+    tenant_id: "tenant_demo",
+    display_name: "Demo User",
+    email: "demo@example.com",
+    status: "active",
+    roles: ["admin"],
+    role_summary: ["admin"],
+    team_ids: ["team_assessment_quality"],
+    has_password: true,
+    password_reset_required: false,
+    registration_request_id: null
+  };
+  const pendingUser = {
+    id: "user_pending",
+    tenant_id: "tenant_demo",
+    display_name: "Pending User",
+    email: "pending@example.com",
+    status: "pending_activation",
+    roles: ["submitter"],
+    role_summary: ["submitter"],
+    team_ids: [],
+    has_password: false,
+    password_reset_required: true,
+    registration_request_id: "req_registration_001"
+  };
+  const portfolio = { id: "port_assessment", tenant_id: "tenant_demo", name: "Assessment Portfolio", owner_team_id: "team_assessment_quality", scope_keys: ["team_assessment_quality"], status: "active" };
   const integration = {
     id: "int_agent_codex",
     name: "OpenAI Codex",
@@ -278,11 +310,19 @@ vi.mock("@/lib/server-api", () => {
     listPortfolios: vi.fn(async () => [portfolio]),
     listTeams: vi.fn(async () => [team]),
     listUsers: vi.fn(async () => [user]),
+    listPublicRegistrationOptions: vi.fn(async () => ({
+      tenants: [{ id: "tenant_demo", name: "Demo Tenant", status: "active" }],
+      organizations: [{ id: "org_assessment", name: "Assessment and Quality", status: "active" }],
+      teams: [{ id: "team_assessment_quality", organization_id: "org_assessment", name: "Assessment Quality", kind: "delivery", status: "active" }]
+    })),
     listPortfolioSummaries: vi.fn(async () => [{ portfolio_id: "port_assessment", portfolio_name: "Assessment Portfolio", request_count: 12, active_request_count: 3, completed_request_count: 9, deployment_count: 4 }]),
     listBottleneckAnalytics: vi.fn(async () => [{ bottleneck: "review", count: 3, average_delay: "1.2h", severity: "high" }]),
-    listAdminUsers: vi.fn(async () => [user]),
+    listAdminUsers: vi.fn(async () => [user, pendingUser]),
+    listAdminTenants: vi.fn(async () => [tenant]),
+    listAdminOrganizations: vi.fn(async () => [organization]),
     listAdminTeams: vi.fn(async () => [team]),
     listAdminPortfolios: vi.fn(async () => [portfolio]),
+    getCurrentPrincipal: vi.fn(async () => ({ user_id: "admin_demo", tenant_id: "tenant_demo", roles: ["platform_admin"] })),
     listPolicies: vi.fn(async () => [{
       id: "pol_001",
       name: "Default Policy",
@@ -372,6 +412,22 @@ describe("coverage smoke pages", () => {
     expect(screen.getByText("Supported User Journeys")).toBeInTheDocument();
   });
 
+  it("renders forbidden access handling", async () => {
+    render(await ForbiddenPage({ searchParams: Promise.resolve({ from: "/api/v1/admin/templates" }) }));
+    expect(screen.getByRole("heading", { name: "Access Restricted" })).toBeInTheDocument();
+    expect(screen.getByText("/api/v1/admin/templates")).toBeInTheDocument();
+  });
+
+  it("renders the public registration page", async () => {
+    render(await RegisterPage({ searchParams: Promise.resolve({}) }));
+    expect(screen.getByText("Create Account Request")).toBeInTheDocument();
+    expect(screen.getByText("Requested Access")).toBeInTheDocument();
+    expect(screen.getByText("Tenant")).toBeInTheDocument();
+    expect(screen.getByText("Organization")).toBeInTheDocument();
+    expect(screen.getByText("Requested Team")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("Assessment and Quality")).toBeInTheDocument();
+  });
+
   it("renders request pages", async () => {
     render(await RequestDetailPage({ params: Promise.resolve({ requestId: "req_001" }), searchParams: Promise.resolve({}) }));
     expect(screen.getByText("Request Detail")).toBeInTheDocument();
@@ -391,7 +447,13 @@ describe("coverage smoke pages", () => {
   it("renders admin pages", async () => {
     render(await AdminOrgPage());
     expect(screen.getByText("Admin Organization")).toBeInTheDocument();
-    expect(screen.getByText("Teams and Members")).toBeInTheDocument();
+    expect(screen.getByText("Tenants, Organizations, Teams, and Members")).toBeInTheDocument();
+    expect(screen.getByText("Demo Tenant")).toBeInTheDocument();
+    expect(screen.getByText("Create Tenant")).toBeInTheDocument();
+    expect(screen.getByText("Assessment and Quality")).toBeInTheDocument();
+    expect(screen.getByText("Unassigned Users")).toBeInTheDocument();
+    expect(screen.getByText("Pending User")).toBeInTheDocument();
+    expect(screen.getByText("pending_activation")).toBeInTheDocument();
 
     render(await AdminTeamDetailPage({ params: Promise.resolve({ teamId: "team_assessment_quality" }) }));
     expect(screen.getByText("Team Settings")).toBeInTheDocument();

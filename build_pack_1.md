@@ -193,6 +193,8 @@ Rules
 template_id and template_version are immutable after submission.
 input_payload may only change by governed amendment event.
 status changes only through allowed transitions.
+Externally initiated onboarding and registration still materialize as Request records bound to immutable request templates. A separate unaudited registration store is not allowed for governed user onboarding.
+Administrative navigation and APIs SHALL honor the tenant hierarchy explicitly. Platform-admin journeys SHALL expose tenants above organizations, while tenant-admin journeys SHALL be limited to the organizations, teams, users, and portfolios of the current tenant.
 
 
 
@@ -251,6 +253,13 @@ RequestTemplate:
   updated_at: datetime
   updated_by: string
   version_number: integer
+
+
+Specialization
+
+
+
+At least one published template family SHALL support governed user-registration and account lifecycle changes. Those templates SHALL be usable from externally facing intake journeys and from internal administrative workflows.
 
 
 Rules

@@ -482,9 +482,27 @@ class PerformanceOperationsTrendPoint(RgpModel):
 
 class UserRecord(RgpModel):
     id: str
+    tenant_id: str
     display_name: str
     email: str
     role_summary: list[str] = Field(default_factory=list)
+    status: str
+    has_password: bool = False
+    password_reset_required: bool = False
+    registration_request_id: str | None = None
+
+
+class TenantRecord(RgpModel):
+    id: str
+    name: str
+    status: str
+    organization_count: int = 0
+
+
+class OrganizationRecord(RgpModel):
+    id: str
+    tenant_id: str
+    name: str
     status: str
 
 
@@ -497,6 +515,9 @@ class TeamMemberRecord(RgpModel):
 
 class TeamRecord(RgpModel):
     id: str
+    tenant_id: str
+    organization_id: str
+    organization_name: str
     name: str
     kind: str
     status: str
@@ -506,10 +527,34 @@ class TeamRecord(RgpModel):
 
 class PortfolioRecord(RgpModel):
     id: str
+    tenant_id: str
     name: str
     status: str
     owner_team_id: str
     scope_keys: list[str] = Field(default_factory=list)
+
+
+class CreateTenantRequest(RgpModel):
+    id: str
+    name: str
+    status: str = "active"
+
+
+class UpdateTenantRequest(RgpModel):
+    name: str
+    status: str = "active"
+
+
+class CreateOrganizationRequest(RgpModel):
+    id: str
+    tenant_id: str | None = None
+    name: str
+    status: str = "active"
+
+
+class UpdateOrganizationRequest(RgpModel):
+    name: str
+    status: str = "active"
 
 
 class CreateUserRequest(RgpModel):
@@ -518,6 +563,9 @@ class CreateUserRequest(RgpModel):
     email: str
     role_summary: list[str] = Field(default_factory=list)
     status: str = "active"
+    password: str | None = None
+    password_reset_required: bool = False
+    registration_request_id: str | None = None
 
 
 class UpdateUserRequest(RgpModel):
@@ -525,16 +573,21 @@ class UpdateUserRequest(RgpModel):
     email: str
     role_summary: list[str] = Field(default_factory=list)
     status: str = "active"
+    password: str | None = None
+    password_reset_required: bool | None = None
+    reset_password: bool = False
 
 
 class CreateTeamRequest(RgpModel):
     id: str
+    organization_id: str
     name: str
     kind: str = "delivery"
     status: str = "active"
 
 
 class UpdateTeamRequest(RgpModel):
+    organization_id: str
     name: str
     kind: str = "delivery"
     status: str = "active"
@@ -872,6 +925,41 @@ def seed_templates() -> list[TemplateRecord]:
                         "enum": ["Standards alignment", "Difficulty adjustment", "Quality remediation"],
                     },
                     "target_window": {"type": "string", "title": "Target Window", "default": "Spring 2026", "min_length": 6},
+                },
+            },
+            created_at=now,
+            updated_at=now,
+        ),
+        TemplateRecord(
+            id="tmpl_user_registration",
+            version="1.0.0",
+            name="User Registration",
+            description="Externally initiated onboarding request for governed user-account creation.",
+            status=TemplateStatus.PUBLISHED,
+            schema={
+                "required": ["display_name", "email", "organization_id", "job_title", "requested_team_id", "business_justification"],
+                "routing": {
+                    "owner_team": "team_ops",
+                    "workflow_binding": "wf_user_registration_v1",
+                    "reviewers": ["ops_isaac"],
+                    "promotion_approvers": ["ops_isaac"],
+                },
+                "properties": {
+                    "display_name": {"type": "string", "title": "Full Name", "min_length": 3},
+                    "email": {"type": "string", "title": "Email", "pattern": r"^[^@\s]+@[^@\s]+\.[^@\s]+$"},
+                    "organization_id": {"type": "string", "title": "Organization", "pattern": r"org_[A-Za-z0-9_-]+$"},
+                    "job_title": {"type": "string", "title": "Job Title", "min_length": 2},
+                    "requested_team_id": {"type": "string", "title": "Requested Team", "pattern": r"team_[A-Za-z0-9_-]+$"},
+                    "requested_roles": {
+                        "type": "array",
+                        "title": "Requested Access",
+                        "default": ["submitter"],
+                    },
+                    "business_justification": {
+                        "type": "string",
+                        "title": "Business Justification",
+                        "min_length": 10,
+                    },
                 },
             },
             created_at=now,

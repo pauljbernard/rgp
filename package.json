@@ -17,10 +17,11 @@
     "test:unit": "pnpm test:ui && pnpm test:web && pnpm test:api-unit",
     "test:unit:coverage": "pnpm test:ui:coverage && pnpm test:web:coverage && pnpm test:api-unit:coverage && node scripts/report-unit-coverage.mjs",
     "test:integration": "bash -lc 'cd /Volumes/data/development/rgp/apps/api && source .venv/bin/activate && cd /Volumes/data/development/rgp && python -m unittest discover -s tests/integration -p \"test_*.py\" -v'",
+    "test:compliance": "bash -lc 'cd /Volumes/data/development/rgp/apps/api && source .venv/bin/activate && cd /Volumes/data/development/rgp && python -m unittest discover -s tests/integration -p \"test_spec_compliance.py\" -v'",
     "test:performance": "bash -lc 'cd /Volumes/data/development/rgp/apps/api && source .venv/bin/activate && cd /Volumes/data/development/rgp && python -m unittest discover -s tests/performance -p \"test_*.py\" -v'",
     "test:journey": "pnpm --filter @rgp/web test:journey",
     "test:security": "bash -lc 'cd /Volumes/data/development/rgp/apps/api && source .venv/bin/activate && cd /Volumes/data/development/rgp && python scripts/security_scan.py'",
-    "test:comprehensive": "pnpm test:unit && pnpm test:integration && pnpm test:performance && pnpm test:journey && pnpm test:security",
+    "test:comprehensive": "pnpm test:unit && pnpm test:integration && pnpm test:compliance && pnpm test:performance && pnpm test:journey && pnpm test:security",
     "check": "pnpm lint:web && pnpm typecheck:web && pnpm build:web"
   }
 }

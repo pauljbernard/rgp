@@ -2,7 +2,7 @@ import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
 
 const sessionCookieName = "rgp_access_token";
-const publicPaths = new Set(["/login", "/login/start", "/login/callback"]);
+const publicPaths = new Set(["/login", "/login/start", "/login/callback", "/register"]);
 const webBaseUrl = process.env.NEXT_PUBLIC_WEB_BASE_URL ?? "http://localhost:3000";
 
 function publicAppUrl(path: string) {

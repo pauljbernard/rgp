@@ -25,6 +25,7 @@ export default async function AdminUserDetailPage({ params }: UserDetailPageProp
   const memberships = teams
     .filter((team) => team.members.some((member) => member.user_id === user.id))
     .map((team) => ({
+      organizationName: team.organization_name,
       teamId: team.id,
       teamName: team.name,
       role: team.members.find((member) => member.user_id === user.id)?.role ?? "member",
@@ -52,7 +53,25 @@ export default async function AdminUserDetailPage({ params }: UserDetailPageProp
             <label className="space-y-1 text-sm text-slate-700"><span className="block text-xs font-medium text-slate-500">Display Name</span><input name="displayName" defaultValue={user.display_name} className="w-full rounded-lg border border-chrome bg-slate-50 px-3 py-2 text-sm text-slate-700" /></label>
             <label className="space-y-1 text-sm text-slate-700"><span className="block text-xs font-medium text-slate-500">Email</span><input name="email" defaultValue={user.email} className="w-full rounded-lg border border-chrome bg-slate-50 px-3 py-2 text-sm text-slate-700" /></label>
             <label className="space-y-1 text-sm text-slate-700"><span className="block text-xs font-medium text-slate-500">Roles</span><input name="roles" defaultValue={user.role_summary.join(", ")} className="w-full rounded-lg border border-chrome bg-slate-50 px-3 py-2 text-sm text-slate-700" /></label>
-            <label className="space-y-1 text-sm text-slate-700"><span className="block text-xs font-medium text-slate-500">Status</span><input name="status" defaultValue={user.status} className="w-full rounded-lg border border-chrome bg-slate-50 px-3 py-2 text-sm text-slate-700" /></label>
+            <label className="space-y-1 text-sm text-slate-700">
+              <span className="block text-xs font-medium text-slate-500">Status</span>
+              <select name="status" defaultValue={user.status} className="w-full rounded-lg border border-chrome bg-slate-50 px-3 py-2 text-sm text-slate-700">
+                <option value="pending_approval">pending_approval</option>
+                <option value="pending_activation">pending_activation</option>
+                <option value="active">active</option>
+                <option value="suspended">suspended</option>
+                <option value="disabled">disabled</option>
+                <option value="rejected">rejected</option>
+              </select>
+            </label>
+            <div className="rounded-lg border border-chrome bg-slate-50 px-4 py-3 text-sm text-slate-700">
+              <div>Password configured: {user.has_password ? "yes" : "no"}</div>
+              <div>Password reset required: {user.password_reset_required ? "yes" : "no"}</div>
+              {user.registration_request_id ? <div>Provisioned from request: <span className="font-mono text-xs">{user.registration_request_id}</span></div> : null}
+            </div>
+            <label className="space-y-1 text-sm text-slate-700"><span className="block text-xs font-medium text-slate-500">Set Password</span><input type="password" name="password" placeholder={user.has_password ? "Enter a new password to rotate credentials" : "Set an initial password"} className="w-full rounded-lg border border-chrome bg-slate-50 px-3 py-2 text-sm text-slate-700" autoComplete="new-password" /></label>
+            <label className="flex items-center gap-2 text-sm text-slate-700"><input type="checkbox" name="requirePasswordReset" defaultChecked={user.password_reset_required} /> Require password reset before next sign-in</label>
+            <label className="flex items-center gap-2 text-sm text-slate-700"><input type="checkbox" name="resetPassword" /> Clear the current password and force administrator re-provisioning</label>
             <div className="flex justify-end"><Button label="Save User" tone="primary" type="submit" /></div>
           </form>
         </section>
@@ -62,6 +81,7 @@ export default async function AdminUserDetailPage({ params }: UserDetailPageProp
             {memberships.length ? memberships.map((membership) => (
               <a key={membership.teamId} href={`/admin/org/teams/${encodeURIComponent(membership.teamId)}`} className="block rounded-lg border border-chrome bg-slate-50 px-3 py-3 text-sm text-slate-700">
                 <div className="font-medium text-slate-900">{membership.teamName}</div>
+                <div className="mt-1 text-xs text-slate-500">Organization: {membership.organizationName}</div>
                 <div className="mt-1 font-mono text-xs text-slate-500">{membership.teamId}</div>
                 <div className="mt-2">Role: {membership.role}</div>
               </a>

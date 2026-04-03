@@ -15,7 +15,7 @@ const profiles = {
   admin: {
     userId: "admin_demo",
     tenantId: "tenant_demo",
-    roles: ["admin", "operator", "reviewer", "submitter"],
+    roles: ["platform_admin", "operator", "reviewer", "submitter"],
   },
   reviewer: {
     userId: "reviewer_demo",
@@ -35,7 +35,7 @@ const profiles = {
   other_admin: {
     userId: "tenant_other_admin",
     tenantId: "tenant_other",
-    roles: ["admin", "operator", "reviewer", "submitter"],
+    roles: ["tenant_admin", "operator", "reviewer", "submitter"],
   },
 } as const;
 

@@ -9,9 +9,10 @@ from uuid import uuid4
 from sqlalchemy import desc, func, select
 
 from app.core.config import settings
-from app.db.models import AgentSessionMessageTable, AgentSessionTable, ArtifactEventTable, ArtifactLineageEdgeTable, ArtifactTable, CapabilityTable, CheckOverrideTable, CheckResultTable, CheckRunTable, DeploymentExecutionTable, EventOutboxTable, EventStoreTable, IntegrationTable, PolicyTable, PortfolioScopeTable, PortfolioTable, PromotionTable, RequestEventTable, RequestRelationshipTable, RequestTable, ReviewQueueTable, RunTable, RuntimeDispatchTable, RuntimeSignalTable, TeamMembershipTable, TeamTable, TemplateTable, TransitionGateTable, UserTable
+from app.db.models import AgentSessionMessageTable, AgentSessionTable, ArtifactEventTable, ArtifactLineageEdgeTable, ArtifactTable, CapabilityTable, CheckOverrideTable, CheckResultTable, CheckRunTable, DeploymentExecutionTable, EventOutboxTable, EventStoreTable, IntegrationTable, OrganizationTable, PolicyTable, PortfolioScopeTable, PortfolioTable, PromotionTable, RequestEventTable, RequestRelationshipTable, RequestTable, ReviewQueueTable, RunTable, RuntimeDispatchTable, RuntimeSignalTable, TeamMembershipTable, TeamTable, TemplateTable, TenantTable, TransitionGateTable, UserTable
 from app.db.session import SessionLocal
 from app.models.common import PaginatedResponse
+from app.models.security import Principal, PrincipalRole, PublicRegistrationRequest, RegistrationSubmissionResponse
 from app.models.governance import (
     AnalyticsAgentRow,
     AgentSessionDetail,
@@ -37,10 +38,13 @@ from app.models.governance import (
     CompleteAgentSessionRequest,
     CreateIntegrationRequest,
     CheckEvaluationRequest,
+    CreateOrganizationRequest,
     CreatePortfolioRequest,
+    CreateTenantRequest,
     CreateTeamRequest,
     CreateUserRequest,
     IntegrationRecord,
+    OrganizationRecord,
     EventLedgerRecord,
     EventOutboxRecord,
     DeliveryDoraRow,
@@ -70,7 +74,10 @@ from app.models.governance import (
     StepStatus,
     TeamMemberRecord,
     TeamRecord,
+    TenantRecord,
     UpdateIntegrationRequest,
+    UpdateOrganizationRequest,
+    UpdateTenantRequest,
     UpdateTeamRequest,
     UpdateUserRequest,
     UserRecord,
@@ -96,6 +103,7 @@ from app.services.deployment_service import deployment_service
 from app.services.agent_provider_service import agent_provider_service
 from app.services.event_store_service import event_store_service
 from app.services.integration_security_service import integration_security_service
+from app.services.local_account_service import local_account_service
 from app.services.object_store_service import object_store_service
 from app.services.policy_check_service import policy_check_service
 from app.services.runtime_dispatch_service import runtime_dispatch_service
@@ -2066,16 +2074,70 @@ class GovernanceRepository:
             session.delete(row)
             session.commit()
 
-    def list_users(self, tenant_id: str) -> list[UserRecord]:
+    def list_tenants(self) -> list[TenantRecord]:
         with SessionLocal() as session:
-            rows = session.scalars(select(UserTable).where(UserTable.tenant_id == tenant_id).order_by(UserTable.display_name)).all()
+            tenant_rows = session.scalars(select(TenantTable).order_by(TenantTable.name)).all()
+            organization_counts = {
+                tenant_id: count
+                for tenant_id, count in session.execute(
+                    select(OrganizationTable.tenant_id, func.count(OrganizationTable.id)).group_by(OrganizationTable.tenant_id)
+                ).all()
+            }
+        return [
+            TenantRecord(
+                id=row.id,
+                name=row.name,
+                status=row.status,
+                organization_count=organization_counts.get(row.id, 0),
+            )
+            for row in tenant_rows
+        ]
+
+    def create_tenant(self, payload: CreateTenantRequest) -> TenantRecord:
+        with SessionLocal() as session:
+            existing = session.get(TenantTable, payload.id)
+            if existing is not None:
+                raise ValueError(f"Tenant {payload.id} already exists")
+            now = datetime.now(timezone.utc)
+            row = TenantTable(
+                id=payload.id,
+                name=payload.name,
+                status=payload.status,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(row)
+            session.commit()
+        return TenantRecord(id=row.id, name=row.name, status=row.status, organization_count=0)
+
+    def update_tenant(self, tenant_id: str, payload: UpdateTenantRequest) -> TenantRecord:
+        with SessionLocal() as session:
+            row = session.get(TenantTable, tenant_id)
+            if row is None:
+                raise StopIteration(tenant_id)
+            row.name = payload.name
+            row.status = payload.status
+            row.updated_at = datetime.now(timezone.utc)
+            session.commit()
+        return TenantRecord(id=row.id, name=row.name, status=row.status, organization_count=len(self.list_organizations(tenant_id)))
+
+    def list_users(self, tenant_id: str | None = None) -> list[UserRecord]:
+        with SessionLocal() as session:
+            stmt = select(UserTable).order_by(UserTable.display_name)
+            if tenant_id:
+                stmt = stmt.where(UserTable.tenant_id == tenant_id)
+            rows = session.scalars(stmt).all()
         return [
             UserRecord(
                 id=row.id,
+                tenant_id=row.tenant_id,
                 display_name=row.display_name,
                 email=row.email,
                 role_summary=row.role_summary or [],
                 status=row.status,
+                has_password=bool(row.password_hash),
+                password_reset_required=bool(row.password_reset_required),
+                registration_request_id=row.registration_request_id,
             )
             for row in rows
         ]
@@ -2093,6 +2155,9 @@ class GovernanceRepository:
                 email=payload.email,
                 role_summary=payload.role_summary,
                 status=payload.status,
+                password_hash=local_account_service.hash_password(payload.password) if payload.password else None,
+                password_reset_required=payload.password_reset_required if payload.password else True,
+                registration_request_id=payload.registration_request_id,
                 created_at=now,
                 updated_at=now,
             )
@@ -2100,10 +2165,14 @@ class GovernanceRepository:
             session.commit()
         return UserRecord(
             id=row.id,
+            tenant_id=row.tenant_id,
             display_name=row.display_name,
             email=row.email,
             role_summary=row.role_summary or [],
             status=row.status,
+            has_password=bool(row.password_hash),
+            password_reset_required=bool(row.password_reset_required),
+            registration_request_id=row.registration_request_id,
         )
 
     def update_user(self, user_id: str, payload: UpdateUserRequest, tenant_id: str) -> UserRecord:
@@ -2115,21 +2184,160 @@ class GovernanceRepository:
             row.email = payload.email
             row.role_summary = payload.role_summary
             row.status = payload.status
+            if payload.reset_password:
+                row.password_hash = None
+                row.password_reset_required = True
+            elif payload.password:
+                row.password_hash = local_account_service.hash_password(payload.password)
+                row.password_reset_required = payload.password_reset_required if payload.password_reset_required is not None else False
+            elif payload.password_reset_required is not None:
+                row.password_reset_required = payload.password_reset_required
             row.updated_at = datetime.now(timezone.utc)
             session.commit()
         return UserRecord(
             id=row.id,
+            tenant_id=row.tenant_id,
             display_name=row.display_name,
             email=row.email,
             role_summary=row.role_summary or [],
             status=row.status,
+            has_password=bool(row.password_hash),
+            password_reset_required=bool(row.password_reset_required),
+            registration_request_id=row.registration_request_id,
         )
 
-    def list_teams(self, tenant_id: str) -> list[TeamRecord]:
+    def authenticate_local_user(self, email: str, password: str, tenant_id: str) -> Principal:
         with SessionLocal() as session:
-            team_rows = session.scalars(select(TeamTable).where(TeamTable.tenant_id == tenant_id).order_by(TeamTable.name)).all()
-            membership_rows = session.scalars(select(TeamMembershipTable).where(TeamMembershipTable.tenant_id == tenant_id)).all()
-            user_rows = {row.id: row for row in session.scalars(select(UserTable).where(UserTable.tenant_id == tenant_id)).all()}
+            row = session.scalars(
+                select(UserTable).where(
+                    UserTable.tenant_id == tenant_id,
+                    func.lower(UserTable.email) == email.strip().lower(),
+                )
+            ).first()
+            if row is None or row.status != "active":
+                raise ValueError("Invalid credentials")
+            if row.password_reset_required:
+                raise ValueError("Password reset is required before this account can sign in")
+            if not local_account_service.verify_password(password, row.password_hash):
+                raise ValueError("Invalid credentials")
+        roles = [PrincipalRole(role) for role in (row.role_summary or []) if role in {item.value for item in PrincipalRole}]
+        return Principal(user_id=row.id, tenant_id=row.tenant_id, roles=roles or [PrincipalRole.OBSERVER])
+
+    def create_public_registration_request(self, payload: PublicRegistrationRequest) -> RegistrationSubmissionResponse:
+        actor_id = "registration_portal"
+        with SessionLocal() as validation_session:
+            organization_row = validation_session.get(OrganizationTable, payload.organization_id)
+            team_row = validation_session.get(TeamTable, payload.requested_team_id)
+            if organization_row is None or organization_row.tenant_id != payload.tenant_id or organization_row.status != "active":
+                raise ValueError("Select a valid active organization for this registration request")
+            if team_row is None or team_row.tenant_id != payload.tenant_id or team_row.status != "active":
+                raise ValueError("Select a valid active team for this registration request")
+            if team_row.organization_id != organization_row.id:
+                raise ValueError("Select a team that belongs to the chosen organization")
+        draft = self.create_request_draft(
+            CreateRequestDraft(
+                template_id="tmpl_user_registration",
+                template_version="1.0.0",
+                title=f"Register User: {payload.display_name}",
+                summary=f"External registration request for {payload.email}",
+                priority=RequestPriority.MEDIUM,
+                input_payload={
+                    "display_name": payload.display_name,
+                    "email": payload.email,
+                    "organization_id": payload.organization_id,
+                    "organization_name": organization_row.name,
+                    "job_title": payload.job_title,
+                    "requested_team_id": payload.requested_team_id,
+                    "requested_roles": [role.value for role in payload.requested_roles],
+                    "business_justification": payload.business_justification,
+                },
+            ),
+            actor_id=actor_id,
+            tenant_id=payload.tenant_id,
+        )
+        self.submit_request(draft.id, SubmitRequest(actor_id=actor_id, reason="Submitted from public registration portal"), payload.tenant_id)
+        for target_status in (
+            RequestStatus.VALIDATED,
+            RequestStatus.CLASSIFIED,
+            RequestStatus.OWNERSHIP_RESOLVED,
+            RequestStatus.PLANNED,
+            RequestStatus.QUEUED,
+            RequestStatus.IN_EXECUTION,
+            RequestStatus.AWAITING_REVIEW,
+        ):
+            while True:
+                try:
+                    self.transition_request(
+                        draft.id,
+                        TransitionRequest(actor_id=actor_id, target_status=target_status, reason="Fast-tracked registration intake"),
+                        payload.tenant_id,
+                    )
+                    break
+                except ValueError as exc:
+                    message = str(exc)
+                    if "queued or running" in message or "Automated evaluation queued" in message:
+                        time.sleep(0.2)
+                        continue
+                    raise
+        return RegistrationSubmissionResponse(
+            request_id=draft.id,
+            status=RequestStatus.AWAITING_REVIEW.value,
+            message="Registration request submitted for administrative review.",
+        )
+
+    def list_organizations(self, tenant_id: str | None = None) -> list[OrganizationRecord]:
+        with SessionLocal() as session:
+            stmt = select(OrganizationTable).order_by(OrganizationTable.name)
+            if tenant_id:
+                stmt = stmt.where(OrganizationTable.tenant_id == tenant_id)
+            rows = session.scalars(stmt).all()
+        return [OrganizationRecord(id=row.id, tenant_id=row.tenant_id, name=row.name, status=row.status) for row in rows]
+
+    def create_organization(self, payload: CreateOrganizationRequest, tenant_id: str) -> OrganizationRecord:
+        organization_tenant_id = payload.tenant_id or tenant_id
+        with SessionLocal() as session:
+            existing = session.get(OrganizationTable, payload.id)
+            if existing is not None and existing.tenant_id == organization_tenant_id:
+                raise ValueError(f"Organization {payload.id} already exists")
+            now = datetime.now(timezone.utc)
+            row = OrganizationTable(
+                id=payload.id,
+                tenant_id=organization_tenant_id,
+                name=payload.name,
+                status=payload.status,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(row)
+            session.commit()
+        return OrganizationRecord(id=row.id, tenant_id=row.tenant_id, name=row.name, status=row.status)
+
+    def update_organization(self, organization_id: str, payload: UpdateOrganizationRequest, tenant_id: str) -> OrganizationRecord:
+        with SessionLocal() as session:
+            row = session.get(OrganizationTable, organization_id)
+            if row is None or row.tenant_id != tenant_id:
+                raise StopIteration(organization_id)
+            row.name = payload.name
+            row.status = payload.status
+            row.updated_at = datetime.now(timezone.utc)
+            session.commit()
+        return OrganizationRecord(id=row.id, tenant_id=row.tenant_id, name=row.name, status=row.status)
+
+    def list_teams(self, tenant_id: str | None = None) -> list[TeamRecord]:
+        with SessionLocal() as session:
+            organization_stmt = select(OrganizationTable)
+            team_stmt = select(TeamTable).order_by(TeamTable.name)
+            membership_stmt = select(TeamMembershipTable)
+            user_stmt = select(UserTable)
+            if tenant_id:
+                organization_stmt = organization_stmt.where(OrganizationTable.tenant_id == tenant_id)
+                team_stmt = team_stmt.where(TeamTable.tenant_id == tenant_id)
+                membership_stmt = membership_stmt.where(TeamMembershipTable.tenant_id == tenant_id)
+                user_stmt = user_stmt.where(UserTable.tenant_id == tenant_id)
+            organization_rows = {row.id: row for row in session.scalars(organization_stmt).all()}
+            team_rows = session.scalars(team_stmt).all()
+            membership_rows = session.scalars(membership_stmt).all()
+            user_rows = {row.id: row for row in session.scalars(user_stmt).all()}
         memberships_by_team: dict[str, list[TeamMemberRecord]] = {}
         for membership in membership_rows:
             user = user_rows.get(membership.user_id)
@@ -2146,6 +2354,9 @@ class GovernanceRepository:
         return [
             TeamRecord(
                 id=row.id,
+                tenant_id=row.tenant_id,
+                organization_id=row.organization_id,
+                organization_name=organization_rows.get(row.organization_id).name if organization_rows.get(row.organization_id) else row.organization_id,
                 name=row.name,
                 kind=row.kind,
                 status=row.status,
@@ -2160,10 +2371,14 @@ class GovernanceRepository:
             existing = session.get(TeamTable, payload.id)
             if existing is not None and existing.tenant_id == tenant_id:
                 raise ValueError(f"Team {payload.id} already exists")
+            organization = session.get(OrganizationTable, payload.organization_id)
+            if organization is None or organization.tenant_id != tenant_id:
+                raise StopIteration(payload.organization_id)
             now = datetime.now(timezone.utc)
             row = TeamTable(
                 id=payload.id,
                 tenant_id=tenant_id,
+                organization_id=payload.organization_id,
                 name=payload.name,
                 kind=payload.kind,
                 status=payload.status,
@@ -2172,13 +2387,27 @@ class GovernanceRepository:
             )
             session.add(row)
             session.commit()
-        return TeamRecord(id=row.id, name=row.name, kind=row.kind, status=row.status, member_count=0, members=[])
+        return TeamRecord(
+            id=row.id,
+            tenant_id=row.tenant_id,
+            organization_id=row.organization_id,
+            organization_name=organization.name,
+            name=row.name,
+            kind=row.kind,
+            status=row.status,
+            member_count=0,
+            members=[],
+        )
 
     def update_team(self, team_id: str, payload: UpdateTeamRequest, tenant_id: str) -> TeamRecord:
         with SessionLocal() as session:
             row = session.get(TeamTable, team_id)
             if row is None or row.tenant_id != tenant_id:
                 raise StopIteration(team_id)
+            organization = session.get(OrganizationTable, payload.organization_id)
+            if organization is None or organization.tenant_id != tenant_id:
+                raise StopIteration(payload.organization_id)
+            row.organization_id = payload.organization_id
             row.name = payload.name
             row.kind = payload.kind
             row.status = payload.status
@@ -2218,16 +2447,22 @@ class GovernanceRepository:
             session.commit()
         return next(team for team in self.list_teams(tenant_id) if team.id == payload.team_id)
 
-    def list_portfolios(self, tenant_id: str) -> list[PortfolioRecord]:
+    def list_portfolios(self, tenant_id: str | None = None) -> list[PortfolioRecord]:
         with SessionLocal() as session:
-            portfolio_rows = session.scalars(select(PortfolioTable).where(PortfolioTable.tenant_id == tenant_id).order_by(PortfolioTable.name)).all()
-            scope_rows = session.scalars(select(PortfolioScopeTable).where(PortfolioScopeTable.tenant_id == tenant_id).order_by(PortfolioScopeTable.scope_key)).all()
+            portfolio_stmt = select(PortfolioTable).order_by(PortfolioTable.name)
+            scope_stmt = select(PortfolioScopeTable).order_by(PortfolioScopeTable.scope_key)
+            if tenant_id:
+                portfolio_stmt = portfolio_stmt.where(PortfolioTable.tenant_id == tenant_id)
+                scope_stmt = scope_stmt.where(PortfolioScopeTable.tenant_id == tenant_id)
+            portfolio_rows = session.scalars(portfolio_stmt).all()
+            scope_rows = session.scalars(scope_stmt).all()
         scopes_by_portfolio: dict[str, list[str]] = {}
         for scope in scope_rows:
             scopes_by_portfolio.setdefault(scope.portfolio_id, []).append(scope.scope_key)
         return [
             PortfolioRecord(
                 id=row.id,
+                tenant_id=row.tenant_id,
                 name=row.name,
                 status=row.status,
                 owner_team_id=row.owner_team_id,
@@ -3756,6 +3991,7 @@ class GovernanceRepository:
             self._update_artifact_review_state(session, row.id, artifact_status="approved", review_state="approved", stale_review=False)
             self._update_review_queue_status(session, row.id, "Approved")
             check_dispatch_service.enqueue_request_checks(session, row.id, actor_id, "Approval request checks queued")
+            self._apply_registration_request_side_effects(session, row, actor_id, target_status)
             if row.current_run_id:
                 run_row = session.get(RunTable, row.current_run_id)
                 if run_row is not None:
@@ -3790,6 +4026,7 @@ class GovernanceRepository:
 
         if target_status == RequestStatus.COMPLETED and row.current_run_id:
             self._update_artifact_review_state(session, row.id, artifact_status="completed", review_state="approved", stale_review=False, promotion_relevant=True)
+            self._apply_registration_request_side_effects(session, row, actor_id, target_status)
             run_row = session.get(RunTable, row.current_run_id)
             if run_row is not None:
                 run_row.status = RunStatus.COMPLETED.value
@@ -3797,6 +4034,111 @@ class GovernanceRepository:
                 run_row.waiting_reason = None
                 run_row.progress_percent = 100
                 run_row.updated_at = datetime.now(timezone.utc)
+
+    def _apply_registration_request_side_effects(
+        self,
+        session,
+        row: RequestTable,
+        actor_id: str,
+        target_status: RequestStatus,
+    ) -> None:
+        if row.template_id != "tmpl_user_registration":
+            return
+        payload = dict(row.input_payload or {})
+        email = str(payload.get("email") or "").strip().lower()
+        if not email:
+            return
+        existing = session.scalars(
+            select(UserTable).where(
+                UserTable.tenant_id == row.tenant_id,
+                func.lower(UserTable.email) == email,
+            )
+        ).first()
+        requested_roles = payload.get("requested_roles") or []
+        if isinstance(requested_roles, str):
+            requested_roles = [requested_roles]
+        normalized_roles = [role for role in requested_roles if role in {item.value for item in PrincipalRole}]
+        requested_team_id = str(payload.get("requested_team_id") or "").strip()
+        requested_team = None
+        if requested_team_id:
+            requested_team = session.get(TeamTable, requested_team_id)
+            if requested_team is None or requested_team.tenant_id != row.tenant_id or requested_team.status != "active":
+                requested_team = None
+        now = datetime.now(timezone.utc)
+        target_account_status = "active" if target_status == RequestStatus.COMPLETED and existing and existing.password_hash and not existing.password_reset_required else "pending_activation"
+        if existing is None:
+            user_id = f"user_{uuid4().hex[:10]}"
+            created_user = UserTable(
+                id=user_id,
+                tenant_id=row.tenant_id,
+                display_name=str(payload.get("display_name") or payload.get("email") or "Pending User"),
+                email=email,
+                role_summary=normalized_roles or ["submitter"],
+                status=target_account_status,
+                password_hash=None,
+                password_reset_required=True,
+                registration_request_id=row.id,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(created_user)
+            if requested_team is not None:
+                membership = session.scalars(
+                    select(TeamMembershipTable).where(
+                        TeamMembershipTable.tenant_id == row.tenant_id,
+                        TeamMembershipTable.team_id == requested_team.id,
+                        TeamMembershipTable.user_id == created_user.id,
+                    )
+                ).first()
+                if membership is None:
+                    session.add(
+                        TeamMembershipTable(
+                            id=f"tm_{requested_team.id}_{created_user.id}",
+                            tenant_id=row.tenant_id,
+                            team_id=requested_team.id,
+                            user_id=created_user.id,
+                            role="member",
+                            created_at=now,
+                        )
+                    )
+            self._append_event(
+                session=session,
+                request_id=row.id,
+                actor=actor_id,
+                action="User Provisioned",
+                reason_or_evidence=f"Provisioned pending user profile for {email}",
+            )
+            return
+        existing.display_name = str(payload.get("display_name") or existing.display_name)
+        existing.email = email
+        existing.role_summary = normalized_roles or existing.role_summary
+        existing.registration_request_id = row.id
+        if target_status == RequestStatus.COMPLETED and existing.password_hash and not existing.password_reset_required:
+            existing.status = "active"
+        elif existing.status == "active":
+            existing.status = existing.status
+        else:
+            existing.status = "pending_activation"
+        existing.updated_at = now
+        if requested_team is not None:
+            membership = session.scalars(
+                select(TeamMembershipTable).where(
+                    TeamMembershipTable.tenant_id == row.tenant_id,
+                    TeamMembershipTable.team_id == requested_team.id,
+                    TeamMembershipTable.user_id == existing.id,
+                )
+            ).first()
+            if membership is None:
+                session.add(
+                    TeamMembershipTable(
+                        id=f"tm_{requested_team.id}_{existing.id}",
+                        tenant_id=row.tenant_id,
+                        team_id=requested_team.id,
+                        user_id=existing.id,
+                        role="member",
+                        created_at=now,
+                    )
+                )
 
     def _ensure_run_for_request(self, session, row: RequestTable, target_status: RequestStatus) -> None:
         if row.current_run_id:

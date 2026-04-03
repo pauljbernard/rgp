@@ -2,7 +2,7 @@ from sqlalchemy import inspect, select
 from sqlalchemy import func
 
 from app.db.base import Base
-from app.db.models import ArtifactTable, CapabilityTable, CheckOverrideTable, CheckResultTable, IntegrationTable, PolicyTable, PortfolioScopeTable, PortfolioTable, PromotionTable, RequestEventTable, RequestTable, ReviewQueueTable, RunTable, TeamMembershipTable, TeamTable, TemplateTable, TransitionGateTable, UserTable
+from app.db.models import ArtifactTable, CapabilityTable, CheckOverrideTable, CheckResultTable, IntegrationTable, OrganizationTable, PolicyTable, PortfolioScopeTable, PortfolioTable, PromotionTable, RequestEventTable, RequestTable, ReviewQueueTable, RunTable, TeamMembershipTable, TeamTable, TemplateTable, TenantTable, TransitionGateTable, UserTable
 from app.db.session import SessionLocal, engine
 from app.models.governance import seed_artifacts, seed_audit_entries, seed_capabilities, seed_integrations, seed_policies, seed_promotions, seed_requests, seed_review_queue, seed_runs, seed_templates
 
@@ -29,9 +29,14 @@ def initialize_database() -> None:
                     )
                 )
 
-        has_templates = session.scalar(select(func.count()).select_from(TemplateTable)) if "templates" in set(inspector.get_table_names()) else 0
-        if not has_templates:
+        if "templates" in set(inspector.get_table_names()):
+            existing_templates = {
+                (row.id, row.version)
+                for row in session.scalars(select(TemplateTable)).all()
+            }
             for template in seed_templates():
+                if (template.id, template.version) in existing_templates:
+                    continue
                 payload = template.model_dump(mode="python", by_alias=False)
                 payload["tenant_id"] = "tenant_demo"
                 payload["template_schema"] = payload.pop("template_schema")
@@ -41,14 +46,32 @@ def initialize_database() -> None:
 
         if "users" in set(inspector.get_table_names()):
             now = _as_datetime("2026-03-31T00:00:00+00:00")
+            if "tenants" in set(inspector.get_table_names()):
+                existing_tenant_ids = set(session.scalars(select(TenantTable.id)).all())
+                for tenant in [
+                    ("tenant_demo", "Demo Tenant"),
+                    ("tenant_other", "Other Tenant"),
+                ]:
+                    if tenant[0] in existing_tenant_ids:
+                        continue
+                    session.add(
+                        TenantTable(
+                            id=tenant[0],
+                            name=tenant[1],
+                            status="active",
+                            created_at=now,
+                            updated_at=now,
+                        )
+                    )
             existing_user_ids = set(session.scalars(select(UserTable.id)).all())
             for user in [
-                ("user_demo", "Demo User", "demo@rgp.local", ["admin", "operator", "reviewer", "submitter"]),
+                ("user_demo", "Demo User", "demo@rgp.local", ["platform_admin", "operator", "reviewer", "submitter"]),
                 ("reviewer_nina", "Nina Reviewer", "nina@rgp.local", ["reviewer"]),
                 ("reviewer_liam", "Liam Reviewer", "liam@rgp.local", ["reviewer"]),
                 ("ops_isaac", "Isaac Ops", "isaac@rgp.local", ["operator"]),
                 ("ops_override", "Override Ops", "override.ops@rgp.local", ["operator"]),
                 ("reviewer_override", "Override Reviewer", "override.reviewer@rgp.local", ["reviewer"]),
+                ("tenant_admin_demo", "Demo Tenant Admin", "tenant.admin@rgp.local", ["tenant_admin", "operator", "reviewer", "submitter"]),
             ]:
                 if user[0] in existing_user_ids:
                     continue
@@ -67,24 +90,51 @@ def initialize_database() -> None:
 
         if "teams" in set(inspector.get_table_names()):
             now = _as_datetime("2026-03-31T00:00:00+00:00")
+            if "organizations" in set(inspector.get_table_names()):
+                existing_organization_ids = set(session.scalars(select(OrganizationTable.id)).all())
+                for organization in [
+                    ("org_curriculum", "tenant_demo", "Curriculum Programs"),
+                    ("org_assessment", "tenant_demo", "Assessment and Quality"),
+                    ("org_operations", "tenant_demo", "Platform Operations"),
+                    ("org_other_delivery", "tenant_other", "Other Tenant Delivery"),
+                ]:
+                    if organization[0] in existing_organization_ids:
+                        continue
+                    session.add(
+                        OrganizationTable(
+                            id=organization[0],
+                            tenant_id=organization[1],
+                            name=organization[2],
+                            status="active",
+                            created_at=now,
+                            updated_at=now,
+                        )
+                    )
             existing_team_ids = set(session.scalars(select(TeamTable.id)).all())
             for team in [
-                ("team_curriculum_science", "Curriculum Science", "delivery"),
-                ("team_curriculum", "Curriculum Core", "delivery"),
-                ("team_assessment_quality", "Assessment Quality", "delivery"),
-                ("team_assessment", "Assessment Delivery", "delivery"),
-                ("team_science", "Science Delivery", "delivery"),
-                ("team_literacy", "Literacy Delivery", "delivery"),
-                ("team_ops", "Platform Operations", "operations"),
+                ("team_curriculum_science", "tenant_demo", "org_curriculum", "Curriculum Science", "delivery"),
+                ("team_curriculum", "tenant_demo", "org_curriculum", "Curriculum Core", "delivery"),
+                ("team_assessment_quality", "tenant_demo", "org_assessment", "Assessment Quality", "delivery"),
+                ("team_assessment", "tenant_demo", "org_assessment", "Assessment Delivery", "delivery"),
+                ("team_science", "tenant_demo", "org_curriculum", "Science Delivery", "delivery"),
+                ("team_literacy", "tenant_demo", "org_curriculum", "Literacy Delivery", "delivery"),
+                ("team_ops", "tenant_demo", "org_operations", "Platform Operations", "operations"),
+                ("team_other_ops", "tenant_other", "org_other_delivery", "Other Tenant Operations", "operations"),
             ]:
                 if team[0] in existing_team_ids:
+                    if hasattr(TeamTable, "organization_id"):
+                        row = session.get(TeamTable, team[0])
+                        if row is not None and not getattr(row, "organization_id", None):
+                            row.organization_id = team[2]
+                            row.updated_at = now
                     continue
                 session.add(
                     TeamTable(
                         id=team[0],
-                        tenant_id="tenant_demo",
-                        name=team[1],
-                        kind=team[2],
+                        tenant_id=team[1],
+                        organization_id=team[2],
+                        name=team[3],
+                        kind=team[4],
                         status="active",
                         created_at=now,
                         updated_at=now,
@@ -103,6 +153,7 @@ def initialize_database() -> None:
                 ("tm_006", "team_assessment", "user_demo", "lead"),
                 ("tm_007", "team_science", "reviewer_nina", "reviewer"),
                 ("tm_008", "team_literacy", "reviewer_liam", "reviewer"),
+                ("tm_009", "team_ops", "tenant_admin_demo", "lead"),
             ]:
                 if membership[0] in existing_membership_ids:
                     continue

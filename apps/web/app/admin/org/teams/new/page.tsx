@@ -1,7 +1,9 @@
+import { listAdminOrganizations } from "@/lib/server-api";
 import { Button, PageShell, SectionHeading, Tabs, appShellProps } from "../../../../../components/ui-helpers";
 import { createTeamAction } from "../../actions";
 
-export default function AdminNewTeamPage() {
+export default async function AdminNewTeamPage() {
+  const organizations = await listAdminOrganizations();
   return (
     <PageShell
       {...appShellProps("/admin/org", "Create Team", "Create a team, then manage members from the team detail page.")}
@@ -21,6 +23,14 @@ export default function AdminNewTeamPage() {
           <SectionHeading title="Create Team" />
           <form action={createTeamAction} className="mt-3 space-y-4">
             <label className="space-y-1 text-sm text-slate-700"><span className="block text-xs font-medium text-slate-500">Team Id</span><input name="id" placeholder="team_delivery_ops" className="w-full rounded-lg border border-chrome bg-slate-50 px-3 py-2 text-sm text-slate-700" /></label>
+            <label className="space-y-1 text-sm text-slate-700">
+              <span className="block text-xs font-medium text-slate-500">Organization</span>
+              <select name="organizationId" className="w-full rounded-lg border border-chrome bg-slate-50 px-3 py-2 text-sm text-slate-700">
+                {organizations.map((organization) => (
+                  <option key={organization.id} value={organization.id}>{organization.name}</option>
+                ))}
+              </select>
+            </label>
             <label className="space-y-1 text-sm text-slate-700"><span className="block text-xs font-medium text-slate-500">Name</span><input name="name" placeholder="Delivery Operations" className="w-full rounded-lg border border-chrome bg-slate-50 px-3 py-2 text-sm text-slate-700" /></label>
             <label className="space-y-1 text-sm text-slate-700"><span className="block text-xs font-medium text-slate-500">Kind</span><input name="kind" defaultValue="delivery" className="w-full rounded-lg border border-chrome bg-slate-50 px-3 py-2 text-sm text-slate-700" /></label>
             <div className="flex justify-end"><Button label="Create Team" tone="primary" type="submit" /></div>

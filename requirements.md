@@ -115,6 +115,36 @@ The system SHALL expose a complete timeline for each request including events, r
 
 
 
+FR-REQ-008
+
+
+
+
+The system SHALL support externally initiated user-registration journeys that create governed requests from a published registration template.
+
+
+
+FR-REQ-009
+
+
+
+
+The system SHALL support an administrative approval or rejection flow for registration requests, and approval SHALL provision or update a governed user profile through explicit workflow side effects.
+
+
+FR-REQ-010
+
+
+The system SHALL model tenants as first-class administrative boundaries above organizations, teams, and users. Organizations SHALL belong to a tenant, teams SHALL belong to an organization, and users SHALL be assignable to one or more teams.
+
+
+FR-REQ-011
+
+
+The system SHALL distinguish between platform administrators and tenant administrators. Platform administrators SHALL be able to create and maintain tenants and inspect all tenant scopes. Tenant administrators SHALL be restricted to viewing and administering only the organizations, teams, users, portfolios, templates, policies, and integrations within their assigned tenant.
+
+
+
 
 
 
@@ -298,6 +328,15 @@ FR-TPL-012
 
 
 The system SHALL support controlled deletion or removal of draft template versions that have not been published.
+
+
+
+FR-TPL-013
+
+
+
+
+The system SHALL support request templates for user and account lifecycle workflows, including registration, activation, suspension, and credential-governance operations.
 
 
 
