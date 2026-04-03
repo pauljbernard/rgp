@@ -1,0 +1,294 @@
+"""Planning service -- manages planning constructs, memberships, and roadmap views."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from uuid import uuid4
+
+from sqlalchemy import func
+
+from app.db.models import PlanningConstructTable, PlanningMembershipTable, RequestTable
+from app.db.session import SessionLocal
+from app.models.planning import (
+    CreatePlanningConstructRequest,
+    PlanningConstructRecord,
+    PlanningMembershipRecord,
+)
+from app.services.event_store_service import event_store_service
+
+
+class PlanningService:
+    """Manages planning constructs (initiatives, programs, releases, etc.)."""
+
+    # ------------------------------------------------------------------
+    # CRUD
+    # ------------------------------------------------------------------
+
+    def create_construct(
+        self,
+        payload: CreatePlanningConstructRequest,
+        actor_id: str,
+        tenant_id: str,
+    ) -> PlanningConstructRecord:
+        now = datetime.now(timezone.utc)
+        construct_id = f"pc_{uuid4().hex[:12]}"
+
+        with SessionLocal() as session:
+            row = PlanningConstructTable(
+                id=construct_id,
+                tenant_id=tenant_id,
+                type=payload.type,
+                name=payload.name,
+                description=payload.description,
+                owner_team_id=payload.owner_team_id,
+                status="active",
+                priority=payload.priority,
+                target_date=payload.target_date,
+                capacity_budget=payload.capacity_budget,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(row)
+            session.flush()
+
+            event_store_service.append(
+                session,
+                tenant_id=tenant_id,
+                event_type="planning_construct.created",
+                aggregate_type="planning_construct",
+                aggregate_id=construct_id,
+                actor=actor_id,
+                detail=f"Planning construct '{payload.name}' ({payload.type}) created",
+            )
+            session.commit()
+            session.refresh(row)
+            return PlanningConstructRecord.model_validate(row)
+
+    def get_construct(self, construct_id: str) -> PlanningConstructRecord:
+        with SessionLocal() as session:
+            row = (
+                session.query(PlanningConstructTable)
+                .filter(PlanningConstructTable.id == construct_id)
+                .one()
+            )
+            return PlanningConstructRecord.model_validate(row)
+
+    def list_constructs(
+        self, tenant_id: str, type: str | None = None
+    ) -> list[PlanningConstructRecord]:
+        with SessionLocal() as session:
+            q = session.query(PlanningConstructTable).filter(
+                PlanningConstructTable.tenant_id == tenant_id,
+            )
+            if type:
+                q = q.filter(PlanningConstructTable.type == type)
+            rows = q.order_by(PlanningConstructTable.priority.desc(), PlanningConstructTable.created_at.desc()).all()
+            return [PlanningConstructRecord.model_validate(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Membership
+    # ------------------------------------------------------------------
+
+    def add_request(
+        self,
+        construct_id: str,
+        request_id: str,
+        sequence: int = 0,
+        priority: int = 0,
+    ) -> PlanningMembershipRecord:
+        now = datetime.now(timezone.utc)
+        membership_id = f"pm_{uuid4().hex[:12]}"
+
+        with SessionLocal() as session:
+            row = PlanningMembershipTable(
+                id=membership_id,
+                planning_construct_id=construct_id,
+                request_id=request_id,
+                sequence=sequence,
+                priority=priority,
+                added_at=now,
+            )
+            session.add(row)
+            session.flush()
+
+            construct = (
+                session.query(PlanningConstructTable)
+                .filter(PlanningConstructTable.id == construct_id)
+                .one()
+            )
+
+            event_store_service.append(
+                session,
+                tenant_id=construct.tenant_id,
+                event_type="planning_construct.request_added",
+                aggregate_type="planning_construct",
+                aggregate_id=construct_id,
+                actor="system",
+                detail=f"Request {request_id} added to construct {construct_id}",
+                request_id=request_id,
+            )
+            session.commit()
+            session.refresh(row)
+            return PlanningMembershipRecord.model_validate(row)
+
+    def remove_request(
+        self, construct_id: str, request_id: str
+    ) -> None:
+        with SessionLocal() as session:
+            row = (
+                session.query(PlanningMembershipTable)
+                .filter(
+                    PlanningMembershipTable.planning_construct_id == construct_id,
+                    PlanningMembershipTable.request_id == request_id,
+                )
+                .one()
+            )
+            session.delete(row)
+
+            construct = (
+                session.query(PlanningConstructTable)
+                .filter(PlanningConstructTable.id == construct_id)
+                .one()
+            )
+
+            event_store_service.append(
+                session,
+                tenant_id=construct.tenant_id,
+                event_type="planning_construct.request_removed",
+                aggregate_type="planning_construct",
+                aggregate_id=construct_id,
+                actor="system",
+                detail=f"Request {request_id} removed from construct {construct_id}",
+                request_id=request_id,
+            )
+            session.commit()
+
+    def reorder_requests(
+        self, construct_id: str, ordering: list[dict]
+    ) -> list[PlanningMembershipRecord]:
+        """Reorder requests within a construct.
+
+        ``ordering`` is a list of dicts, each with ``request_id``,
+        ``sequence``, and optionally ``priority``.
+        """
+        with SessionLocal() as session:
+            for entry in ordering:
+                row = (
+                    session.query(PlanningMembershipTable)
+                    .filter(
+                        PlanningMembershipTable.planning_construct_id == construct_id,
+                        PlanningMembershipTable.request_id == entry["request_id"],
+                    )
+                    .one()
+                )
+                row.sequence = entry.get("sequence", row.sequence)
+                row.priority = entry.get("priority", row.priority)
+
+            session.commit()
+
+            rows = (
+                session.query(PlanningMembershipTable)
+                .filter(PlanningMembershipTable.planning_construct_id == construct_id)
+                .order_by(PlanningMembershipTable.sequence.asc())
+                .all()
+            )
+            return [PlanningMembershipRecord.model_validate(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Aggregation
+    # ------------------------------------------------------------------
+
+    def aggregate_progress(self, construct_id: str) -> dict:
+        """Query child requests and return a status summary.
+
+        Returns a dict with counts per request status and overall
+        completion percentage.
+        """
+        with SessionLocal() as session:
+            memberships = (
+                session.query(PlanningMembershipTable)
+                .filter(PlanningMembershipTable.planning_construct_id == construct_id)
+                .all()
+            )
+            request_ids = [m.request_id for m in memberships]
+
+            if not request_ids:
+                return {
+                    "construct_id": construct_id,
+                    "total": 0,
+                    "status_counts": {},
+                    "completion_pct": 0.0,
+                }
+
+            status_counts: dict[str, int] = {}
+            rows = (
+                session.query(RequestTable.status, func.count(RequestTable.id))
+                .filter(RequestTable.id.in_(request_ids))
+                .group_by(RequestTable.status)
+                .all()
+            )
+            total = 0
+            for status, count in rows:
+                status_counts[status] = count
+                total += count
+
+            completed = status_counts.get("completed", 0) + status_counts.get("closed", 0)
+            completion_pct = (completed / total * 100.0) if total > 0 else 0.0
+
+            return {
+                "construct_id": construct_id,
+                "total": total,
+                "status_counts": status_counts,
+                "completion_pct": round(completion_pct, 1),
+            }
+
+    # ------------------------------------------------------------------
+    # Roadmap view
+    # ------------------------------------------------------------------
+
+    def get_roadmap_view(
+        self, tenant_id: str, type: str | None = None
+    ) -> list[dict]:
+        """Return a timeline projection of constructs with their progress.
+
+        Each entry includes the construct metadata plus aggregated
+        membership and completion information.
+        """
+        with SessionLocal() as session:
+            q = session.query(PlanningConstructTable).filter(
+                PlanningConstructTable.tenant_id == tenant_id,
+            )
+            if type:
+                q = q.filter(PlanningConstructTable.type == type)
+
+            constructs = q.order_by(
+                PlanningConstructTable.target_date.asc().nulls_last(),
+                PlanningConstructTable.priority.desc(),
+            ).all()
+
+            roadmap: list[dict] = []
+            for c in constructs:
+                member_count = (
+                    session.query(func.count(PlanningMembershipTable.id))
+                    .filter(PlanningMembershipTable.planning_construct_id == c.id)
+                    .scalar()
+                )
+
+                roadmap.append(
+                    {
+                        "id": c.id,
+                        "type": c.type,
+                        "name": c.name,
+                        "status": c.status,
+                        "priority": c.priority,
+                        "target_date": c.target_date.isoformat() if c.target_date else None,
+                        "capacity_budget": c.capacity_budget,
+                        "member_count": member_count,
+                        "owner_team_id": c.owner_team_id,
+                    }
+                )
+
+            return roadmap
+
+
+planning_service = PlanningService()

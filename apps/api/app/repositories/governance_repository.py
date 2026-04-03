@@ -83,19 +83,6 @@ from app.models.governance import (
     UserRecord,
     WorkflowTrendPoint,
     AddTeamMembershipRequest,
-    seed_agent_analytics,
-    seed_artifacts,
-    seed_audit_entries,
-    seed_bottleneck_analytics,
-    seed_capabilities,
-    seed_integrations,
-    seed_policies,
-    seed_promotions,
-    seed_requests,
-    seed_review_queue,
-    seed_runs,
-    seed_templates,
-    seed_workflow_analytics,
 )
 from app.models.request import AmendRequest, CancelRequest, CloneRequest, CreateRequestDraft, RequestCheckRun, RequestPriority, RequestRecord, RequestStatus, SubmitRequest, SupersedeRequest, TransitionRequest
 from app.services.check_dispatch_service import check_dispatch_service
@@ -107,6 +94,16 @@ from app.services.local_account_service import local_account_service
 from app.services.object_store_service import object_store_service
 from app.services.policy_check_service import policy_check_service
 from app.services.runtime_dispatch_service import runtime_dispatch_service
+from app.domain.state_machine import (
+    TRANSITION_RULES as _SM_TRANSITION_RULES,
+    SUBMITTABLE_STATUSES as _SM_SUBMITTABLE_STATUSES,
+    AMENDABLE_STATUSES as _SM_AMENDABLE_STATUSES,
+    CANCELABLE_STATUSES as _SM_CANCELABLE_STATUSES,
+    SLA_POLICY_RULES as _SM_SLA_POLICY_RULES,
+    compute_sla_risk as _sm_compute_sla_risk,
+    assert_valid_transition as _sm_assert_valid_transition,
+)
+from app.domain import template_engine as _te
 from app.models.template import (
     CreateTemplateVersionRequest,
     TemplateRecord,
@@ -124,86 +121,16 @@ class GovernanceRepository:
     _agent_stream_lock = threading.Lock()
     _agent_stream_inflight: set[str] = set()
 
-    SLA_POLICY_RULES = {
-        "sla_standard_v1": {
-            "review_hours": {"medium": 4, "high": 2, "urgent": 1},
-            "promotion_hours": {"medium": 6, "high": 4, "urgent": 2},
-            "execution_hours": {"medium": 8, "high": 6, "urgent": 3},
-        }
-    }
-    TRANSITION_RULES = {
-        RequestStatus.SUBMITTED: {RequestStatus.VALIDATED, RequestStatus.VALIDATION_FAILED, RequestStatus.CANCELED},
-        RequestStatus.VALIDATION_FAILED: {RequestStatus.DRAFT, RequestStatus.CANCELED},
-        RequestStatus.VALIDATED: {RequestStatus.CLASSIFIED, RequestStatus.CANCELED},
-        RequestStatus.CLASSIFIED: {RequestStatus.OWNERSHIP_RESOLVED, RequestStatus.CANCELED},
-        RequestStatus.OWNERSHIP_RESOLVED: {RequestStatus.PLANNED, RequestStatus.CANCELED},
-        RequestStatus.PLANNED: {RequestStatus.QUEUED, RequestStatus.CANCELED},
-        RequestStatus.QUEUED: {RequestStatus.IN_EXECUTION, RequestStatus.FAILED, RequestStatus.CANCELED},
-        RequestStatus.IN_EXECUTION: {RequestStatus.AWAITING_INPUT, RequestStatus.AWAITING_REVIEW, RequestStatus.FAILED, RequestStatus.CANCELED},
-        RequestStatus.AWAITING_INPUT: {RequestStatus.DRAFT, RequestStatus.CANCELED},
-        RequestStatus.AWAITING_REVIEW: {RequestStatus.UNDER_REVIEW, RequestStatus.CHANGES_REQUESTED, RequestStatus.APPROVED, RequestStatus.CANCELED},
-        RequestStatus.UNDER_REVIEW: {RequestStatus.CHANGES_REQUESTED, RequestStatus.APPROVED, RequestStatus.REJECTED, RequestStatus.CANCELED},
-        RequestStatus.CHANGES_REQUESTED: {RequestStatus.DRAFT, RequestStatus.CANCELED},
-        RequestStatus.APPROVED: {RequestStatus.PROMOTION_PENDING, RequestStatus.COMPLETED, RequestStatus.CANCELED},
-        RequestStatus.PROMOTION_PENDING: {RequestStatus.PROMOTED, RequestStatus.FAILED, RequestStatus.CANCELED},
-        RequestStatus.PROMOTED: {RequestStatus.COMPLETED},
-        RequestStatus.FAILED: {RequestStatus.PLANNED, RequestStatus.CANCELED},
-    }
-    SUBMITTABLE_STATUSES = {
-        RequestStatus.DRAFT,
-        RequestStatus.CHANGES_REQUESTED,
-        RequestStatus.VALIDATION_FAILED,
-        RequestStatus.AWAITING_INPUT,
-    }
-    AMENDABLE_STATUSES = {
-        RequestStatus.DRAFT,
-        RequestStatus.SUBMITTED,
-        RequestStatus.VALIDATION_FAILED,
-        RequestStatus.VALIDATED,
-        RequestStatus.CLASSIFIED,
-        RequestStatus.OWNERSHIP_RESOLVED,
-        RequestStatus.PLANNED,
-        RequestStatus.QUEUED,
-        RequestStatus.AWAITING_INPUT,
-        RequestStatus.AWAITING_REVIEW,
-        RequestStatus.UNDER_REVIEW,
-        RequestStatus.CHANGES_REQUESTED,
-        RequestStatus.APPROVED,
-        RequestStatus.PROMOTION_PENDING,
-        RequestStatus.FAILED,
-    }
-    CANCELABLE_STATUSES = {
-        RequestStatus.DRAFT,
-        RequestStatus.SUBMITTED,
-        RequestStatus.VALIDATION_FAILED,
-        RequestStatus.VALIDATED,
-        RequestStatus.CLASSIFIED,
-        RequestStatus.OWNERSHIP_RESOLVED,
-        RequestStatus.PLANNED,
-        RequestStatus.QUEUED,
-        RequestStatus.IN_EXECUTION,
-        RequestStatus.AWAITING_INPUT,
-        RequestStatus.AWAITING_REVIEW,
-        RequestStatus.UNDER_REVIEW,
-        RequestStatus.CHANGES_REQUESTED,
-        RequestStatus.APPROVED,
-        RequestStatus.PROMOTION_PENDING,
-        RequestStatus.FAILED,
-    }
+    # Delegated to app.domain.state_machine — kept as class attrs for backward compat
+    SLA_POLICY_RULES = _SM_SLA_POLICY_RULES
+    TRANSITION_RULES = _SM_TRANSITION_RULES
+    SUBMITTABLE_STATUSES = _SM_SUBMITTABLE_STATUSES
+    AMENDABLE_STATUSES = _SM_AMENDABLE_STATUSES
+    CANCELABLE_STATUSES = _SM_CANCELABLE_STATUSES
     def __init__(self) -> None:
-        self.requests = seed_requests()
-        self.templates = seed_templates()
-        self.runs = seed_runs()
-        self.artifacts = seed_artifacts()
-        self.review_queue = seed_review_queue()
-        self.promotions = seed_promotions()
-        self.capabilities = seed_capabilities()
-        self.workflow_analytics = seed_workflow_analytics()
-        self.agent_analytics = seed_agent_analytics()
-        self.bottleneck_analytics = seed_bottleneck_analytics()
-        self.audit_entries = seed_audit_entries()
-        self.policies = seed_policies()
-        self.integrations = seed_integrations()
+        # Seed data is now loaded via app.db.bootstrap.initialize_database()
+        # called at API startup. No in-memory seed data is needed here.
+        pass
 
     @staticmethod
     def _paginate(items: list, page: int, page_size: int) -> PaginatedResponse:
@@ -3385,30 +3312,7 @@ class GovernanceRepository:
 
     @classmethod
     def _compute_sla_risk(cls, row: RequestTable) -> tuple[str | None, str | None]:
-        policy_id = row.sla_policy_id or "sla_standard_v1"
-        policy = cls.SLA_POLICY_RULES.get(policy_id, cls.SLA_POLICY_RULES["sla_standard_v1"])
-        age_hours = max((datetime.now(timezone.utc) - row.updated_at).total_seconds() / 3600, 0)
-        priority = row.priority if row.priority in {"medium", "high", "urgent"} else "medium"
-
-        if row.status == RequestStatus.FAILED.value:
-            return "critical", "Execution failure"
-        if row.priority == RequestPriority.URGENT.value:
-            if age_hours >= 2:
-                return "critical", "Urgent request exceeded rapid-response threshold"
-            return "high", "Urgent priority under active SLA watch"
-        if row.status in {RequestStatus.AWAITING_REVIEW.value, RequestStatus.UNDER_REVIEW.value, RequestStatus.CHANGES_REQUESTED.value}:
-            threshold = policy["review_hours"][priority]
-            if age_hours >= threshold:
-                return "high", "Review delay"
-        if row.status == RequestStatus.PROMOTION_PENDING.value:
-            threshold = policy["promotion_hours"][priority]
-            if age_hours >= threshold:
-                return "high", "Promotion delay"
-        if row.status in {RequestStatus.QUEUED.value, RequestStatus.IN_EXECUTION.value, RequestStatus.AWAITING_INPUT.value}:
-            threshold = policy["execution_hours"][priority]
-            if age_hours >= threshold:
-                return "medium", "Execution delay"
-        return None, None
+        return _sm_compute_sla_risk(row.status, row.priority, row.sla_policy_id, row.updated_at)
 
     @staticmethod
     def _ensure_request_tenant_access(row: RequestTable | None, tenant_id: str | None) -> None:
@@ -3432,310 +3336,21 @@ class GovernanceRepository:
             }
         )
 
-    @staticmethod
-    def _coerce_template_value(field_name: str, field_schema: dict, value):
-        expected_type = field_schema.get("type")
-        if expected_type == "string" and not isinstance(value, str):
-            raise ValueError(f"Template validation failed for {field_name}: expected string")
-        if expected_type == "integer" and (not isinstance(value, int) or isinstance(value, bool)):
-            raise ValueError(f"Template validation failed for {field_name}: expected integer")
-        if expected_type == "number" and (not isinstance(value, (int, float)) or isinstance(value, bool)):
-            raise ValueError(f"Template validation failed for {field_name}: expected number")
-        if expected_type == "boolean" and not isinstance(value, bool):
-            raise ValueError(f"Template validation failed for {field_name}: expected boolean")
-        if expected_type == "array" and not isinstance(value, list):
-            raise ValueError(f"Template validation failed for {field_name}: expected array")
-        if expected_type == "object" and not isinstance(value, dict):
-            raise ValueError(f"Template validation failed for {field_name}: expected object")
-        allowed_values = field_schema.get("enum")
-        if allowed_values and value not in allowed_values:
-            raise ValueError(f"Template validation failed for {field_name}: expected one of {', '.join(str(item) for item in allowed_values)}")
-        if isinstance(value, str):
-            min_length = field_schema.get("min_length")
-            max_length = field_schema.get("max_length")
-            pattern = field_schema.get("pattern")
-            if min_length is not None and len(value.strip()) < int(min_length):
-                raise ValueError(f"Template validation failed for {field_name}: minimum length is {min_length}")
-            if max_length is not None and len(value) > int(max_length):
-                raise ValueError(f"Template validation failed for {field_name}: maximum length is {max_length}")
-            if pattern and not re.fullmatch(str(pattern), value):
-                raise ValueError(f"Template validation failed for {field_name}: does not match required format")
-        return value
-
-    @staticmethod
-    def _conditional_rule_matches(rule: dict, field_values: dict) -> bool:
-        when = rule.get("when", {})
-        field_name = when.get("field")
-        if not field_name:
-            return False
-        current_value = field_values.get(field_name)
-        if "equals" in when:
-            return current_value == when.get("equals")
-        if "not_equals" in when:
-            return current_value != when.get("not_equals")
-        if "in" in when:
-            return current_value in when.get("in", [])
-        return False
+    # Delegated to app.domain.template_engine
+    _coerce_template_value = staticmethod(_te.coerce_value)
+    _conditional_rule_matches = staticmethod(_te.conditional_rule_matches)
 
     def _validate_template_payload(self, template_schema: dict, payload: dict, *, require_required: bool) -> dict:
-        properties = template_schema.get("properties", {})
-        required_fields = set(template_schema.get("required", []))
-        conditional_required = template_schema.get("conditional_required", [])
-        normalized = deepcopy(payload)
-
-        for field_name, field_schema in properties.items():
-            if field_name not in normalized and "default" in field_schema:
-                normalized[field_name] = deepcopy(field_schema["default"])
-
-        for field_name in required_fields:
-            value = normalized.get(field_name)
-            if require_required and (value is None or (isinstance(value, str) and not value.strip())):
-                raise ValueError(f"Template validation failed for {field_name}: field is required")
-
-        for rule in conditional_required:
-            target_field = rule.get("field")
-            if not target_field or not self._conditional_rule_matches(rule, normalized):
-                continue
-            value = normalized.get(target_field)
-            if require_required and (value is None or (isinstance(value, str) and not value.strip())):
-                raise ValueError(rule.get("message") or f"Template validation failed for {target_field}: field is required")
-
-        for field_name, value in list(normalized.items()):
-            field_schema = properties.get(field_name)
-            if field_schema is None:
-                continue
-            normalized[field_name] = self._coerce_template_value(field_name, field_schema, value)
-
-        return normalized
+        return _te.validate_payload(template_schema, payload, require_required=require_required)
 
     def _validate_template_definition(self, template_schema: dict) -> TemplateValidationResult:
-        issues: list[TemplateValidationIssue] = []
-        if not isinstance(template_schema, dict):
-            return TemplateValidationResult(
-                valid=False,
-                issues=[TemplateValidationIssue(level="error", path="schema", message="Template schema must be an object.")],
-                preview=TemplateValidationPreview(field_count=0, required_fields=[], conditional_rule_count=0, routed_fields=[], fields=[]),
-            )
+        return _te.validate_definition(template_schema)
 
-        properties = template_schema.get("properties", {})
-        required_fields = template_schema.get("required", [])
-        conditional_required = template_schema.get("conditional_required", [])
-        routing = template_schema.get("routing", {})
-
-        if not isinstance(properties, dict):
-            issues.append(TemplateValidationIssue(level="error", path="schema.properties", message="Properties must be an object."))
-            properties = {}
-        if not isinstance(required_fields, list):
-            issues.append(TemplateValidationIssue(level="error", path="schema.required", message="Required must be a list of field keys."))
-            required_fields = []
-        if not isinstance(conditional_required, list):
-            issues.append(TemplateValidationIssue(level="error", path="schema.conditional_required", message="Conditional rules must be a list."))
-            conditional_required = []
-        if not isinstance(routing, dict):
-            issues.append(TemplateValidationIssue(level="error", path="schema.routing", message="Routing must be an object."))
-            routing = {}
-
-        allowed_types = {"string", "number", "integer", "boolean"}
-        property_keys = set(properties.keys())
-        preview_fields: list[TemplateValidationPreviewField] = []
-        routing_rule_count = 0
-
-        for key, definition in properties.items():
-            if not isinstance(definition, dict):
-                issues.append(TemplateValidationIssue(level="error", path=f"schema.properties.{key}", message="Field definition must be an object."))
-                continue
-            field_type = str(definition.get("type", "") or "")
-            if field_type not in allowed_types:
-                issues.append(TemplateValidationIssue(level="error", path=f"schema.properties.{key}.type", message=f"Unsupported field type {field_type or '<missing>'}."))
-            if "title" not in definition:
-                issues.append(TemplateValidationIssue(level="warning", path=f"schema.properties.{key}.title", message="Field title is missing."))
-            enum_values = definition.get("enum", [])
-            if enum_values and not isinstance(enum_values, list):
-                issues.append(TemplateValidationIssue(level="error", path=f"schema.properties.{key}.enum", message="Enum must be a list."))
-            if isinstance(definition.get("min_length"), int) and isinstance(definition.get("max_length"), int):
-                if int(definition["min_length"]) > int(definition["max_length"]):
-                    issues.append(TemplateValidationIssue(level="error", path=f"schema.properties.{key}", message="min_length cannot exceed max_length."))
-            preview_fields.append(
-                TemplateValidationPreviewField(
-                    key=key,
-                    title=str(definition.get("title", key)),
-                    field_type=field_type or "unknown",
-                    required=key in required_fields,
-                    default=definition.get("default"),
-                    enum_values=[str(item) for item in enum_values] if isinstance(enum_values, list) else [],
-                    description=str(definition.get("description")) if definition.get("description") is not None else None,
-                )
-            )
-
-        for field in required_fields:
-            if field not in property_keys:
-                issues.append(TemplateValidationIssue(level="error", path="schema.required", message=f"Required field {field} is not defined in properties."))
-
-        for index, rule in enumerate(conditional_required):
-            if not isinstance(rule, dict):
-                issues.append(TemplateValidationIssue(level="error", path=f"schema.conditional_required[{index}]", message="Conditional rule must be an object."))
-                continue
-            when = rule.get("when", {})
-            fields = rule.get("fields")
-            if fields is None and rule.get("field"):
-                fields = [rule.get("field")]
-            when_field = when.get("field") if isinstance(when, dict) else None
-            if when_field not in property_keys:
-                issues.append(TemplateValidationIssue(level="error", path=f"schema.conditional_required[{index}].when.field", message="Conditional rule references an unknown field."))
-            if not isinstance(fields, list) or not fields:
-                issues.append(TemplateValidationIssue(level="error", path=f"schema.conditional_required[{index}].fields", message="Conditional rule must list one or more dependent fields."))
-                continue
-            for field in fields:
-                if field not in property_keys:
-                    issues.append(TemplateValidationIssue(level="error", path=f"schema.conditional_required[{index}].fields", message=f"Conditional field {field} is not defined in properties."))
-
-        routed_fields: set[str] = set()
-        for route_key, route_mapping in routing.items():
-            if route_key == "owner_team":
-                if not isinstance(route_mapping, str) or not route_mapping.strip():
-                    issues.append(TemplateValidationIssue(level="error", path=f"schema.routing.{route_key}", message="owner_team must be a non-empty string."))
-                continue
-            if route_key == "workflow_binding":
-                if not isinstance(route_mapping, str) or not route_mapping.strip():
-                    issues.append(TemplateValidationIssue(level="error", path=f"schema.routing.{route_key}", message="workflow_binding must be a non-empty string."))
-                continue
-            if route_key in {"reviewers", "promotion_approvers"}:
-                if not isinstance(route_mapping, list) or not all(isinstance(item, str) and item.strip() for item in route_mapping):
-                    issues.append(TemplateValidationIssue(level="error", path=f"schema.routing.{route_key}", message=f"{route_key} must be a list of non-empty strings."))
-                continue
-            if not isinstance(route_mapping, dict):
-                issues.append(TemplateValidationIssue(level="error", path=f"schema.routing.{route_key}", message="Routing mapping must be an object."))
-                continue
-            for field_name, field_mapping in route_mapping.items():
-                routed_fields.add(str(field_name))
-                if field_name not in property_keys:
-                    issues.append(TemplateValidationIssue(level="error", path=f"schema.routing.{route_key}.{field_name}", message="Routing references an unknown field."))
-                if not isinstance(field_mapping, dict):
-                    issues.append(TemplateValidationIssue(level="error", path=f"schema.routing.{route_key}.{field_name}", message="Routing field mapping must be an object."))
-                    continue
-                for match_value, target_value in field_mapping.items():
-                    routing_rule_count += 1
-                    if not str(match_value).strip():
-                        issues.append(TemplateValidationIssue(level="error", path=f"schema.routing.{route_key}.{field_name}", message="Routing match value must be non-empty."))
-                    normalized_target = target_value
-                    if isinstance(target_value, dict) and "value" in target_value:
-                        normalized_target = target_value.get("value")
-                    if route_key in {"reviewers_by_field", "promotion_approvers_by_field"}:
-                        if not isinstance(normalized_target, list) or not all(isinstance(item, str) and item.strip() for item in normalized_target):
-                            issues.append(TemplateValidationIssue(level="error", path=f"schema.routing.{route_key}.{field_name}.{match_value}", message="Target value must be a list of non-empty strings."))
-                    else:
-                        if not isinstance(normalized_target, str) or not normalized_target.strip():
-                            issues.append(TemplateValidationIssue(level="error", path=f"schema.routing.{route_key}.{field_name}.{match_value}", message="Target value must be a non-empty string."))
-
-        list_values: dict[str, list[str]] = {}
-        for list_key, label in {
-            "expected_artifact_types": "Expected artifact types",
-            "check_requirements": "Check requirements",
-            "promotion_requirements": "Promotion requirements",
-        }.items():
-            value = template_schema.get(list_key, [])
-            if value is None:
-                list_values[list_key] = []
-                continue
-            if not isinstance(value, list):
-                issues.append(TemplateValidationIssue(level="error", path=f"schema.{list_key}", message=f"{label} must be a list."))
-                list_values[list_key] = []
-                continue
-            normalized_items: list[str] = []
-            seen_items: set[str] = set()
-            for index, item in enumerate(value):
-                if not isinstance(item, str) or not item.strip():
-                    issues.append(TemplateValidationIssue(level="error", path=f"schema.{list_key}[{index}]", message=f"{label} entries must be non-empty strings."))
-                    continue
-                normalized = item.strip()
-                normalized_items.append(normalized)
-                if normalized in seen_items:
-                    issues.append(TemplateValidationIssue(level="warning", path=f"schema.{list_key}[{index}]", message=f"{label} contains duplicate entry {normalized}."))
-                seen_items.add(normalized)
-                if list_key in {"expected_artifact_types", "check_requirements"} and not re.match(r"^[a-z][a-z0-9_:-]*$", normalized):
-                    issues.append(TemplateValidationIssue(level="error", path=f"schema.{list_key}[{index}]", message=f"{label} must use lowercase identifier syntax."))
-                if list_key == "promotion_requirements":
-                    if ":" not in normalized:
-                        issues.append(TemplateValidationIssue(level="error", path=f"schema.{list_key}[{index}]", message="Promotion requirement must use type:value syntax."))
-                    else:
-                        requirement_type, requirement_value = normalized.split(":", 1)
-                        if requirement_type not in {"approval", "check", "segregation_of_duties"}:
-                            issues.append(TemplateValidationIssue(level="warning", path=f"schema.{list_key}[{index}]", message=f"Unknown promotion requirement type {requirement_type}."))
-                        if not requirement_value.strip():
-                            issues.append(TemplateValidationIssue(level="error", path=f"schema.{list_key}[{index}]", message="Promotion requirement value must be non-empty."))
-            list_values[list_key] = normalized_items
-
-        if not property_keys:
-            issues.append(TemplateValidationIssue(level="warning", path="schema.properties", message="Template has no fields defined."))
-        if "expected_artifact_types" in template_schema and not list_values.get("expected_artifact_types"):
-            issues.append(TemplateValidationIssue(level="warning", path="schema.expected_artifact_types", message="No expected artifact types defined."))
-        if "check_requirements" in template_schema and not list_values.get("check_requirements"):
-            issues.append(TemplateValidationIssue(level="warning", path="schema.check_requirements", message="No check requirements defined."))
-        if "promotion_requirements" in template_schema and not list_values.get("promotion_requirements"):
-            issues.append(TemplateValidationIssue(level="warning", path="schema.promotion_requirements", message="No promotion requirements defined."))
-
-        field_order_map = {
-            key: int(definition.get("order"))
-            for key, definition in properties.items()
-            if isinstance(definition, dict) and definition.get("order") is not None
-        }
-        issues.sort(key=lambda issue: (issue.level != "error", issue.path))
-        preview_fields.sort(key=lambda field: (field_order_map.get(field.key, 10_000), field.key))
-        return TemplateValidationResult(
-            valid=not any(issue.level == "error" for issue in issues),
-            issues=issues,
-            preview=TemplateValidationPreview(
-                field_count=len(preview_fields),
-                required_fields=[str(field) for field in required_fields],
-                conditional_rule_count=len(conditional_required) if isinstance(conditional_required, list) else 0,
-                routing_rule_count=routing_rule_count,
-                artifact_type_count=len(list_values.get("expected_artifact_types", [])),
-                check_requirement_count=len(list_values.get("check_requirements", [])),
-                promotion_requirement_count=len(list_values.get("promotion_requirements", [])),
-                routed_fields=sorted(routed_fields),
-                fields=preview_fields,
-            ),
-        )
-
-    @staticmethod
-    def _resolve_routing_value(mapping_groups: dict, field_values: dict):
-        for source_field, mapping in mapping_groups.items():
-            field_value = field_values.get(source_field)
-            if isinstance(mapping, dict) and field_value in mapping:
-                target = deepcopy(mapping[field_value])
-                if isinstance(target, dict) and "value" in target:
-                    return deepcopy(target["value"])
-                return target
-        return None
+    # Delegated to app.domain.template_engine
+    _resolve_routing_value = staticmethod(_te.resolve_routing_value)
 
     def _resolve_request_routing(self, template_schema: dict, input_payload: dict) -> dict:
-        routing = template_schema.get("routing", {})
-        owner_team = routing.get("owner_team")
-        if owner_team is None:
-            owner_team = self._resolve_routing_value(routing.get("owner_team_by_field", {}), input_payload)
-
-        workflow_binding = routing.get("workflow_binding")
-        if workflow_binding is None:
-            workflow_binding = self._resolve_routing_value(routing.get("workflow_binding_by_field", {}), input_payload)
-
-        reviewers = routing.get("reviewers")
-        if reviewers is None:
-            reviewers = self._resolve_routing_value(routing.get("reviewers_by_field", {}), input_payload)
-        if not isinstance(reviewers, list):
-            reviewers = []
-
-        promotion_approvers = routing.get("promotion_approvers")
-        if promotion_approvers is None:
-            promotion_approvers = self._resolve_routing_value(routing.get("promotion_approvers_by_field", {}), input_payload)
-        if not isinstance(promotion_approvers, list):
-            promotion_approvers = []
-
-        return {
-            "owner_team_id": owner_team,
-            "workflow_binding_id": workflow_binding,
-            "reviewers": reviewers,
-            "promotion_approvers": promotion_approvers,
-        }
+        return _te.resolve_routing(template_schema, input_payload)
 
     @staticmethod
     def _run_detail_from_row(

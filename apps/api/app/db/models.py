@@ -496,3 +496,515 @@ class ArtifactLineageEdgeTable(Base):
     to_version_id: Mapped[str] = mapped_column(String(64), nullable=False)
     relation: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+# ---------------------------------------------------------------------------
+# Workflow execution engine tables
+# ---------------------------------------------------------------------------
+
+class WorkflowDefinitionTable(Base):
+    __tablename__ = "workflow_definitions"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    version: Mapped[str] = mapped_column(String(32), nullable=False)
+    template_id: Mapped[str | None] = mapped_column(String(64))
+    steps: Mapped[dict] = mapped_column(JSON, nullable=False, default=list)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="draft")
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class WorkflowExecutionTable(Base):
+    __tablename__ = "workflow_executions"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    run_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    workflow_definition_id: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    current_step_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    step_states: Mapped[dict] = mapped_column(JSON, nullable=False, default=list)
+    pause_reason: Mapped[str | None] = mapped_column(Text)
+    cancel_reason: Mapped[str | None] = mapped_column(Text)
+    failure_reason: Mapped[str | None] = mapped_column(Text)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    started_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=True))
+    paused_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=True))
+    resumed_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class WorkflowStepExecutionTable(Base):
+    __tablename__ = "workflow_step_executions"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    workflow_execution_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    step_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    step_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    input_payload: Mapped[dict | None] = mapped_column(JSON)
+    output_payload: Mapped[dict | None] = mapped_column(JSON)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    started_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=True))
+
+
+# ---------------------------------------------------------------------------
+# Policy engine tables (Phase 2, Area A)
+# ---------------------------------------------------------------------------
+
+class PolicyRuleTable(Base):
+    __tablename__ = "policy_rules"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    policy_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    condition: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    actions: Mapped[dict] = mapped_column(JSON, nullable=False, default=list)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class CheckTypeDefinitionTable(Base):
+    __tablename__ = "check_type_definitions"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    handler_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    config: Mapped[dict | None] = mapped_column(JSON)
+    severity: Mapped[str] = mapped_column(String(32), nullable=False, default="required")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+# ---------------------------------------------------------------------------
+# Collaboration mode tables (Phase 2, Area B)
+# ---------------------------------------------------------------------------
+
+class CollaborationModeTransitionTable(Base):
+    __tablename__ = "collaboration_mode_transitions"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    from_mode: Mapped[str] = mapped_column(String(32), nullable=False)
+    to_mode: Mapped[str] = mapped_column(String(32), nullable=False)
+    actor: Mapped[str] = mapped_column(String(128), nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text)
+    policy_basis: Mapped[dict | None] = mapped_column(JSON)
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+# ---------------------------------------------------------------------------
+# Context bundle tables (Phase 2, Area C)
+# ---------------------------------------------------------------------------
+
+class ContextBundleTable(Base):
+    __tablename__ = "context_bundles"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    session_id: Mapped[str | None] = mapped_column(String(64))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    bundle_type: Mapped[str] = mapped_column(String(32), nullable=False, default="assignment")
+    contents: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    policy_scope: Mapped[dict | None] = mapped_column(JSON)
+    assembled_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    assembled_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+    provenance: Mapped[dict] = mapped_column(JSON, nullable=False, default=list)
+
+
+class ContextAccessLogTable(Base):
+    __tablename__ = "context_access_log"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    bundle_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    accessor_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    accessor_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    accessed_resource: Mapped[str] = mapped_column(String(255), nullable=False)
+    access_result: Mapped[str] = mapped_column(String(32), nullable=False)
+    policy_basis: Mapped[dict | None] = mapped_column(JSON)
+    accessed_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+# ---------------------------------------------------------------------------
+# Saga orchestration tables (Phase 2, Area D)
+# ---------------------------------------------------------------------------
+
+class SagaDefinitionTable(Base):
+    __tablename__ = "saga_definitions"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    steps: Mapped[dict] = mapped_column(JSON, nullable=False, default=list)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="draft")
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class SagaExecutionTable(Base):
+    __tablename__ = "saga_executions"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    saga_definition_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    step_states: Mapped[dict] = mapped_column(JSON, nullable=False, default=list)
+    compensation_log: Mapped[dict] = mapped_column(JSON, nullable=False, default=list)
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=True))
+
+
+# ---------------------------------------------------------------------------
+# Federation tables (Phase 2, Area E)
+# ---------------------------------------------------------------------------
+
+class ProjectionMappingTable(Base):
+    __tablename__ = "projection_mappings"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    integration_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    entity_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    entity_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    external_system: Mapped[str] = mapped_column(String(128), nullable=False)
+    external_ref: Mapped[str | None] = mapped_column(String(255))
+    external_state: Mapped[dict | None] = mapped_column(JSON)
+    projection_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    last_projected_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=True))
+    last_synced_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ReconciliationLogTable(Base):
+    __tablename__ = "reconciliation_log"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    projection_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    detail: Mapped[str | None] = mapped_column(Text)
+    resolved_by: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Domain pack tables (Area A)
+# ---------------------------------------------------------------------------
+
+class DomainPackTable(Base):
+    __tablename__ = "domain_packs"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    version: Mapped[str] = mapped_column(String(32), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="draft")
+    contributed_templates: Mapped[dict] = mapped_column(JSON, nullable=False, default=list)
+    contributed_artifact_types: Mapped[dict] = mapped_column(JSON, nullable=False, default=list)
+    contributed_workflows: Mapped[dict] = mapped_column(JSON, nullable=False, default=list)
+    contributed_policies: Mapped[dict] = mapped_column(JSON, nullable=False, default=list)
+    activated_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+class DomainPackInstallationTable(Base):
+    __tablename__ = "domain_pack_installations"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    pack_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    installed_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="installed")
+    installed_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    installed_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+# ---------------------------------------------------------------------------
+# Phase 3: Workspace & change set tables (Area B)
+# ---------------------------------------------------------------------------
+
+class WorkspaceTable(Base):
+    __tablename__ = "workspaces"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="created")
+    owner_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_ref: Mapped[str | None] = mapped_column(String(255))
+    target_ref: Mapped[str | None] = mapped_column(String(255))
+    protected_targets: Mapped[dict] = mapped_column(JSON, nullable=False, default=list)
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+class ChangeSetTable(Base):
+    __tablename__ = "change_sets"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    workspace_id: Mapped[str | None] = mapped_column(String(64))
+    artifact_id: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="draft")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    diff_metadata: Mapped[dict | None] = mapped_column(JSON)
+    lineage: Mapped[dict | None] = mapped_column(JSON)
+    applicable_type: Mapped[str] = mapped_column(String(64), nullable=False, default="generic")
+    description: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+# ---------------------------------------------------------------------------
+# Phase 3: Editorial workflow tables (Area C)
+# ---------------------------------------------------------------------------
+
+class EditorialWorkflowTable(Base):
+    __tablename__ = "editorial_workflows"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    artifact_id: Mapped[str | None] = mapped_column(String(64))
+    current_stage: Mapped[str] = mapped_column(String(64), nullable=False, default="drafting")
+    stages: Mapped[dict] = mapped_column(JSON, nullable=False, default=list)
+    role_assignments: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+class ContentProjectionTable(Base):
+    __tablename__ = "content_projections"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    artifact_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    channel: Mapped[str] = mapped_column(String(128), nullable=False)
+    projection_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    projected_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=True))
+    external_ref: Mapped[str | None] = mapped_column(String(255))
+    config: Mapped[dict | None] = mapped_column(JSON)
+
+# ---------------------------------------------------------------------------
+# Phase 3: Knowledge artifact tables (Area D)
+# ---------------------------------------------------------------------------
+
+class KnowledgeArtifactTable(Base):
+    __tablename__ = "knowledge_artifacts"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    content: Mapped[str | None] = mapped_column(Text)
+    content_type: Mapped[str] = mapped_column(String(64), nullable=False, default="text")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="draft")
+    policy_scope: Mapped[dict | None] = mapped_column(JSON)
+    provenance: Mapped[dict] = mapped_column(JSON, nullable=False, default=list)
+    tags: Mapped[dict] = mapped_column(JSON, nullable=False, default=list)
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+class KnowledgeArtifactVersionTable(Base):
+    __tablename__ = "knowledge_artifact_versions"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    artifact_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str | None] = mapped_column(Text)
+    summary: Mapped[str | None] = mapped_column(Text)
+    author: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+# ---------------------------------------------------------------------------
+# Phase 3: Planning construct tables (Area E)
+# ---------------------------------------------------------------------------
+
+class PlanningConstructTable(Base):
+    __tablename__ = "planning_constructs"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    type: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    owner_team_id: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    target_date: Mapped[DateTime | None] = mapped_column(DateTime(timezone=True))
+    capacity_budget: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+class PlanningMembershipTable(Base):
+    __tablename__ = "planning_memberships"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    planning_construct_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    added_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Data governance tables
+# ---------------------------------------------------------------------------
+
+class DataClassificationTable(Base):
+    __tablename__ = "data_classifications"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    entity_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    entity_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    classification_level: Mapped[str] = mapped_column(String(32), nullable=False, default="internal")
+    residency_zone: Mapped[str | None] = mapped_column(String(64))
+    retention_policy_id: Mapped[str | None] = mapped_column(String(64))
+    classified_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    classified_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+class RetentionPolicyTable(Base):
+    __tablename__ = "retention_policies"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    retention_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    action_on_expiry: Mapped[str] = mapped_column(String(32), nullable=False, default="archive")
+    applies_to: Mapped[dict] = mapped_column(JSON, nullable=False, default=list)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+class DataLineageTable(Base):
+    __tablename__ = "data_lineage_records"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    transformation: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+# ---------------------------------------------------------------------------
+# Phase 4: Billing & quota tables
+# ---------------------------------------------------------------------------
+
+class UsageMeterTable(Base):
+    __tablename__ = "usage_meters"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    meter_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    resource_id: Mapped[str | None] = mapped_column(String(64))
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    unit: Mapped[str] = mapped_column(String(32), nullable=False, default="count")
+    cost_amount: Mapped[float | None] = mapped_column(nullable=True)
+    cost_currency: Mapped[str] = mapped_column(String(8), nullable=False, default="USD")
+    attributed_to: Mapped[str | None] = mapped_column(String(128))
+    recorded_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+class QuotaDefinitionTable(Base):
+    __tablename__ = "quota_definitions"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    meter_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    limit_value: Mapped[int] = mapped_column(Integer, nullable=False)
+    period: Mapped[str] = mapped_column(String(32), nullable=False, default="monthly")
+    enforcement: Mapped[str] = mapped_column(String(32), nullable=False, default="soft")
+    budget_amount: Mapped[float | None] = mapped_column(nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+# ---------------------------------------------------------------------------
+# Phase 4: Queue & assignment tables
+# ---------------------------------------------------------------------------
+
+class AssignmentGroupTable(Base):
+    __tablename__ = "assignment_groups"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    skill_tags: Mapped[dict] = mapped_column(JSON, nullable=False, default=list)
+    max_capacity: Mapped[int | None] = mapped_column(Integer)
+    current_load: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+class EscalationRuleTable(Base):
+    __tablename__ = "escalation_rules"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    condition: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    escalation_target: Mapped[str] = mapped_column(String(128), nullable=False)
+    escalation_type: Mapped[str] = mapped_column(String(32), nullable=False, default="reassign")
+    delay_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+class SlaDefinitionTable(Base):
+    __tablename__ = "sla_definitions"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    scope_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    scope_id: Mapped[str | None] = mapped_column(String(64))
+    response_target_hours: Mapped[float | None] = mapped_column(nullable=True)
+    resolution_target_hours: Mapped[float | None] = mapped_column(nullable=True)
+    review_deadline_hours: Mapped[float | None] = mapped_column(nullable=True)
+    warning_threshold_pct: Mapped[int] = mapped_column(Integer, nullable=False, default=70)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+class SlaBreachAuditTable(Base):
+    __tablename__ = "sla_breach_audit"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    sla_definition_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    breach_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_hours: Mapped[float] = mapped_column(nullable=False)
+    actual_hours: Mapped[float] = mapped_column(nullable=False)
+    severity: Mapped[str] = mapped_column(String(32), nullable=False)
+    remediation_action: Mapped[str | None] = mapped_column(String(255))
+    breached_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+# ---------------------------------------------------------------------------
+# Phase 4: View, replay, and deployment environment tables
+# ---------------------------------------------------------------------------
+
+class ViewDefinitionTable(Base):
+    __tablename__ = "view_definitions"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    view_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    config: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+class EventReplayCheckpointTable(Base):
+    __tablename__ = "event_replay_checkpoints"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    replay_scope: Mapped[str] = mapped_column(String(64), nullable=False)
+    scope_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    last_event_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    replayed_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+class DeploymentEnvironmentTable(Base):
+    __tablename__ = "deployment_environments"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    mode: Mapped[str] = mapped_column(String(32), nullable=False, default="saas")
+    isolation_level: Mapped[str] = mapped_column(String(32), nullable=False, default="shared")
+    config: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)

@@ -69,6 +69,11 @@ from app.models.request import RequestRecord
 from app.models.security import LocalLoginRequest, Principal, PrincipalRole, PublicRegistrationRequest, RegistrationSubmissionResponse
 from app.models.template import TemplateRecord
 from app.repositories.governance_repository import governance_repository
+from app.repositories.request_lifecycle_repository import request_lifecycle_repository
+from app.repositories.promotion_repository import promotion_repository
+from app.repositories.analytics_repository import analytics_repository
+from app.repositories.org_repository import org_repository
+from app.repositories.event_query_repository import event_query_repository
 from app.services.performance_metrics_service import performance_metrics_service
 
 
@@ -87,10 +92,10 @@ class GovernanceService:
         request_id: str | None = None,
         tenant_id: str | None = None,
     ) -> PaginatedResponse[RequestRecord]:
-        return governance_repository.list_requests(page, page_size, status, owner_team_id, workflow, request_id, tenant_id)
+        return request_lifecycle_repository.list_requests(page, page_size, status, owner_team_id, workflow, request_id, tenant_id)
 
     def get_request(self, request_id: str, principal: Principal) -> RequestDetail:
-        return governance_repository.get_request(request_id, principal.tenant_id)
+        return request_lifecycle_repository.get_request(request_id, principal.tenant_id)
 
     def list_agent_integrations_for_request(self, request_id: str, principal: Principal) -> list[IntegrationRecord]:
         return governance_repository.list_agent_integrations_for_request(request_id, principal.tenant_id)
@@ -167,31 +172,31 @@ class GovernanceService:
         request_id: str | None = None,
         tenant_id: str | None = None,
     ) -> PaginatedResponse[ReviewQueueItem]:
-        return governance_repository.list_review_queue(page, page_size, assigned_reviewer, blocking_only, stale_only, request_id, tenant_id)
+        return promotion_repository.list_review_queue(page, page_size, assigned_reviewer, blocking_only, stale_only, request_id, tenant_id)
 
     def record_review_decision(self, review_id: str, payload: ReviewDecisionRequest, principal: Principal) -> ReviewQueueItem:
-        return governance_repository.record_review_decision(review_id, payload, principal.tenant_id)
+        return promotion_repository.record_review_decision(review_id, payload, principal.tenant_id)
 
     def override_review_assignment(self, review_id: str, payload: ReviewAssignmentOverrideRequest, principal: Principal) -> ReviewQueueItem:
-        return governance_repository.override_review_assignment(review_id, payload, principal.tenant_id)
+        return promotion_repository.override_review_assignment(review_id, payload, principal.tenant_id)
 
     def get_promotion(self, promotion_id: str, principal: Principal) -> PromotionDetail:
-        return governance_repository.get_promotion(promotion_id, principal.tenant_id)
+        return promotion_repository.get_promotion(promotion_id, principal.tenant_id)
 
     def apply_promotion_action(self, promotion_id: str, payload: PromotionActionRequest, principal: Principal) -> PromotionDetail:
-        return governance_repository.apply_promotion_action(promotion_id, payload, principal.tenant_id)
+        return promotion_repository.apply_promotion_action(promotion_id, payload, principal.tenant_id)
 
     def override_promotion_approval(self, promotion_id: str, payload: PromotionApprovalOverrideRequest, principal: Principal) -> PromotionDetail:
-        return governance_repository.override_promotion_approval(promotion_id, payload, principal.tenant_id)
+        return promotion_repository.override_promotion_approval(promotion_id, payload, principal.tenant_id)
 
     def evaluate_check(self, promotion_id: str, check_id: str, payload: CheckEvaluationRequest, principal: Principal) -> PromotionDetail:
-        return governance_repository.evaluate_check(promotion_id, check_id, payload, principal.tenant_id)
+        return promotion_repository.evaluate_check(promotion_id, check_id, payload, principal.tenant_id)
 
     def override_check(self, promotion_id: str, check_id: str, payload: CheckOverrideRequest, principal: Principal) -> PromotionDetail:
-        return governance_repository.override_check(promotion_id, check_id, payload, principal.tenant_id)
+        return promotion_repository.override_check(promotion_id, check_id, payload, principal.tenant_id)
 
     def run_promotion_checks(self, promotion_id: str, payload: CheckRunRequest, principal: Principal) -> PromotionDetail:
-        return governance_repository.run_promotion_checks(promotion_id, payload, principal.tenant_id)
+        return promotion_repository.run_promotion_checks(promotion_id, payload, principal.tenant_id)
 
     def list_capabilities(self, page: int, page_size: int, principal: Principal) -> PaginatedResponse[CapabilityRecord]:
         return governance_repository.list_capabilities(page, page_size, principal.tenant_id)
@@ -207,7 +212,7 @@ class GovernanceService:
         user_id: str | None = None,
         portfolio_id: str | None = None,
     ) -> list[AnalyticsWorkflowRow]:
-        return governance_repository.list_workflow_analytics(days, tenant_id, team_id, user_id, portfolio_id)
+        return analytics_repository.list_workflow_analytics(days, tenant_id, team_id, user_id, portfolio_id)
 
     def list_workflow_trends(
         self,
@@ -218,7 +223,7 @@ class GovernanceService:
         portfolio_id: str | None = None,
         workflow: str | None = None,
     ) -> list[WorkflowTrendPoint]:
-        return governance_repository.list_workflow_trends(days, tenant_id, team_id, user_id, portfolio_id, workflow)
+        return analytics_repository.list_workflow_trends(days, tenant_id, team_id, user_id, portfolio_id, workflow)
 
     def list_agent_analytics(
         self,
@@ -228,7 +233,7 @@ class GovernanceService:
         user_id: str | None = None,
         portfolio_id: str | None = None,
     ) -> list[AnalyticsAgentRow]:
-        return governance_repository.list_agent_analytics(days, tenant_id, team_id, user_id, portfolio_id)
+        return analytics_repository.list_agent_analytics(days, tenant_id, team_id, user_id, portfolio_id)
 
     def list_agent_trends(
         self,
@@ -239,10 +244,10 @@ class GovernanceService:
         portfolio_id: str | None = None,
         agent: str | None = None,
     ) -> list[AgentTrendPoint]:
-        return governance_repository.list_agent_trends(days, tenant_id, team_id, user_id, portfolio_id, agent)
+        return analytics_repository.list_agent_trends(days, tenant_id, team_id, user_id, portfolio_id, agent)
 
     def list_bottleneck_analytics(self, days: int = 30, tenant_id: str | None = None) -> list[AnalyticsBottleneckRow]:
-        return governance_repository.list_bottleneck_analytics(days, tenant_id)
+        return analytics_repository.list_bottleneck_analytics(days, tenant_id)
 
     def list_performance_route_summaries(
         self, page: int, page_size: int, days: int, principal: Principal
@@ -303,102 +308,102 @@ class GovernanceService:
         )
 
     def get_performance_operations_summary(self, principal: Principal) -> PerformanceOperationsSummary:
-        return governance_repository.get_performance_operations_summary(principal.tenant_id)
+        return analytics_repository.get_performance_operations_summary(principal.tenant_id)
 
     def list_performance_operations_trends(self, principal: Principal, days: int = 30) -> list[PerformanceOperationsTrendPoint]:
-        return governance_repository.list_performance_operations_trends(principal.tenant_id, days)
+        return analytics_repository.list_performance_operations_trends(principal.tenant_id, days)
 
     def list_audit_entries(self, request_id: str, principal: Principal) -> list[AuditEntry]:
-        return governance_repository.list_audit_entries(request_id, principal.tenant_id)
+        return request_lifecycle_repository.list_audit_entries(request_id, principal.tenant_id)
 
     def list_policies(self, principal: Principal) -> list[PolicyRecord]:
-        return governance_repository.list_policies(principal.tenant_id)
+        return org_repository.list_policies(principal.tenant_id)
 
     def update_policy_rules(self, policy_id: str, payload: PolicyRuleUpdateRequest, principal: Principal) -> PolicyRecord:
-        return governance_repository.update_policy_rules(policy_id, payload, principal.tenant_id)
+        return org_repository.update_policy_rules(policy_id, payload, principal.tenant_id)
 
     def list_request_check_runs(self, request_id: str, principal: Principal) -> list[CheckRunRecord]:
-        return governance_repository.list_request_check_runs(request_id, principal.tenant_id)
+        return promotion_repository.list_request_check_runs(request_id, principal.tenant_id)
 
     def list_promotion_check_runs(self, promotion_id: str, principal: Principal) -> list[CheckRunRecord]:
-        return governance_repository.list_promotion_check_runs(promotion_id, principal.tenant_id)
+        return promotion_repository.list_promotion_check_runs(promotion_id, principal.tenant_id)
 
     def list_integrations(self, principal: Principal) -> list[IntegrationRecord]:
-        return governance_repository.list_integrations(self._admin_scope(principal))
+        return org_repository.list_integrations(self._admin_scope(principal))
 
     def create_integration(self, payload: CreateIntegrationRequest, principal: Principal) -> IntegrationRecord:
-        return governance_repository.create_integration(payload, principal.tenant_id)
+        return org_repository.create_integration(payload, principal.tenant_id)
 
     def update_integration(self, integration_id: str, payload: UpdateIntegrationRequest, principal: Principal) -> IntegrationRecord:
-        return governance_repository.update_integration(integration_id, payload, principal.tenant_id)
+        return org_repository.update_integration(integration_id, payload, principal.tenant_id)
 
     def delete_integration(self, integration_id: str, principal: Principal) -> None:
-        governance_repository.delete_integration(integration_id, principal.tenant_id)
+        org_repository.delete_integration(integration_id, principal.tenant_id)
 
     def list_users(self, principal: Principal) -> list[UserRecord]:
-        return governance_repository.list_users(self._admin_scope(principal))
+        return org_repository.list_users(self._admin_scope(principal))
 
     def list_tenants(self, principal: Principal) -> list[TenantRecord]:
         if PrincipalRole.PLATFORM_ADMIN not in principal.roles:
             raise PermissionError("Tenant catalog requires platform administration scope")
-        return governance_repository.list_tenants()
+        return org_repository.list_tenants()
 
     def create_tenant(self, payload: CreateTenantRequest, principal: Principal) -> TenantRecord:
         if PrincipalRole.PLATFORM_ADMIN not in principal.roles:
             raise PermissionError("Tenant creation requires platform administration scope")
-        return governance_repository.create_tenant(payload)
+        return org_repository.create_tenant(payload)
 
     def update_tenant(self, tenant_id: str, payload: UpdateTenantRequest, principal: Principal) -> TenantRecord:
         if PrincipalRole.PLATFORM_ADMIN not in principal.roles:
             raise PermissionError("Tenant updates require platform administration scope")
-        return governance_repository.update_tenant(tenant_id, payload)
+        return org_repository.update_tenant(tenant_id, payload)
 
     def create_user(self, payload: CreateUserRequest, principal: Principal) -> UserRecord:
-        return governance_repository.create_user(payload, principal.tenant_id)
+        return org_repository.create_user(payload, principal.tenant_id)
 
     def update_user(self, user_id: str, payload: UpdateUserRequest, principal: Principal) -> UserRecord:
-        return governance_repository.update_user(user_id, payload, principal.tenant_id)
+        return org_repository.update_user(user_id, payload, principal.tenant_id)
 
     def authenticate_local_user(self, payload: LocalLoginRequest) -> Principal:
-        return governance_repository.authenticate_local_user(payload.email, payload.password, payload.tenant_id)
+        return org_repository.authenticate_local_user(payload.email, payload.password, payload.tenant_id)
 
     def create_public_registration_request(self, payload: PublicRegistrationRequest) -> RegistrationSubmissionResponse:
-        return governance_repository.create_public_registration_request(payload)
+        return request_lifecycle_repository.create_public_registration_request(payload)
 
     def list_organizations(self, principal: Principal) -> list[OrganizationRecord]:
-        return governance_repository.list_organizations(self._admin_scope(principal))
+        return org_repository.list_organizations(self._admin_scope(principal))
 
     def create_organization(self, payload: CreateOrganizationRequest, principal: Principal) -> OrganizationRecord:
         if PrincipalRole.PLATFORM_ADMIN not in principal.roles:
             payload = payload.model_copy(update={"tenant_id": principal.tenant_id})
-        return governance_repository.create_organization(payload, principal.tenant_id)
+        return org_repository.create_organization(payload, principal.tenant_id)
 
     def update_organization(self, organization_id: str, payload: UpdateOrganizationRequest, principal: Principal) -> OrganizationRecord:
-        return governance_repository.update_organization(organization_id, payload, principal.tenant_id)
+        return org_repository.update_organization(organization_id, payload, principal.tenant_id)
 
     def list_public_registration_teams(self, tenant_id: str) -> list[TeamRecord]:
-        return governance_repository.list_teams(tenant_id)
+        return org_repository.list_teams(tenant_id)
 
     def list_teams(self, principal: Principal) -> list[TeamRecord]:
-        return governance_repository.list_teams(self._admin_scope(principal))
+        return org_repository.list_teams(self._admin_scope(principal))
 
     def create_team(self, payload: CreateTeamRequest, principal: Principal) -> TeamRecord:
-        return governance_repository.create_team(payload, principal.tenant_id)
+        return org_repository.create_team(payload, principal.tenant_id)
 
     def update_team(self, team_id: str, payload: UpdateTeamRequest, principal: Principal) -> TeamRecord:
-        return governance_repository.update_team(team_id, payload, principal.tenant_id)
+        return org_repository.update_team(team_id, payload, principal.tenant_id)
 
     def add_team_membership(self, payload: AddTeamMembershipRequest, principal: Principal) -> TeamRecord:
-        return governance_repository.add_team_membership(payload, principal.tenant_id)
+        return org_repository.add_team_membership(payload, principal.tenant_id)
 
     def list_portfolios(self, principal: Principal) -> list[PortfolioRecord]:
-        return governance_repository.list_portfolios(self._admin_scope(principal))
+        return org_repository.list_portfolios(self._admin_scope(principal))
 
     def create_portfolio(self, payload: CreatePortfolioRequest, principal: Principal) -> PortfolioRecord:
-        return governance_repository.create_portfolio(payload, principal.tenant_id)
+        return org_repository.create_portfolio(payload, principal.tenant_id)
 
     def list_portfolio_summaries(self, principal: Principal) -> list[PortfolioSummary]:
-        return governance_repository.list_portfolio_summaries(principal.tenant_id)
+        return org_repository.list_portfolio_summaries(principal.tenant_id)
 
     def list_delivery_dora(
         self,
@@ -407,7 +412,7 @@ class GovernanceService:
         team_id: str | None = None,
         user_id: str | None = None,
     ) -> list[DeliveryDoraRow]:
-        return governance_repository.list_delivery_dora(principal.tenant_id, portfolio_id, team_id, user_id)
+        return analytics_repository.list_delivery_dora(principal.tenant_id, portfolio_id, team_id, user_id)
 
     def list_delivery_lifecycle(
         self,
@@ -416,7 +421,7 @@ class GovernanceService:
         team_id: str | None = None,
         user_id: str | None = None,
     ) -> list[DeliveryLifecycleRow]:
-        return governance_repository.list_delivery_lifecycle(principal.tenant_id, portfolio_id, team_id, user_id)
+        return analytics_repository.list_delivery_lifecycle(principal.tenant_id, portfolio_id, team_id, user_id)
 
     def list_delivery_trends(
         self,
@@ -426,7 +431,7 @@ class GovernanceService:
         team_id: str | None = None,
         user_id: str | None = None,
     ) -> list[DeliveryTrendPoint]:
-        return governance_repository.list_delivery_trends(principal.tenant_id, days, portfolio_id, team_id, user_id)
+        return analytics_repository.list_delivery_trends(principal.tenant_id, days, portfolio_id, team_id, user_id)
 
     def get_delivery_forecast(
         self,
@@ -437,7 +442,7 @@ class GovernanceService:
         team_id: str | None = None,
         user_id: str | None = None,
     ) -> DeliveryForecastSummary:
-        return governance_repository.get_delivery_forecast(principal.tenant_id, history_days, forecast_days, portfolio_id, team_id, user_id)
+        return analytics_repository.get_delivery_forecast(principal.tenant_id, history_days, forecast_days, portfolio_id, team_id, user_id)
 
     def list_delivery_forecast_points(
         self,
@@ -448,7 +453,7 @@ class GovernanceService:
         team_id: str | None = None,
         user_id: str | None = None,
     ) -> list[DeliveryForecastPoint]:
-        return governance_repository.list_delivery_forecast_points(principal.tenant_id, history_days, forecast_days, portfolio_id, team_id, user_id)
+        return analytics_repository.list_delivery_forecast_points(principal.tenant_id, history_days, forecast_days, portfolio_id, team_id, user_id)
 
     def list_event_ledger(
         self,
@@ -462,7 +467,7 @@ class GovernanceService:
         check_run_id: str | None = None,
         event_type: str | None = None,
     ) -> PaginatedResponse[EventLedgerRecord]:
-        return governance_repository.list_event_ledger(
+        return event_query_repository.list_event_ledger(
             page=page,
             page_size=page_size,
             tenant_id=principal.tenant_id,
@@ -483,7 +488,7 @@ class GovernanceService:
         status: str | None = None,
         topic: str | None = None,
     ) -> PaginatedResponse[EventOutboxRecord]:
-        return governance_repository.list_event_outbox(
+        return event_query_repository.list_event_outbox(
             page=page,
             page_size=page_size,
             tenant_id=principal.tenant_id,

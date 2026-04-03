@@ -1,0 +1,1 @@
+# Concrete substrate adapter implementations.
