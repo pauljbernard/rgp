@@ -39,10 +39,11 @@ describe("NewRequestPage", () => {
     render(ui);
 
     expect(screen.getByRole("heading", { name: "Select Request Template" })).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: /Assessment Revision/i })).toHaveAttribute(
-      "href",
-      "/requests/new?template=tmpl_assessment%401.4.0",
-    );
+    expect(screen.getByLabelText("Search Templates")).toBeInTheDocument();
+    expect(screen.getByRole("columnheader", { name: /^Template ▲$/ })).toBeInTheDocument();
+    expect(screen.getByRole("columnheader", { name: /^Template ID ↕$/ })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Assessment Revision" })).toHaveAttribute("href", "/requests/new?template=tmpl_assessment%401.4.0");
+    expect(screen.getByText("Page 1 of 1 · 2 total records")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Create Draft" })).not.toBeInTheDocument();
   });
 
