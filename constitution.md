@@ -174,6 +174,100 @@ Execution systems SHALL be authoritative only for runtime state.
 
 
 
+2.4 External Substrate Neutrality
+
+
+
+
+
+2.4.1 Principle
+
+
+
+
+
+RGP SHALL operate as a universal governance control plane independent of any specific execution, storage, or management substrate.
+
+
+
+
+
+2.4.2 Substrate Classes
+
+
+
+
+
+RGP SHALL support governance across multiple substrate classes, including but not limited to:
+
+
+
+
+
+source control systems
+content and document systems
+publishing systems
+service management systems
+project and planning systems
+runtime execution systems
+agent platforms
+
+
+
+
+
+2.4.3 Canonical Authority
+
+
+
+
+
+RGP SHALL be authoritative for governance state regardless of substrate.
+
+
+
+
+
+2.4.4 Projection Model
+
+
+
+
+
+External systems SHALL be treated as:
+
+
+
+
+
+execution substrates
+storage substrates
+interaction substrates
+projection targets
+
+
+
+
+
+Host-native constructs SHALL be treated as projections or signals and SHALL NOT define canonical governance semantics.
+
+
+
+
+
+2.4.5 Adapter Requirement
+
+
+
+
+
+All substrate integrations SHALL be implemented through explicit adapter contracts.
+
+
+
+
+
+
 
 
 3. HOMOICONIC PRINCIPLE
@@ -320,7 +414,7 @@ Execution SHALL be delegated to external systems but governed centrally.
 
 
 
-All work types SHALL be represented within a single unified model.
+All work types across all substrate classes SHALL be representable within a single unified, domain-neutral model without requiring substrate-specific semantics.
 
 
 
@@ -401,6 +495,7 @@ Final authority SHALL remain human or policy-controlled.
 
 
 All requests SHALL resolve to ownership.
+Ownership and accountability SHALL support direct ownership, shared ownership, queue-based routing, assignment groups, escalation contexts, and dynamic workload balancing.
 
 
 
@@ -416,6 +511,8 @@ All requests SHALL resolve to ownership.
 
 
 All outputs SHALL be governed artifacts.
+All artifacts SHALL be substrate-agnostic representations and MAY be projected into external systems in substrate-specific forms.
+Artifacts SHALL support draft state, review state, published state, archived state, multi-channel projection, and branchable revision histories where applicable.
 
 
 
@@ -573,6 +670,116 @@ The system SHALL measure and optimize workflow performance.
 
 
 
+4.19 Normalized Event Semantics
+
+
+
+
+
+All external signals SHALL be translated into canonical RGP events.
+Event meaning SHALL be substrate-independent.
+Raw substrate events SHALL be preserved alongside normalized events.
+
+
+
+
+
+4.20 Relationship Graph
+
+
+
+
+
+4.20.1 Principle
+
+
+
+
+
+Requests, artifacts, records, managed targets, and change sets SHALL support explicit, typed, governed relationships.
+
+
+
+
+
+4.20.2 Governance
+
+
+
+
+
+Relationships SHALL be versioned, auditable, and policy-aware.
+
+
+
+
+
+4.20.3 Operational Use
+
+
+
+
+
+Relationships SHALL support hierarchy, dependency, association, supersession, duplication, and impact analysis.
+
+
+
+
+4.21 Governed Context Principle
+
+
+
+
+All agentic execution SHALL operate against explicit, governed context rather than implicit or ambient state.
+
+
+
+
+Context supplied to humans and agents SHALL be:
+
+
+
+
+policy-scoped
+auditable
+retrievable
+minimized to necessary scope
+traceable to source
+
+
+
+
+4.22 Agent Specificity Principle
+
+
+
+
+Agents SHALL operate under explicit constitutions, requirements, policy constraints, and process-specific instructions appropriate to the assigned work.
+
+
+
+
+Agent behavior SHALL NOT rely on undeclared assumptions about workflow, policy, domain semantics, or available context.
+
+
+
+
+4.23 Governed Tool and Context Access Principle
+
+
+
+
+Access to external tools, substrates, and contextual systems SHALL occur through governed integration contracts.
+
+
+
+
+Robust MCP-style integration SHALL be treated as a first-class mechanism for controlled agent access to context, tools, and external systems.
+
+
+
+
+
 
 
 
@@ -604,6 +811,8 @@ No system evolution without review
 No metric without traceable data
 No SLA without measurable enforcement
 No governance decision without audit record
+No agent assignment without governed context
+No agent tool access without policy-scoped authorization
 
 
 
@@ -810,7 +1019,7 @@ Represents isolated mutable execution environment.
 
 
 
-Represents governed modifications.
+Represents a governed set of proposed modifications to one or more artifacts, records, configurations, or managed targets, independent of substrate.
 
 
 
@@ -856,6 +1065,96 @@ Represents authorization to apply change.
 
 
 Tracks active execution capabilities.
+
+
+
+
+
+6.17 Managed Target
+
+
+
+
+
+Represents any governed destination to which changes may be applied, including code repositories, content systems, service environments, or configuration domains.
+
+
+
+
+
+6.18 Record
+
+
+
+
+
+Represents a structured entity managed within a substrate, including documents, tickets, incidents, or configuration objects.
+
+
+
+
+
+6.19 Revision
+
+
+
+
+
+Represents an immutable version of an artifact or record.
+
+
+
+
+
+6.20 Projection
+
+
+
+
+
+Represents a substrate-specific representation of a canonical RGP entity.
+
+
+
+
+
+6.21 Binding
+
+
+
+
+
+Represents a governed association between RGP entities and external substrates.
+
+
+
+
+6.22 Context Bundle
+
+
+
+
+Represents the governed set of contextual materials, bindings, policies, knowledge, and references assembled for a human or agent interaction.
+
+
+
+
+6.23 Context Binding
+
+
+
+
+Represents an auditable association between an entity, interaction, agent session, or run and the context sources made available to it.
+
+
+
+
+6.24 Agent Operating Profile
+
+
+
+
+Represents the governed behavioral specification under which an agent operates, including applicable instructions, process rules, tool access, policy constraints, and context entitlements.
 
 
 
@@ -910,6 +1209,34 @@ Pending → Authorized → Executing → Completed
 
 
 
+7.4 Extensible Lifecycle Principle
+
+
+
+
+
+Request, artifact, and domain-specific process lifecycles SHALL be extensible and template-defined, provided that core governance checkpoints remain preserved.
+
+
+
+
+
+Core governance checkpoints SHALL include:
+
+
+
+
+
+execution eligibility
+review eligibility
+approval eligibility
+promotion eligibility
+completion eligibility
+
+
+
+
+
 
 
 8. REVIEW CONSTITUTION
@@ -953,6 +1280,12 @@ scoped interaction channels
 command-driven control
 agent visibility
 audit of all interactions
+human-led collaboration
+agent-assisted collaboration
+agent-led collaboration
+governed and auditable transitions between collaboration modes
+context-aware interaction continuity
+auditable context augmentation during interaction
 
 
 
@@ -977,6 +1310,11 @@ external execution via Foundry
 orchestration via Agent Framework
 normalized runtime signals
 governance independence
+Execution substrates MAY include code execution systems, content generation systems, workflow engines, service platforms, or agent frameworks.
+cross-request coordination and dependency-aware orchestration
+policies able to validate, block, route, escalate, trigger workflow branches, require additional review, and initiate remediation or fallback actions
+agent execution SHALL be supplied with governed context bundles and explicit operating profiles
+tool and context access for agentic execution SHALL be mediated through governed adapter or MCP-style integration contracts
 
 
 
@@ -1001,6 +1339,7 @@ promotion required for finalization
 approval ≠ promotion
 target-based acceptance
 version-safe evolution
+Promotion SHALL apply to any managed target and MAY represent merge, publish, activation, deployment, fulfillment, or state transition depending on context.
 
 
 
@@ -1052,6 +1391,41 @@ RBAC
 service identities
 agent identities
 full auditability
+
+
+
+
+13A. FEDERATED IDENTITY EXTENSION
+
+
+
+
+13A.1 Identity Mapping
+
+
+
+
+RGP SHALL map identities across systems.
+
+
+
+
+13A.2 Role Consistency
+
+
+
+
+Roles and permissions SHALL be consistently enforced across federated systems.
+
+
+
+
+13A.3 Auditability
+
+
+
+
+All cross-system actions SHALL be attributable to a unified identity.
 
 
 
@@ -1153,6 +1527,41 @@ debugging
 
 
 
+17A. UNIFIED TIMELINE CONSTITUTION
+
+
+
+
+17A.1 Principle
+
+
+
+
+The system SHALL provide a unified timeline of all actions across all federated systems.
+
+
+
+
+17A.2 Scope
+
+
+
+
+The timeline SHALL include:
+
+
+
+
+governance events
+execution events
+agent actions
+human interactions
+projections
+external system updates
+
+
+
+
 
 
 
@@ -1173,6 +1582,60 @@ run management
 failure handling
 alerting
 operator control
+recorded rationale, evidence, and traceability for substantive governance decisions
+
+
+
+
+
+18A. SLA / SLO CONSTITUTION
+
+
+
+
+
+18A.1 Principle
+
+
+
+
+
+Service expectations SHALL be first-class governed constructs.
+
+
+
+
+
+18A.2 Scope
+
+
+
+
+
+RGP SHALL support lifecycle-aware service commitments including:
+
+
+
+
+
+SLA
+SLO
+response targets
+resolution targets
+review deadlines
+publication deadlines
+
+
+
+
+
+18A.3 Enforcement
+
+
+
+
+
+Breaches, risks, and escalations SHALL be visible, auditable, and actionable.
 
 
 
@@ -1196,6 +1659,20 @@ operator control
 reusable components
 discovery
 sharing
+
+
+
+
+
+19A. SUBSTRATE CAPABILITY CONSTITUTION
+
+
+
+
+
+RGP SHALL maintain capability models for all connected substrates.
+Governance SHALL remain consistent regardless of substrate capability differences.
+Missing substrate capabilities SHALL be compensated for within RGP.
 
 
 
@@ -1298,6 +1775,617 @@ The system SHALL provide actionable insights.
 
 
 
+21A. DOMAIN CAPABILITY CONSTITUTION
+
+
+
+
+
+21A.1 Principle
+
+
+
+
+
+RGP SHALL support domain-specific capability packs (“Domain Packs”) that extend the platform’s core governance model without altering core semantics or invariants.
+
+
+
+
+
+21A.2 Scope
+
+
+
+
+
+Domain Packs MAY define:
+
+
+
+
+
+additional request templates
+additional artifact types
+additional workflows
+additional policies
+additional lifecycle variants
+additional relationship models
+additional analytics
+additional views
+
+
+
+
+
+21A.3 Compatibility
+
+
+
+
+
+All Domain Packs SHALL operate through the canonical RGP constructs of:
+
+
+
+
+
+Request
+Template
+Workflow Binding
+Run
+Artifact
+Review
+Check
+Change Set
+Promotion
+Event
+Policy
+
+
+
+
+
+21A.4 Isolation
+
+
+
+
+
+No Domain Pack SHALL redefine or weaken core governance invariants.
+
+
+
+
+
+21A.5 Illustrative Packs
+
+
+
+
+
+The platform SHALL be capable of supporting Domain Packs such as:
+
+
+
+
+
+Source Control Pack
+Content & Editorial Pack
+ITSM Pack
+Planning & Delivery Pack
+Knowledge & Documentation Pack
+
+
+
+
+
+21B. PLANNING CONSTITUTION
+
+
+
+
+
+21B.1 Principle
+
+
+
+
+
+RGP SHALL support planning constructs independent of execution substrates.
+
+
+
+
+
+21B.2 Scope
+
+
+
+
+
+Planning constructs SHALL support:
+
+
+
+
+
+grouping
+prioritization
+sequencing
+dependency management
+capacity alignment
+release alignment
+portfolio visibility
+
+
+
+
+
+21C. KNOWLEDGE AND MEMORY CONSTITUTION
+
+
+
+
+
+21C.1 Principle
+
+
+
+
+
+The system SHALL maintain governed knowledge artifacts and reusable context to support human and agent work across requests and domains.
+
+
+
+
+
+21C.2 Governance
+
+
+
+
+
+Knowledge context SHALL be versioned, auditable, retrievable, and policy-scoped.
+
+
+
+
+21D. FEDERATED GOVERNANCE CONSTITUTION
+
+
+
+
+21D.1 Principle
+
+
+
+
+RGP SHALL operate as a federated governance control plane coordinating work across multiple external systems.
+
+
+
+
+21D.2 Authority Model
+
+
+
+
+RGP SHALL be authoritative for:
+
+
+
+
+request state
+review state
+approval state
+promotion eligibility
+cross-system relationships
+audit and compliance
+
+
+
+
+External systems SHALL be authoritative only for:
+
+
+
+
+domain-specific execution
+local runtime state
+system-native interactions
+
+
+
+
+21D.3 Delegated Execution
+
+
+
+
+RGP SHALL delegate execution to external systems through adapters while retaining governance authority.
+
+
+
+
+21D.4 Federation Scope
+
+
+
+
+Federation SHALL apply across:
+
+
+
+
+source control systems
+service management systems
+content systems
+planning systems
+runtime platforms
+
+
+
+
+21D.5 Non-Replacement Principle
+
+
+
+
+RGP SHALL support coexistence with existing systems without requiring immediate replacement.
+
+
+
+
+21E. PROJECTION & SYNCHRONIZATION CONSTITUTION
+
+
+
+
+21E.1 Projection Principle
+
+
+
+
+RGP SHALL project canonical entities into external systems as substrate-specific representations.
+
+
+
+
+21E.2 Synchronization Principle
+
+
+
+
+RGP SHALL maintain bidirectional synchronization between canonical governance state and external system state.
+
+
+
+
+21E.3 Event Ingestion
+
+
+
+
+External system events SHALL be ingested, normalized, and mapped to canonical governance events.
+
+
+
+
+21E.4 Idempotency
+
+
+
+
+All projections and synchronizations SHALL be idempotent.
+
+
+
+
+21E.5 Traceability
+
+
+
+
+All projections and external events SHALL be traceable to originating requests, change sets, and decisions.
+
+
+
+
+21F. SYSTEM OF RECORD CONSTITUTION
+
+
+
+
+21F.1 Governance System of Record
+
+
+
+
+RGP SHALL be the system of record for governance state.
+
+
+
+
+21F.2 Execution System of Record
+
+
+
+
+External systems SHALL remain the system of record for execution details.
+
+
+
+
+21F.3 Audit System of Record
+
+
+
+
+RGP SHALL maintain the authoritative audit trail across all systems.
+
+
+
+
+21F.4 Relationship System of Record
+
+
+
+
+RGP SHALL maintain canonical relationships across all entities.
+
+
+
+
+21G. ADAPTER CONSTITUTION
+
+
+
+
+21G.1 Adapter Model
+
+
+
+
+All external system integrations SHALL be implemented through adapters.
+
+
+
+
+21G.2 Adapter Responsibilities
+
+
+
+
+Adapters SHALL:
+
+
+
+
+map canonical entities to external representations
+ingest external events
+execute projection operations
+reconcile state differences
+expose substrate capabilities
+
+
+
+
+21G.3 Capability Declaration
+
+
+
+
+Adapters SHALL declare supported capabilities and limitations.
+
+
+
+
+21H. RECONCILIATION CONSTITUTION
+
+
+
+
+21H.1 Conflict Detection
+
+
+
+
+The system SHALL detect divergence between canonical state and external state.
+
+
+
+
+21H.2 Resolution Policy
+
+
+
+
+Governance state SHALL take precedence for:
+
+
+
+
+approvals
+promotions
+lifecycle decisions
+
+
+
+
+External state SHALL take precedence for:
+
+
+
+
+execution-specific details
+
+
+
+
+21H.3 Reconciliation Actions
+
+
+
+
+The system SHALL:
+
+
+
+
+synchronize state
+flag inconsistencies
+require intervention where necessary
+
+
+
+
+21I. CROSS-SYSTEM ORCHESTRATION CONSTITUTION
+
+
+
+
+21I.1 Principle
+
+
+
+
+RGP SHALL coordinate workflows that span multiple external systems.
+
+
+
+
+21I.2 Orchestration Scope
+
+
+
+
+Orchestration SHALL support:
+
+
+
+
+sequential execution
+parallel execution
+dependency-aware execution
+saga-style coordination
+
+
+
+
+21I.3 Visibility
+
+
+
+
+Cross-system workflows SHALL be visible and auditable as unified flows.
+
+
+
+
+
+
+
+
+21J. AGENT CONTEXT CONSTITUTION
+
+
+
+
+21J.1 Principle
+
+
+
+
+Agents assigned to requests SHALL receive sufficient governed context to perform the assigned work correctly.
+
+
+
+
+21J.2 Context Scope
+
+
+
+
+Governed context MAY include:
+
+
+
+
+request details
+template semantics
+workflow state
+policy constraints
+knowledge artifacts
+related entities and dependencies
+historical decisions
+external bindings
+
+
+
+
+21J.3 Context Governance
+
+
+
+
+Context access SHALL be policy-scoped, auditable, and attributable to the consuming human or agent identity.
+
+
+
+
+21J.4 Insufficient Context Handling
+
+
+
+
+If sufficient context is unavailable, the system SHALL require augmentation, clarification, or escalation rather than permitting silent agentic misexecution.
+
+
+
+
+21K. MCP & CONTEXT INTEGRATION CONSTITUTION
+
+
+
+
+21K.1 Principle
+
+
+
+
+RGP SHALL support robust MCP-style integration for governed access to contextual systems, tools, and substrates.
+
+
+
+
+21K.2 Role
+
+
+
+
+MCP-style integration SHALL enable retrieval, tool use, structured interaction, and capability discovery without weakening canonical governance control.
+
+
+
+
+21K.3 Governance
+
+
+
+
+MCP-mediated access SHALL be policy-aware, least-privilege, auditable, and attributable.
+
+
+
+
+21K.4 Reliability
+
+
+
+
+Failures, limitations, and degraded context access through MCP or similar integration mechanisms SHALL be visible and governable.
+
 
 
 
@@ -1315,4 +2403,5 @@ RGP is defined as:
 A universal, enterprise-grade, self-governing system
 for managing, executing, reviewing, promoting,
 and continuously optimizing all forms of work
-performed by humans and intelligent agents.
+performed by humans and intelligent agents across heterogeneous enterprise systems,
+while preserving existing investments and enabling progressive consolidation.

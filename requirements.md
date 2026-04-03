@@ -147,6 +147,84 @@ The system SHALL distinguish between platform administrators and tenant administ
 
 
 
+1A. SUBSTRATE ABSTRACTION
+
+
+
+
+
+FR-SUB-001
+
+
+
+
+
+The system SHALL support binding to multiple substrate types through pluggable adapters.
+
+
+
+
+
+FR-SUB-002
+
+
+
+
+
+The system SHALL define canonical representations for:
+
+
+
+
+
+repositories
+documents
+records
+artifacts
+revisions
+change sets
+managed targets
+
+
+
+
+
+FR-SUB-003
+
+
+
+
+
+The system SHALL normalize substrate-specific events into canonical governance events.
+
+
+
+
+
+FR-SUB-004
+
+
+
+
+
+The system SHALL preserve raw substrate payloads alongside normalized events.
+
+
+
+
+
+FR-SUB-005
+
+
+
+
+
+The system SHALL support operation independent of any single substrate.
+
+
+
+
+
 
 
 
@@ -411,6 +489,187 @@ The system SHALL allow override of ownership assignments with audit tracking.
 
 
 
+3A. QUEUE & ASSIGNMENT
+
+
+
+
+
+FR-QUE-001
+
+
+
+
+
+The system SHALL support assignment queues.
+
+
+
+
+
+FR-QUE-002
+
+
+
+
+
+The system SHALL support assignment groups.
+
+
+
+
+
+FR-QUE-003
+
+
+
+
+
+Requests SHALL be routable based on:
+
+
+
+
+
+skill
+role
+capacity
+workload
+priority
+SLA context
+policy domain
+
+
+
+
+
+FR-QUE-004
+
+
+
+
+
+The system SHALL support escalation rules.
+
+
+
+
+
+FR-QUE-005
+
+
+
+
+
+The system SHALL support reassignment with audit history.
+
+
+
+
+
+FR-QUE-006
+
+
+
+
+
+The system SHALL support queue-level analytics and workload visibility.
+
+
+
+
+
+3B. RELATIONSHIP GRAPH
+
+
+
+
+
+FR-REL-001
+
+
+
+
+
+The system SHALL support typed relationships between requests.
+
+
+
+
+
+FR-REL-002
+
+
+
+
+
+The system SHALL support typed relationships between requests, artifacts, change sets, records, and managed targets.
+
+
+
+
+
+FR-REL-003
+
+
+
+
+
+Relationship types SHALL include:
+
+
+
+
+
+parent / child
+dependency
+blocking
+related
+duplicate
+supersedes
+derived-from
+fulfills
+
+
+
+
+
+FR-REL-004
+
+
+
+
+
+The system SHALL support graph traversal and dependency-aware navigation.
+
+
+
+
+
+FR-REL-005
+
+
+
+
+
+The system SHALL support impact analysis across related entities.
+
+
+
+
+
+FR-REL-006
+
+
+
+
+
+The system SHALL enforce workflow constraints based on defined relationships where configured.
+
+
+
+
+
 
 
 
@@ -484,6 +743,96 @@ FR-WFB-005
 
 
 The system SHALL support multiple runs per request.
+
+
+
+
+
+FR-WFB-006
+
+
+
+
+
+Workflows SHALL support both execution-heavy and human-centric processes including editorial, service, and planning workflows.
+
+
+
+
+
+4A. EXTENSIBLE LIFECYCLE
+
+
+
+
+
+FR-LIFE-001
+
+
+
+
+
+Templates SHALL be able to define custom lifecycle states.
+
+
+
+
+
+FR-LIFE-002
+
+
+
+
+
+Templates SHALL be able to define allowed transitions between lifecycle states.
+
+
+
+
+
+FR-LIFE-003
+
+
+
+
+
+Lifecycle transitions SHALL support conditional rules.
+
+
+
+
+
+FR-LIFE-004
+
+
+
+
+
+Lifecycle transitions SHALL support role-based constraints.
+
+
+
+
+
+FR-LIFE-005
+
+
+
+
+
+Lifecycle definitions SHALL preserve core governance checkpoints.
+
+
+
+
+
+FR-LIFE-006
+
+
+
+
+
+The system SHALL support distinct lifecycle models for requests, artifacts, and domain-specific records.
 
 
 
@@ -569,6 +918,134 @@ The system SHALL maintain separation between runtime and governance state.
 
 
 
+5A. DEPENDENCY-AWARE EXECUTION
+
+
+
+
+
+FR-DEX-001
+
+
+
+
+
+The system SHALL support execution sequencing based on relationships and dependencies.
+
+
+
+
+
+FR-DEX-002
+
+
+
+
+
+The system SHALL support blocking execution when required dependencies are unmet.
+
+
+
+
+
+FR-DEX-003
+
+
+
+
+
+The system SHALL support parallel execution when dependencies permit.
+
+
+
+
+
+FR-DEX-004
+
+
+
+
+
+The system SHALL support dependency-aware retry and recovery.
+
+
+
+
+
+5B. CROSS-REQUEST ORCHESTRATION
+
+
+
+
+
+FR-ORCH-001
+
+
+
+
+
+The system SHALL support orchestration across multiple related requests.
+
+
+
+
+
+FR-ORCH-002
+
+
+
+
+
+The system SHALL support saga-style coordination patterns.
+
+
+
+
+
+FR-ORCH-003
+
+
+
+
+
+The system SHALL support compensation and rollback-aware orchestration where applicable.
+
+
+
+
+
+FR-ORCH-004
+
+
+
+
+
+Cross-request orchestration state SHALL be visible and auditable.
+
+
+
+
+FR-ORCH-005
+
+
+
+
+The system SHALL support workflows spanning multiple external systems.
+
+
+
+
+FR-ORCH-006
+
+
+
+
+The system SHALL coordinate dependencies across systems.
+
+
+
+
+
 
 
 
@@ -642,6 +1119,58 @@ FR-AGT-005
 
 
 The system SHALL prevent agent self-approval.
+
+
+
+
+
+FR-AGT-006
+
+
+
+
+
+Agents SHALL operate across all substrate types including content, service, planning, and code workflows.
+
+
+
+
+FR-AGT-007
+
+
+
+
+Agent assignment SHALL assemble a governed context bundle sufficient for the assigned task.
+
+
+
+
+FR-AGT-008
+
+
+
+
+Agents SHALL operate under explicit operating profiles that define instructions, policy constraints, allowed tools, and process-specific behavior.
+
+
+
+
+FR-AGT-009
+
+
+
+
+The system SHALL record the context bundle, operating profile, and capability set made available to each agent turn or session.
+
+
+
+
+FR-AGT-010
+
+
+
+
+If required context or capability access is unavailable, the system SHALL require clarification, augmentation, or escalation rather than allowing silent degraded execution.
 
 
 
@@ -778,6 +1307,197 @@ The system SHALL support real-time progress visibility.
 
 
 
+7A. COLLABORATION MODES
+
+
+
+
+
+FR-COL-001
+
+
+
+
+
+The system SHALL support human-led, agent-assisted, and agent-led collaboration modes.
+
+
+
+
+
+FR-COL-002
+
+
+
+
+
+The system SHALL support switching collaboration mode during request execution subject to policy.
+
+
+
+
+
+FR-COL-003
+
+
+
+
+
+The active collaboration mode SHALL be visible and auditable.
+
+
+
+
+
+FR-COL-004
+
+
+
+
+
+Policy SHALL be able to constrain which collaboration modes are allowed by request type, role, or substrate.
+
+
+
+
+7B. AGENT CONTEXT & MCP ACCESS
+
+
+
+
+FR-CTX-001
+
+
+
+
+The system SHALL support governed context bundles for agent assignment, agent sessions, runs, reviews, and other scoped interactions.
+
+
+
+
+FR-CTX-002
+
+
+
+
+Context bundles SHALL be able to include:
+
+
+
+
+request data
+template semantics
+workflow state
+policy constraints
+knowledge artifacts
+relationship graph context
+prior decisions and evidence
+external bindings and projections
+
+
+
+
+FR-CTX-003
+
+
+
+
+Context bundles SHALL be versioned, auditable, and attributable to the identity consuming them.
+
+
+
+
+FR-CTX-004
+
+
+
+
+Context access SHALL be policy-scoped and limited to the minimum necessary scope.
+
+
+
+
+FR-CTX-005
+
+
+
+
+The system SHALL support context augmentation during an active human or agent interaction with full audit history.
+
+
+
+
+FR-CTX-006
+
+
+
+
+The system SHALL preserve provenance from each context element back to its source entity, binding, or external system.
+
+
+
+
+FR-MCP-001
+
+
+
+
+The system SHALL support robust MCP-style integrations for governed access to tools, contextual systems, and external substrates.
+
+
+
+
+FR-MCP-002
+
+
+
+
+MCP-style integrations SHALL support retrieval, structured interaction, capability discovery, and tool invocation where authorized.
+
+
+
+
+FR-MCP-003
+
+
+
+
+MCP-mediated access SHALL be policy-aware, auditable, attributable, and least-privilege.
+
+
+
+
+FR-MCP-004
+
+
+
+
+The system SHALL record which MCP-accessible capabilities, tools, and context sources were made available to an agent session or turn.
+
+
+
+
+FR-MCP-005
+
+
+
+
+The system SHALL surface MCP failures, degraded context access, and unavailable capabilities to operators and interacting users when relevant.
+
+
+
+
+FR-MCP-006
+
+
+
+
+The system SHALL support governance over which MCP integrations are permitted by request type, role, policy domain, and collaboration mode.
+
+
+
+
+
 
 
 
@@ -863,6 +1583,162 @@ FR-ART-006
 
 
 Artifacts SHALL link to producing runs and steps.
+
+
+
+
+
+FR-ART-007
+
+
+
+
+
+Artifacts SHALL support non-code types including documents, media, structured records, and knowledge objects.
+
+
+
+
+
+8A. CONTENT & EDITORIAL
+
+
+
+
+
+FR-CONT-001
+
+
+
+
+
+The system SHALL support content-oriented artifact types including documents, media, structured content objects, reference bundles, and publication packages.
+
+
+
+
+
+FR-CONT-002
+
+
+
+
+
+Artifacts SHALL support draft, review, approved, published, deprecated, and archived states where applicable.
+
+
+
+
+
+FR-CONT-003
+
+
+
+
+
+The system SHALL support multi-stage editorial workflows.
+
+
+
+
+
+FR-CONT-004
+
+
+
+
+
+The system SHALL support content revision branching where applicable.
+
+
+
+
+
+FR-CONT-005
+
+
+
+
+
+The system SHALL support projection of content artifacts to multiple output channels.
+
+
+
+
+
+FR-CONT-006
+
+
+
+
+
+The system SHALL support editorial review roles including author, editor, fact reviewer, legal reviewer, compliance reviewer, and publisher where configured.
+
+
+
+
+
+8B. MULTI-ASSET COORDINATION
+
+
+
+
+
+FR-MAS-001
+
+
+
+
+
+The system SHALL support multiple artifacts per request.
+
+
+
+
+
+FR-MAS-002
+
+
+
+
+
+The system SHALL support required artifact sets for particular request types.
+
+
+
+
+
+FR-MAS-003
+
+
+
+
+
+The system SHALL support dependency relationships among artifacts.
+
+
+
+
+
+FR-MAS-004
+
+
+
+
+
+Promotion SHALL validate required artifact completeness where configured.
+
+
+
+
+
+FR-MAS-005
+
+
+
+
+
+The system SHALL support coordinated review and promotion across related artifacts.
 
 
 
@@ -960,6 +1836,28 @@ The system SHALL block completion and promotion if requirements are unmet.
 
 
 
+FR-REV-007
+
+
+
+
+
+The system SHALL support multiple review types including:
+
+
+
+
+
+technical review
+editorial review
+compliance review
+operational review
+policy review
+
+
+
+
+
 
 
 
@@ -1039,10 +1937,64 @@ The system SHALL support override with audit.
 
 
 
+10A. POLICY-DRIVEN ORCHESTRATION
 
 
 
-11. WORKSPACE & CHANGE MANAGEMENT
+
+
+FR-POL-001
+
+
+
+
+
+Policies SHALL be able to influence workflow routing and branching.
+
+
+
+
+
+FR-POL-002
+
+
+
+
+
+Policies SHALL be able to trigger escalations, fallback workflows, additional review requirements, or remediation actions.
+
+
+
+
+
+FR-POL-003
+
+
+
+
+
+Policy-triggered actions SHALL emit auditable governance events.
+
+
+
+
+
+FR-POL-004
+
+
+
+
+
+The system SHALL expose the policy basis for policy-driven workflow behavior.
+
+
+
+
+
+
+
+
+11. WORKSPACE & CHANGE MANAGEMENT (SUBSTRATE-NEUTRAL)
 
 
 
@@ -1134,6 +2086,18 @@ The system SHALL support change set versioning.
 
 
 
+FR-CODE-008
+
+
+
+
+
+Change sets SHALL be applicable to any artifact or record type, not limited to source code.
+
+
+
+
+
 
 
 
@@ -1200,6 +2164,28 @@ FR-PRO-005
 
 
 The system SHALL support dry-run validation.
+
+
+
+
+
+FR-PRO-006
+
+
+
+
+
+Promotion targets SHALL include:
+
+
+
+
+
+source systems
+content systems
+service platforms
+configuration domains
+knowledge systems
 
 
 
@@ -1429,6 +2415,26 @@ All actions SHALL be auditable.
 
 
 
+FR-ID-006
+
+
+
+
+The system SHALL map identities across external systems.
+
+
+
+
+FR-ID-007
+
+
+
+
+The system SHALL enforce consistent authorization across systems.
+
+
+
+
 
 
 
@@ -1607,6 +2613,72 @@ The system SHALL support rolling upgrades.
 
 
 
+18A. SLA / SLO
+
+
+
+
+
+FR-SLA-001
+
+
+
+
+
+The system SHALL support SLA definitions per request type, template, or domain pack.
+
+
+
+
+
+FR-SLA-002
+
+
+
+
+
+The system SHALL support SLO definitions for operational targets.
+
+
+
+
+
+FR-SLA-003
+
+
+
+
+
+The system SHALL evaluate SLA/SLO compliance continuously from normalized events and lifecycle timestamps.
+
+
+
+
+
+FR-SLA-004
+
+
+
+
+
+The system SHALL trigger alerts and escalations when SLA/SLO risks or breaches occur.
+
+
+
+
+
+FR-SLA-005
+
+
+
+
+
+The system SHALL expose SLA/SLO history and breach audit records.
+
+
+
+
+
 
 
 
@@ -1661,6 +2733,183 @@ FR-OBS-004
 
 
 The system SHALL support debugging and replay.
+
+
+
+
+
+19A. ADAPTER CONTRACTS
+
+
+
+
+
+FR-ADP-001
+
+
+
+
+
+All substrate integrations SHALL implement a defined adapter contract.
+
+
+
+
+
+FR-ADP-002
+
+
+
+
+
+Adapters SHALL support:
+
+
+
+
+
+binding
+event ingestion
+projection
+promotion execution
+state reconciliation
+
+
+
+
+
+FR-ADP-003
+
+
+
+
+
+Adapters SHALL declare supported capabilities.
+
+
+
+
+FR-ADP-004
+
+
+
+
+Adapters SHALL support bidirectional synchronization.
+
+
+
+
+FR-ADP-005
+
+
+
+
+Adapters SHALL support capability discovery.
+
+
+
+
+FR-ADP-006
+
+
+
+
+Adapters SHALL expose error and failure states.
+
+
+
+
+
+19B. EVENT MODEL
+
+
+
+
+
+FR-EVT-001
+
+
+
+
+
+The system SHALL classify events as:
+
+
+
+
+
+observed
+inferred
+projected
+
+
+
+
+
+FR-EVT-002
+
+
+
+
+
+The system SHALL support replay of normalized events.
+
+
+
+
+
+FR-EVT-003
+
+
+
+
+
+The system SHALL maintain lineage from substrate event to governance outcome.
+
+
+
+
+19C. EVENT INGESTION
+
+
+
+
+FR-ING-001
+
+
+
+
+The system SHALL ingest events from external systems.
+
+
+
+
+FR-ING-002
+
+
+
+
+The system SHALL normalize external events into canonical events.
+
+
+
+
+FR-ING-003
+
+
+
+
+The system SHALL retain raw event payloads.
+
+
+
+
+FR-ING-004
+
+
+
+
+The system SHALL support near real-time event processing.
 
 
 
@@ -1725,6 +2974,95 @@ The system SHALL support alerting.
 
 
 
+20A. DECISION TRACEABILITY
+
+
+
+
+
+FR-AUD-001
+
+
+
+
+
+The system SHALL record rationale for substantive governance decisions.
+
+
+
+
+
+FR-AUD-002
+
+
+
+
+
+Decision rationale SHALL support human-generated and agent-generated decisions.
+
+
+
+
+
+FR-AUD-003
+
+
+
+
+
+Decision records SHALL include supporting evidence where available.
+
+
+
+
+
+FR-AUD-004
+
+
+
+
+
+Decision rationale SHALL be auditable and linked to the resulting governance state changes.
+
+
+
+
+20B. UNIFIED TIMELINE
+
+
+
+
+FR-TIME-001
+
+
+
+
+The system SHALL provide a unified timeline across all systems.
+
+
+
+
+FR-TIME-002
+
+
+
+
+The timeline SHALL correlate events across systems.
+
+
+
+
+FR-TIME-003
+
+
+
+
+The timeline SHALL support filtering and drill-down.
+
+
+
+
+
 
 
 
@@ -1767,6 +3105,416 @@ FR-ECO-003
 
 
 The system SHALL support capability discovery.
+
+
+
+
+
+21A. DOMAIN PACKS
+
+
+
+
+
+FR-DOM-001
+
+
+
+
+
+The system SHALL support installation and activation of Domain Packs.
+
+
+
+
+
+FR-DOM-002
+
+
+
+
+
+Domain Packs SHALL be able to contribute:
+
+
+
+
+
+templates
+artifact types
+workflows
+policies
+lifecycle variants
+analytics
+views
+
+
+
+
+
+FR-DOM-003
+
+
+
+
+
+Domain Packs SHALL operate without modifying core governance invariants.
+
+
+
+
+
+FR-DOM-004
+
+
+
+
+
+Domain Packs SHALL be versioned and governable artifacts.
+
+
+
+
+
+21B. PLANNING & DELIVERY
+
+
+
+
+
+FR-PLAN-001
+
+
+
+
+
+The system SHALL support grouping of requests into higher-order planning constructs.
+
+
+
+
+
+FR-PLAN-002
+
+
+
+
+
+Planning constructs SHALL include configurable types such as initiative, program, release, milestone, campaign, or equivalent structures.
+
+
+
+
+
+FR-PLAN-003
+
+
+
+
+
+The system SHALL support prioritization of requests and groups.
+
+
+
+
+
+FR-PLAN-004
+
+
+
+
+
+The system SHALL support dependency-aware planning.
+
+
+
+
+
+FR-PLAN-005
+
+
+
+
+
+The system SHALL support capacity-aware planning.
+
+
+
+
+
+FR-PLAN-006
+
+
+
+
+
+The system SHALL support roadmap-oriented views.
+
+
+
+
+
+FR-PLAN-007
+
+
+
+
+
+The system SHALL support progress aggregation from child work into parent planning constructs.
+
+
+
+
+
+21C. KNOWLEDGE & MEMORY
+
+
+
+
+
+FR-KNOW-001
+
+
+
+
+
+The system SHALL support persistent knowledge artifacts.
+
+
+
+
+
+FR-KNOW-002
+
+
+
+
+
+Knowledge artifacts SHALL be versioned and auditable.
+
+
+
+
+
+FR-KNOW-003
+
+
+
+
+
+The system SHALL support retrieval of relevant knowledge context into requests, runs, reviews, and agent interactions.
+
+
+
+
+
+FR-KNOW-004
+
+
+
+
+
+Agents SHALL be able to consume governed knowledge context subject to policy and access control.
+
+
+
+
+
+FR-KNOW-005
+
+
+
+
+
+Knowledge reuse across requests SHALL preserve provenance and lineage.
+
+
+
+
+21D. FEDERATED GOVERNANCE & INTEGRATION
+
+
+
+
+FR-FED-001
+
+
+
+
+The system SHALL support integration with multiple external systems simultaneously.
+
+
+
+
+FR-FED-002
+
+
+
+
+The system SHALL support federated workflows spanning multiple systems.
+
+
+
+
+FR-FED-003
+
+
+
+
+The system SHALL maintain canonical governance state independent of external systems.
+
+
+
+
+21E. PROJECTION
+
+
+
+
+FR-PROJ-001
+
+
+
+
+The system SHALL project requests, artifacts, change sets, and reviews into external systems.
+
+
+
+
+FR-PROJ-002
+
+
+
+
+Projection SHALL support create, update, and delete operations.
+
+
+
+
+FR-PROJ-003
+
+
+
+
+Projection SHALL be idempotent.
+
+
+
+
+FR-PROJ-004
+
+
+
+
+The system SHALL track projection state and status.
+
+
+
+
+21F. SYNCHRONIZATION & RECONCILIATION
+
+
+
+
+FR-SYNC-001
+
+
+
+
+The system SHALL synchronize canonical state with external system state.
+
+
+
+
+FR-SYNC-002
+
+
+
+
+The system SHALL detect and reconcile inconsistencies.
+
+
+
+
+FR-SYNC-003
+
+
+
+
+The system SHALL support eventual consistency across systems.
+
+
+
+
+FR-SYNC-004
+
+
+
+
+Synchronization SHALL be auditable.
+
+
+
+
+FR-CONF-001
+
+
+
+
+The system SHALL detect conflicting state between RGP and external systems.
+
+
+
+
+FR-CONF-002
+
+
+
+
+The system SHALL apply resolution policies.
+
+
+
+
+FR-CONF-003
+
+
+
+
+The system SHALL surface conflicts to operators when required.
+
+
+
+
+21G. INTEGRATION LEVELS
+
+
+
+
+FR-INT-LVL-001
+
+
+
+
+The system SHALL support multiple integration levels:
+
+
+
+
+observability
+projection
+governed execution
+full substitution
+
+
+
+
+FR-INT-LVL-002
+
+
+
+
+Each integration SHALL declare its level.
 
 
 
@@ -1974,13 +3722,243 @@ The system SHALL support drill-down from metrics to execution details.
 
 
 
+FR-INTEL-013
+
+
+
+
+
+The system SHALL support cross-domain analytics across code, content, service, and planning workflows.
+
+
+
+
+
+22A. MULTI-VIEW PROJECTIONS
+
+
+
+
+
+FR-VIEW-001
+
+
+
+
+
+The system SHALL support multiple views over the same governed data.
+
+
+
+
+
+FR-VIEW-002
+
+
+
+
+
+Supported views SHALL include, where applicable:
+
+
+
+
+
+queue view
+board view
+timeline view
+graph view
+artifact/document view
+planning/roadmap view
+
+
+
+
+
+FR-VIEW-003
+
+
+
+
+
+Views SHALL be projections of canonical RGP state and SHALL NOT define canonical semantics.
+
+
+
+
+
+
+
+
+30. REQUIRED GUARDRAILS FOR MULTI-VERTICAL EVOLUTION
+
+
+
+
+
+30.1 Core-over-Vertical Rule
+
+
+
+
+
+Domain Packs SHALL extend the core model and SHALL NOT replace it.
+
+
+
+
+
+30.2 No Vertical-First Core Redefinition
+
+
+
+
+
+The core model SHALL NOT be redefined in terms specific to:
+
+
+
+
+
+source control
+editorial publishing
+ITSM
+planning boards
+
+
+
+
+
+30.3 Relationship Graph as Canonical Coordination Layer
+
+
+
+
+
+Dependencies, hierarchies, and associations SHALL be modeled canonically and not outsourced to external tools as the sole system of meaning.
+
+
+
+
+
+30.4 Extensible Lifecycle without Semantic Fragmentation
+
+
+
+
+
+Lifecycle specialization SHALL remain compatible with canonical governance checkpoints.
+
+
+
+
+
+30.5 Planning, Service, and Editorial Views are Projections
+
+
+
+
+
+Queue views, board views, document views, and roadmap views SHALL remain projections over canonical state rather than alternative models.
+
+
+
+
+
+30.6 Knowledge Context SHALL Remain Governed
+
+
+
+
+
+Persistent memory and reusable context SHALL be versioned, policy-scoped, and auditable.
+
+
+
+
+
+30.7 Canonical Core Language Guardrail
+
+
+
+
+The core model and requirements SHALL avoid code-only framing.
+
+
+
+
+No repository-first thinking
+No PR-first thinking
+No commit-first thinking
+
+
+
+
+Core concepts SHALL be defined in terms of:
+
+
+
+
+request
+artifact
+change set
+review
+promotion
+policy
+event
+
+
+
+
+30.8 Adapter Framing Guardrail
+
+
+
+
+All external systems SHALL be treated as adapters to canonical RGP semantics.
+
+
+
+
+GitHub is an adapter
+Jira is an adapter
+ServiceNow is an adapter
+CMS is an adapter
+
+
+
+
+30.9 Universal Promotion Guardrail
+
+
+
+
+Promotion is the universal apply-change mechanism.
+
+
+
+
+Merge, publish, deploy, and fulfill SHALL remain context-specific expressions of promotion rather than separate core primitives.
+
+
+
+
+30.10 Domain-Neutral Change Set Guardrail
+
+
+
+
+Change Set must remain domain-neutral.
+
+
+
+
+If Change Set collapses into code diff semantics, the platform loses substrate neutrality and multi-vertical applicability.
+
 
 
 
 FINAL REQUIREMENTS STATEMENT
-
-
-
 
 
 
@@ -1993,19 +3971,10 @@ Executes via external AI platforms
 Evolves its own capabilities
 Measures and optimizes performance
 Operates at enterprise scale
-
-
-
-
-
-
-
-FINAL RESULT
-
-
-
-
-
-Together, Constitution + Requirements now define:
-
-A complete enterprise AI-native operating system for work
+Supports substrate-neutral governance
+Supports multi-domain work coordination
+Supports agentic content authoring and editorial pipelines
+Supports service-management-style workflows
+Supports planning and delivery workflows
+Supports persistent governed knowledge
+Supports policy-aware orchestration across humans and agents
