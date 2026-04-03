@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rgp-api"
+version = "0.1.0"
+description = "Request Governance Platform API"
+license = { text = "PolyForm Noncommercial 1.0.0 (see repository LICENSE.md)" }
+requires-python = ">=3.11"
+dependencies = [
+  "alembic>=1.15.2",
+  "celery>=5.4.0",
+  "cryptography>=44.0.2",
+  "fastapi>=0.115.12",
+  "opentelemetry-exporter-otlp-proto-http>=1.33.1",
+  "opentelemetry-instrumentation-fastapi>=0.54b1",
+  "opentelemetry-instrumentation-sqlalchemy>=0.54b1",
+  "opentelemetry-sdk>=1.33.1",
+  "PyJWT[crypto]>=2.10.1",
+  "psycopg[binary]>=3.2.6",
+  "uvicorn[standard]>=0.34.0",
+  "pydantic>=2.10.6",
+  "pydantic-settings>=2.8.1",
+  "redis>=5.2.1",
+  "sqlalchemy>=2.0.38"
+]
+
+[project.optional-dependencies]
+dev = [
+  "bandit>=1.8.3",
+  "coverage[toml]>=7.8.0",
+  "pip-audit>=2.9.0"
+]
+
+[tool.coverage.run]
+source = ["app.services", "app.core"]
+
+[tool.coverage.report]
+omit = ["*/__init__.py"]
+
+[tool.setuptools.packages.find]
+include = ["app*"]

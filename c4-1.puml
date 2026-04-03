@@ -1,0 +1,226 @@
+@startuml RGP_C4_Context
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Context.puml
+
+title Request Governance Platform - System Context
+
+Person(submitter, "Submitter", "Creates and tracks governed requests")
+Person(reviewer, "Reviewer / Approver", "Reviews artifacts, approvals, and promotions")
+Person(operator, "Operator", "Monitors runs, failures, and interventions")
+Person(executive, "Executive / Manager", "Consumes workflow intelligence and platform metrics")
+Person(admin, "Platform Administrator", "Configures templates, policies, capabilities, and integrations")
+
+System(rgp, "Request Governance Platform (RGP)", "Governance, interaction, review, promotion, audit, capability registry, and workflow intelligence layer")
+System_Ext(foundry, "Microsoft Foundry", "Managed runtime for hosted agent execution")
+System_Ext(maf, "Microsoft Agent Framework", "Workflow orchestration and multi-agent coordination")
+System_Ext(github, "GitHub / GitHub MCP", "Repository hosting, source control, pull request mirroring, and repository operations")
+System_Ext(idp, "Enterprise Identity Provider", "SAML / OIDC / SCIM")
+System_Ext(policy, "Policy / Compliance Services", "External policy, compliance, and validation engines")
+System_Ext(notify, "Notification Services", "Email, chat, paging, webhook delivery")
+System_Ext(bi, "BI / Data Warehouse", "Optional downstream analytics and executive reporting")
+
+Rel(submitter, rgp, "Creates requests, interacts with runs, views outcomes")
+Rel(reviewer, rgp, "Reviews artifacts, approves, blocks, requests changes")
+Rel(operator, rgp, "Monitors and intervenes in governed execution")
+Rel(executive, rgp, "Views workflow intelligence, trends, and performance dashboards")
+Rel(admin, rgp, "Administers templates, policies, capabilities, and integrations")
+
+Rel(rgp, foundry, "Dispatches and governs agent execution")
+Rel(rgp, maf, "Binds requests to workflows and receives execution signals")
+Rel(rgp, github, "Reads/writes repositories, manages change sets, optionally mirrors PR-style flows")
+Rel(rgp, idp, "Federates identity, group membership, and provisioning")
+Rel(rgp, policy, "Evaluates checks, compliance, and policy decisions")
+Rel(rgp, notify, "Sends alerts, notifications, and escalation events")
+Rel(rgp, bi, "Publishes workflow intelligence and metric aggregates")
+
+Rel(foundry, maf, "Executes workflow-defined agents and steps", "Runtime coordination")
+
+@enduml
+
+@startuml RGP_C4_Container
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+title Request Governance Platform - Container Diagram
+
+Person(submitter, "Submitter")
+Person(reviewer, "Reviewer / Approver")
+Person(operator, "Operator")
+Person(executive, "Executive / Manager")
+Person(admin, "Platform Administrator")
+
+System_Ext(foundry, "Microsoft Foundry", "Managed agent runtime")
+System_Ext(maf, "Microsoft Agent Framework", "Workflow orchestration substrate")
+System_Ext(github, "GitHub / GitHub MCP", "Repository and source control integration")
+System_Ext(idp, "Enterprise Identity Provider", "SSO / SCIM")
+System_Ext(policy, "Policy / Compliance Services", "External policy and validation")
+System_Ext(notify, "Notification Services", "Email, chat, paging")
+System_Ext(bi, "BI / Analytics Platform", "Optional downstream reporting")
+
+System_Boundary(rgp_boundary, "Request Governance Platform") {
+
+  Container(web, "Web Application", "React / Next.js", "Request intake, review, promotion, operations, dashboards")
+  Container(api, "Governance API", "FastAPI / .NET API", "Primary API for requests, reviews, approvals, promotions, and capabilities")
+  Container(orchestrator, "Coordination Service", "Service layer", "Workflow binding, dispatch, runtime normalization, state synchronization")
+  Container(conversation, "Conversation & Command Service", "Service layer", "Scoped interaction threads, command handling, agent/user message routing")
+  Container(review, "Review & Promotion Service", "Service layer", "Review routing, freshness, approval enforcement, promotion gates")
+  Container(capability, "Capability Registry Service", "Service layer", "Tracks active workflows, agents, tools, templates, and policies")
+  Container(policysvc, "Policy & Check Service", "Service layer", "Evaluates checks, policy decisions, and override rules")
+  Container(analytics, "Workflow Intelligence Service", "Service layer", "Computes lifecycle metrics, bottlenecks, trends, cost efficiency, and SLA/SLO reporting")
+  Container(events, "Event Store", "Event database", "Immutable governance event streams")
+  ContainerDb(operationaldb, "Operational Database", "PostgreSQL", "Current state, templates, requests, artifacts, reviews, promotions")
+  ContainerDb(artifactstore, "Artifact Store", "Object storage", "Artifacts, diffs, reports, exported evidence")
+  ContainerDb(metricsdb, "Metrics Warehouse", "Analytics DB / Lakehouse", "Aggregated workflow intelligence and historical metrics")
+  Container(queue, "Async Bus / Queue", "Kafka / SQS / Service Bus", "Async processing, signal ingestion, notifications, analytics pipelines")
+  Container(adapter, "Integration Adapter Layer", "Connector services", "Foundry, Agent Framework, GitHub, identity, notifications, external systems")
+}
+
+Rel(submitter, web, "Uses")
+Rel(reviewer, web, "Uses")
+Rel(operator, web, "Uses")
+Rel(executive, web, "Uses")
+Rel(admin, web, "Uses")
+
+Rel(web, api, "Calls")
+Rel(api, operationaldb, "Reads/Writes")
+Rel(api, events, "Appends events")
+Rel(api, queue, "Publishes async work")
+
+Rel(api, orchestrator, "Invokes")
+Rel(api, review, "Invokes")
+Rel(api, conversation, "Invokes")
+Rel(api, capability, "Invokes")
+Rel(api, policysvc, "Invokes")
+Rel(api, analytics, "Queries")
+
+Rel(orchestrator, adapter, "Dispatches execution and ingests signals through")
+Rel(orchestrator, events, "Appends run and workflow events")
+Rel(orchestrator, operationaldb, "Updates request/run state")
+Rel(orchestrator, queue, "Publishes runtime normalization jobs")
+
+Rel(conversation, operationaldb, "Reads/Writes threads and commands")
+Rel(conversation, events, "Appends interaction events")
+Rel(conversation, queue, "Publishes notifications / command jobs")
+
+Rel(review, operationaldb, "Reads/Writes reviews, approvals, promotions")
+Rel(review, events, "Appends review and promotion events")
+Rel(review, policysvc, "Requests check evaluations")
+
+Rel(capability, operationaldb, "Reads/Writes capability registry")
+Rel(capability, artifactstore, "Stores definition artifacts")
+Rel(capability, events, "Appends capability lifecycle events")
+
+Rel(policysvc, operationaldb, "Reads policy bindings and check state")
+Rel(policysvc, events, "Appends check and override events")
+Rel(policysvc, adapter, "Calls external policy/compliance systems via")
+
+Rel(analytics, events, "Consumes event streams")
+Rel(analytics, operationaldb, "Reads state snapshots")
+Rel(analytics, metricsdb, "Writes aggregates and trends")
+Rel(analytics, queue, "Consumes async analytics jobs")
+
+Rel(queue, notify, "Delivers notifications via adapter")
+Rel(adapter, foundry, "Invokes runtime")
+Rel(adapter, maf, "Invokes workflows / receives workflow signals")
+Rel(adapter, github, "Reads/writes repositories, change sets, optional PR mirroring")
+Rel(adapter, idp, "Authenticates and syncs identities")
+Rel(adapter, policy, "Evaluates external checks and compliance rules")
+Rel(analytics, bi, "Publishes curated metrics")
+
+Rel(artifactstore, operationaldb, "Stores artifact references for", "Metadata linkage")
+
+@enduml
+
+@startuml RGP_C4_Component
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+
+title Request Governance Platform - Core API Components
+
+Container_Boundary(api_boundary, "Governance API") {
+
+  Component(request_api, "Request API", "REST / GraphQL endpoints", "Creates, amends, submits, cancels, clones, and queries requests")
+  Component(template_api, "Template API", "REST / GraphQL endpoints", "Manages request templates and version binding")
+  Component(run_api, "Run API", "REST / GraphQL endpoints", "Exposes run state, execution controls, and runtime linkage")
+  Component(review_api, "Review API", "REST / GraphQL endpoints", "Handles reviews, approvals, stale state, and promotion requests")
+  Component(conversation_api, "Conversation API", "REST / streaming endpoints", "Scoped messages, commands, and interaction history")
+  Component(capability_api, "Capability API", "REST / GraphQL endpoints", "Capability registry, definition artifacts, activation/deprecation")
+  Component(analytics_api, "Analytics API", "REST / GraphQL endpoints", "Workflow metrics, bottlenecks, trends, forecasting, dashboards")
+
+  Component(request_service, "Request Service", "Domain service", "Request lifecycle, state transitions, event emission")
+  Component(template_service, "Template Service", "Domain service", "Template validation, versioning, schema binding")
+  Component(ownership_service, "Ownership Service", "Domain service", "Owner resolution, reviewer assignment, escalation")
+  Component(workflow_binding_service, "Workflow Binding Service", "Domain service", "Maps requests to workflows and runtime bindings")
+  Component(run_service, "Run Service", "Domain service", "Tracks runs, current step, runtime status normalization")
+  Component(review_service, "Review Service", "Domain service", "Review routing, freshness, blocking logic, approval states")
+  Component(promotion_service, "Promotion Service", "Domain service", "Promotion eligibility, target authorization, execution handoff")
+  Component(conversation_service, "Conversation Service", "Domain service", "Scoped threads, message persistence, command semantics")
+  Component(command_service, "Command Service", "Domain service", "Pause, resume, retry, inject context, override, promote")
+  Component(check_service, "Check Service", "Domain service", "Policy checks, validation results, override handling")
+  Component(capability_service, "Capability Service", "Domain service", "Definition lifecycle, registry activation, rollback/deprecation")
+  Component(artifact_service, "Artifact Service", "Domain service", "Artifact registration, lineage, versioning, diff references")
+  Component(event_service, "Event Service", "Domain service", "Appends immutable governance events and produces streams")
+  Component(metrics_service, "Metrics Service", "Domain service", "Computes lifecycle metrics, SLA/SLOs, throughput, cost efficiency")
+  Component(authz_service, "Authorization Service", "Domain service", "RBAC, tenant boundaries, delegated access")
+
+  ComponentDb(state_repo, "Operational State Repository", "PostgreSQL / ORM", "Persists current-state models")
+  ComponentDb(event_repo, "Event Repository", "Event store", "Persists immutable governance events")
+}
+
+Rel(request_api, request_service, "Uses")
+Rel(template_api, template_service, "Uses")
+Rel(run_api, run_service, "Uses")
+Rel(review_api, review_service, "Uses")
+Rel(review_api, promotion_service, "Uses")
+Rel(conversation_api, conversation_service, "Uses")
+Rel(conversation_api, command_service, "Uses")
+Rel(capability_api, capability_service, "Uses")
+Rel(analytics_api, metrics_service, "Uses")
+
+Rel(request_service, template_service, "Validates against")
+Rel(request_service, ownership_service, "Resolves ownership with")
+Rel(request_service, workflow_binding_service, "Binds workflows with")
+Rel(request_service, event_service, "Emits events through")
+Rel(request_service, state_repo, "Reads/Writes")
+
+Rel(template_service, state_repo, "Reads/Writes")
+Rel(ownership_service, state_repo, "Reads rules / Writes assignments")
+Rel(workflow_binding_service, state_repo, "Reads bindings / Writes selections")
+Rel(run_service, state_repo, "Reads/Writes")
+Rel(run_service, event_service, "Emits events through")
+
+Rel(review_service, check_service, "Requests blocking checks from")
+Rel(review_service, artifact_service, "Evaluates artifact versions through")
+Rel(review_service, event_service, "Emits events through")
+Rel(review_service, state_repo, "Reads/Writes")
+
+Rel(promotion_service, review_service, "Verifies approvals with")
+Rel(promotion_service, check_service, "Verifies checks with")
+Rel(promotion_service, event_service, "Emits events through")
+Rel(promotion_service, state_repo, "Reads/Writes")
+
+Rel(conversation_service, event_service, "Emits message events through")
+Rel(conversation_service, state_repo, "Reads/Writes")
+
+Rel(command_service, authz_service, "Authorizes through")
+Rel(command_service, run_service, "Controls runs through")
+Rel(command_service, promotion_service, "Controls promotions through")
+Rel(command_service, event_service, "Emits command events through")
+
+Rel(check_service, state_repo, "Reads/Writes")
+Rel(check_service, event_service, "Emits events through")
+
+Rel(capability_service, artifact_service, "Uses definition artifacts from")
+Rel(capability_service, review_service, "Requires reviews from")
+Rel(capability_service, promotion_service, "Promotes via")
+Rel(capability_service, state_repo, "Reads/Writes")
+Rel(capability_service, event_service, "Emits events through")
+
+Rel(artifact_service, state_repo, "Reads/Writes")
+Rel(artifact_service, event_service, "Emits events through")
+
+Rel(metrics_service, event_repo, "Consumes event streams from")
+Rel(metrics_service, state_repo, "Reads snapshots from")
+Rel(metrics_service, state_repo, "Writes aggregate references to")
+
+Rel(event_service, event_repo, "Appends to")
+Rel(authz_service, state_repo, "Reads roles, permissions, tenancy rules from")
+
+@enduml

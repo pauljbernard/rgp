@@ -1,0 +1,100 @@
+@startuml
+title Enterprise AI-Buildable Specification Process - Swimlane by Role
+
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam defaultFontName Arial
+skinparam activity {
+  BorderColor #444444
+  BackgroundColor #F8F9FA
+  DiamondBackgroundColor #FFF8E1
+  DiamondBorderColor #B26A00
+  StartColor #2E7D32
+  EndColor #2E7D32
+  BarColor #666666
+  ArrowColor #444444
+}
+
+|Product Manager|
+start
+:Define product purpose;
+:Draft constitution;
+:Define business goals and requirements;
+:Prioritize delivery phases;
+
+|Architect|
+:Refine constitution into system boundaries;
+:Define architecture (C4);
+:Define domain model;
+:Define integration contracts;
+:Define execution specification pack;
+
+|Designer|
+:Define UX information architecture;
+:Define UX style guide;
+:Define enterprise design system;
+:Define screen contracts;
+:Define component contracts;
+
+|Product Manager|
+:Define decision tables and business rules;
+:Define acceptance criteria;
+:Approve scope for implementation;
+
+|Architect|
+:Define API contracts;
+:Define event model;
+:Define state transition matrix;
+:Define permission and concurrency model;
+
+|Designer|
+:Validate UX consistency across all screens;
+:Validate that workflows, tables, and drill-downs are coherent;
+
+|Product Manager|
+if (Specification sufficiently complete?) then (yes)
+  |AI Coding Agent|
+  :Generate application structure;
+  :Generate backend services;
+  :Generate frontend screens and components;
+  :Generate integration adapters;
+  :Generate tests;
+  
+  |Architect|
+  :Review technical correctness;
+  :Review architecture fidelity;
+  
+  |Designer|
+  :Review UX fidelity;
+  :Review design system compliance;
+  
+  |Product Manager|
+  :Review business workflow correctness;
+  
+  if (Defects, ambiguity, or drift found?) then (yes)
+    :Route issues back to responsible role;
+    |Architect|
+    :Refine technical specs as needed;
+    |Designer|
+    :Refine UX / design specs as needed;
+    |Product Manager|
+    :Refine requirements / rules as needed;
+    |AI Coding Agent|
+    :Regenerate affected implementation;
+  else (no)
+    |Product Manager|
+    :Approve implementation baseline;
+    stop
+  endif
+else (no)
+  :Identify missing specification artifacts;
+  |Architect|
+  :Close architecture / data / API gaps;
+  |Designer|
+  :Close UX / screen / component gaps;
+  |Product Manager|
+  :Close requirement / rule / acceptance gaps;
+  --> :Define business goals and requirements;
+endif
+
+@enduml

@@ -1,0 +1,4506 @@
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
+import re
+import threading
+import time
+from types import SimpleNamespace
+from uuid import uuid4
+
+from sqlalchemy import desc, func, select
+
+from app.core.config import settings
+from app.db.models import AgentSessionMessageTable, AgentSessionTable, ArtifactEventTable, ArtifactLineageEdgeTable, ArtifactTable, CapabilityTable, CheckOverrideTable, CheckResultTable, CheckRunTable, DeploymentExecutionTable, EventOutboxTable, EventStoreTable, IntegrationTable, PolicyTable, PortfolioScopeTable, PortfolioTable, PromotionTable, RequestEventTable, RequestRelationshipTable, RequestTable, ReviewQueueTable, RunTable, RuntimeDispatchTable, RuntimeSignalTable, TeamMembershipTable, TeamTable, TemplateTable, TransitionGateTable, UserTable
+from app.db.session import SessionLocal
+from app.models.common import PaginatedResponse
+from app.models.governance import (
+    AnalyticsAgentRow,
+    AgentSessionDetail,
+    AgentSessionMessageCreateRequest,
+    AgentSessionMessageRecord,
+    AgentSessionRecord,
+    AnalyticsBottleneckRow,
+    AnalyticsWorkflowRow,
+    AgentTrendPoint,
+    AssignAgentSessionRequest,
+    ArtifactDetail,
+    ArtifactEvent,
+    ArtifactLineageEdge,
+    ArtifactRecord,
+    AuditEntry,
+    CapabilityDetail,
+    CapabilityRecord,
+    CheckOverride,
+    CheckOverrideRequest,
+    CheckRunRecord,
+    CheckRunRequest,
+    CheckResult,
+    CompleteAgentSessionRequest,
+    CreateIntegrationRequest,
+    CheckEvaluationRequest,
+    CreatePortfolioRequest,
+    CreateTeamRequest,
+    CreateUserRequest,
+    IntegrationRecord,
+    EventLedgerRecord,
+    EventOutboxRecord,
+    DeliveryDoraRow,
+    DeliveryForecastPoint,
+    DeliveryForecastSummary,
+    DeliveryLifecycleRow,
+    DeliveryTrendPoint,
+    PerformanceOperationsSummary,
+    PerformanceOperationsTrendPoint,
+    PolicyRecord,
+    PolicyRuleUpdateRequest,
+    PortfolioRecord,
+    PortfolioSummary,
+    PromotionDetail,
+    PromotionActionRequest,
+    PromotionApprovalOverrideRequest,
+    RequestDetail,
+    RequestRelationship,
+    ReviewAssignmentOverrideRequest,
+    ReviewDecisionRequest,
+    ReviewQueueItem,
+    RunCommandRequest,
+    RuntimeRunCallbackRequest,
+    RunStatus,
+    RunDetail,
+    RunRecord,
+    StepStatus,
+    TeamMemberRecord,
+    TeamRecord,
+    UpdateIntegrationRequest,
+    UpdateTeamRequest,
+    UpdateUserRequest,
+    UserRecord,
+    WorkflowTrendPoint,
+    AddTeamMembershipRequest,
+    seed_agent_analytics,
+    seed_artifacts,
+    seed_audit_entries,
+    seed_bottleneck_analytics,
+    seed_capabilities,
+    seed_integrations,
+    seed_policies,
+    seed_promotions,
+    seed_requests,
+    seed_review_queue,
+    seed_runs,
+    seed_templates,
+    seed_workflow_analytics,
+)
+from app.models.request import AmendRequest, CancelRequest, CloneRequest, CreateRequestDraft, RequestCheckRun, RequestPriority, RequestRecord, RequestStatus, SubmitRequest, SupersedeRequest, TransitionRequest
+from app.services.check_dispatch_service import check_dispatch_service
+from app.services.deployment_service import deployment_service
+from app.services.agent_provider_service import agent_provider_service
+from app.services.event_store_service import event_store_service
+from app.services.integration_security_service import integration_security_service
+from app.services.object_store_service import object_store_service
+from app.services.policy_check_service import policy_check_service
+from app.services.runtime_dispatch_service import runtime_dispatch_service
+from app.models.template import (
+    CreateTemplateVersionRequest,
+    TemplateRecord,
+    TemplateStatus,
+    TemplateStatusActionRequest,
+    TemplateValidationIssue,
+    TemplateValidationPreview,
+    TemplateValidationPreviewField,
+    TemplateValidationResult,
+    UpdateTemplateDefinitionRequest,
+)
+
+
+class GovernanceRepository:
+    _agent_stream_lock = threading.Lock()
+    _agent_stream_inflight: set[str] = set()
+
+    SLA_POLICY_RULES = {
+        "sla_standard_v1": {
+            "review_hours": {"medium": 4, "high": 2, "urgent": 1},
+            "promotion_hours": {"medium": 6, "high": 4, "urgent": 2},
+            "execution_hours": {"medium": 8, "high": 6, "urgent": 3},
+        }
+    }
+    TRANSITION_RULES = {
+        RequestStatus.SUBMITTED: {RequestStatus.VALIDATED, RequestStatus.VALIDATION_FAILED, RequestStatus.CANCELED},
+        RequestStatus.VALIDATION_FAILED: {RequestStatus.DRAFT, RequestStatus.CANCELED},
+        RequestStatus.VALIDATED: {RequestStatus.CLASSIFIED, RequestStatus.CANCELED},
+        RequestStatus.CLASSIFIED: {RequestStatus.OWNERSHIP_RESOLVED, RequestStatus.CANCELED},
+        RequestStatus.OWNERSHIP_RESOLVED: {RequestStatus.PLANNED, RequestStatus.CANCELED},
+        RequestStatus.PLANNED: {RequestStatus.QUEUED, RequestStatus.CANCELED},
+        RequestStatus.QUEUED: {RequestStatus.IN_EXECUTION, RequestStatus.FAILED, RequestStatus.CANCELED},
+        RequestStatus.IN_EXECUTION: {RequestStatus.AWAITING_INPUT, RequestStatus.AWAITING_REVIEW, RequestStatus.FAILED, RequestStatus.CANCELED},
+        RequestStatus.AWAITING_INPUT: {RequestStatus.DRAFT, RequestStatus.CANCELED},
+        RequestStatus.AWAITING_REVIEW: {RequestStatus.UNDER_REVIEW, RequestStatus.CHANGES_REQUESTED, RequestStatus.APPROVED, RequestStatus.CANCELED},
+        RequestStatus.UNDER_REVIEW: {RequestStatus.CHANGES_REQUESTED, RequestStatus.APPROVED, RequestStatus.REJECTED, RequestStatus.CANCELED},
+        RequestStatus.CHANGES_REQUESTED: {RequestStatus.DRAFT, RequestStatus.CANCELED},
+        RequestStatus.APPROVED: {RequestStatus.PROMOTION_PENDING, RequestStatus.COMPLETED, RequestStatus.CANCELED},
+        RequestStatus.PROMOTION_PENDING: {RequestStatus.PROMOTED, RequestStatus.FAILED, RequestStatus.CANCELED},
+        RequestStatus.PROMOTED: {RequestStatus.COMPLETED},
+        RequestStatus.FAILED: {RequestStatus.PLANNED, RequestStatus.CANCELED},
+    }
+    SUBMITTABLE_STATUSES = {
+        RequestStatus.DRAFT,
+        RequestStatus.CHANGES_REQUESTED,
+        RequestStatus.VALIDATION_FAILED,
+        RequestStatus.AWAITING_INPUT,
+    }
+    AMENDABLE_STATUSES = {
+        RequestStatus.DRAFT,
+        RequestStatus.SUBMITTED,
+        RequestStatus.VALIDATION_FAILED,
+        RequestStatus.VALIDATED,
+        RequestStatus.CLASSIFIED,
+        RequestStatus.OWNERSHIP_RESOLVED,
+        RequestStatus.PLANNED,
+        RequestStatus.QUEUED,
+        RequestStatus.AWAITING_INPUT,
+        RequestStatus.AWAITING_REVIEW,
+        RequestStatus.UNDER_REVIEW,
+        RequestStatus.CHANGES_REQUESTED,
+        RequestStatus.APPROVED,
+        RequestStatus.PROMOTION_PENDING,
+        RequestStatus.FAILED,
+    }
+    CANCELABLE_STATUSES = {
+        RequestStatus.DRAFT,
+        RequestStatus.SUBMITTED,
+        RequestStatus.VALIDATION_FAILED,
+        RequestStatus.VALIDATED,
+        RequestStatus.CLASSIFIED,
+        RequestStatus.OWNERSHIP_RESOLVED,
+        RequestStatus.PLANNED,
+        RequestStatus.QUEUED,
+        RequestStatus.IN_EXECUTION,
+        RequestStatus.AWAITING_INPUT,
+        RequestStatus.AWAITING_REVIEW,
+        RequestStatus.UNDER_REVIEW,
+        RequestStatus.CHANGES_REQUESTED,
+        RequestStatus.APPROVED,
+        RequestStatus.PROMOTION_PENDING,
+        RequestStatus.FAILED,
+    }
+    def __init__(self) -> None:
+        self.requests = seed_requests()
+        self.templates = seed_templates()
+        self.runs = seed_runs()
+        self.artifacts = seed_artifacts()
+        self.review_queue = seed_review_queue()
+        self.promotions = seed_promotions()
+        self.capabilities = seed_capabilities()
+        self.workflow_analytics = seed_workflow_analytics()
+        self.agent_analytics = seed_agent_analytics()
+        self.bottleneck_analytics = seed_bottleneck_analytics()
+        self.audit_entries = seed_audit_entries()
+        self.policies = seed_policies()
+        self.integrations = seed_integrations()
+
+    @staticmethod
+    def _paginate(items: list, page: int, page_size: int) -> PaginatedResponse:
+        start = (page - 1) * page_size
+        end = start + page_size
+        return PaginatedResponse.create(items=items[start:end], page=page, page_size=page_size, total_count=len(items))
+
+    def list_requests(
+        self,
+        page: int,
+        page_size: int,
+        status: str | None = None,
+        owner_team_id: str | None = None,
+        workflow: str | None = None,
+        request_id: str | None = None,
+        tenant_id: str | None = None,
+    ) -> PaginatedResponse[RequestRecord]:
+        with SessionLocal() as session:
+            query = select(RequestTable)
+            if tenant_id:
+                query = query.where(RequestTable.tenant_id == tenant_id)
+            rows = session.scalars(query.order_by(desc(RequestTable.updated_at))).all()
+            workflow_request_ids = None
+            if workflow:
+                workflow_request_ids = {
+                    row.request_id
+                    for row in session.scalars(
+                        select(RunTable).where((RunTable.workflow == workflow) | (RunTable.workflow_identity == workflow))
+                    ).all()
+                }
+        records = [self._request_from_row(row) for row in rows]
+        if status:
+            records = [record for record in records if record.status == status]
+        if owner_team_id:
+            records = [record for record in records if record.owner_team_id == owner_team_id]
+        if request_id:
+            records = [record for record in records if record.id == request_id]
+        if workflow:
+            records = [
+                record
+                for record in records
+                if record.workflow_binding_id == workflow or record.template_id == workflow or (workflow_request_ids and record.id in workflow_request_ids)
+            ]
+        return self._paginate(records, page, page_size)
+
+    def get_request(self, request_id: str, tenant_id: str | None = None) -> RequestDetail:
+        with SessionLocal() as session:
+            request_row = session.get(RequestTable, request_id)
+            self._ensure_request_tenant_access(request_row, tenant_id)
+            run_row = session.scalars(select(RunTable).where(RunTable.request_id == request_id).order_by(desc(RunTable.updated_at))).first()
+            artifact_rows = session.scalars(select(ArtifactTable).where(ArtifactTable.request_id == request_id).order_by(desc(ArtifactTable.updated_at))).all()
+            review_rows = session.scalars(select(ReviewQueueTable).where(ReviewQueueTable.request_id == request_id)).all()
+            promotion_row = session.scalars(select(PromotionTable).where(PromotionTable.request_id == request_id).order_by(desc(PromotionTable.id))).first()
+            check_rows = session.scalars(
+                select(CheckResultTable).where(CheckResultTable.request_id == request_id, CheckResultTable.promotion_id.is_(None)).order_by(CheckResultTable.name)
+            ).all()
+            check_run_rows = session.scalars(
+                select(CheckRunTable).where(CheckRunTable.request_id == request_id).order_by(desc(CheckRunTable.queued_at))
+            ).all()
+            predecessor_rows = session.scalars(
+                select(RequestRelationshipTable).where(RequestRelationshipTable.target_request_id == request_id).order_by(RequestRelationshipTable.created_at)
+            ).all()
+            successor_rows = session.scalars(
+                select(RequestRelationshipTable).where(RequestRelationshipTable.source_request_id == request_id).order_by(RequestRelationshipTable.created_at)
+            ).all()
+            agent_session_rows = session.scalars(
+                select(AgentSessionTable).where(AgentSessionTable.request_id == request_id).order_by(desc(AgentSessionTable.updated_at))
+            ).all()
+            agent_messages = (
+                session.scalars(
+                    select(AgentSessionMessageTable)
+                    .where(AgentSessionMessageTable.request_id == request_id)
+                    .order_by(AgentSessionMessageTable.created_at)
+                ).all()
+                if agent_session_rows
+                else []
+            )
+            integration_rows = {
+                row.id: row
+                for row in session.scalars(
+                    select(IntegrationTable).where(
+                        IntegrationTable.id.in_([item.integration_id for item in agent_session_rows])
+                    )
+                ).all()
+            } if agent_session_rows else {}
+        if request_row is None:
+            raise StopIteration(request_id)
+        request = self._request_from_row(request_row)
+        latest_run = self._run_detail_from_row(run_row) if run_row else None
+        artifact_ids = [row.id for row in artifact_rows]
+        include_review_blockers = request.status in {
+            RequestStatus.AWAITING_REVIEW.value,
+            RequestStatus.UNDER_REVIEW.value,
+            RequestStatus.CHANGES_REQUESTED.value,
+        }
+        blockers = [row.blocking_status for row in review_rows if row.blocking_status] if include_review_blockers else []
+        blockers.extend([f"{check.name}: {check.detail}" for check in check_rows if check.state != "passed"])
+        blockers.extend(
+            [f"Checks {run.status}: {run.trigger_reason}" for run in check_run_rows if run.scope == "request" and run.status in {"queued", "running"}]
+        )
+        if request.status == RequestStatus.CHANGES_REQUESTED.value:
+            blockers.append("Reviewer requested changes before progress can continue.")
+        if request.status == RequestStatus.PROMOTION_PENDING.value and promotion_row is not None:
+            blockers.append(promotion_row.execution_readiness)
+        elif request.status == RequestStatus.PROMOTION_PENDING.value:
+            blockers.append("Promotion authorization still pending.")
+        messages_by_session: dict[str, list[AgentSessionMessageTable]] = {}
+        for message in agent_messages:
+            messages_by_session.setdefault(message.session_id, []).append(message)
+        session_records = [
+            self._agent_session_from_row(row, integration_rows.get(row.integration_id), messages_by_session.get(row.id, []))
+            for row in agent_session_rows
+        ]
+        active_agent_waits = [row for row in session_records if row.awaiting_human and row.status in {"active", "waiting_on_human"}]
+        if active_agent_waits:
+            blockers.append(f"Agent session waiting for human input: {active_agent_waits[0].agent_label}")
+        next_required_action = self._next_action_for_request(request.status, latest_run is not None, promotion_row is not None)
+        return RequestDetail(
+            request=request,
+            latest_run_id=latest_run.id if latest_run else None,
+            latest_artifact_ids=artifact_ids,
+            active_blockers=blockers,
+            check_results=[
+                CheckResult.model_validate(
+                    {
+                        "id": check.id,
+                        "request_id": check.request_id,
+                        "promotion_id": check.promotion_id,
+                        "name": check.name,
+                        "state": check.state,
+                        "detail": check.detail,
+                        "severity": check.severity,
+                        "evidence": check.evidence,
+                        "evaluated_at": check.evaluated_at.isoformat().replace("+00:00", "Z"),
+                        "evaluated_by": check.evaluated_by,
+                    }
+                )
+                for check in check_rows
+            ],
+            check_runs=[self._check_run_from_row(row) for row in check_run_rows],
+            agent_sessions=session_records,
+            next_required_action=next_required_action,
+            predecessors=[self._relationship_from_predecessor_row(row) for row in predecessor_rows],
+            successors=[self._relationship_from_successor_row(row) for row in successor_rows],
+        )
+
+    def list_templates(self, tenant_id: str | None = None, include_non_published: bool = False) -> list[TemplateRecord]:
+        with SessionLocal() as session:
+            stmt = select(TemplateTable)
+            if tenant_id:
+                stmt = stmt.where(TemplateTable.tenant_id == tenant_id)
+            if not include_non_published:
+                stmt = stmt.where(TemplateTable.status == TemplateStatus.PUBLISHED.value)
+            rows = session.scalars(stmt.order_by(TemplateTable.id, TemplateTable.version)).all()
+        return [self._template_from_row(row) for row in rows]
+
+    def create_template_version(self, payload: CreateTemplateVersionRequest, actor_id: str, tenant_id: str) -> TemplateRecord:
+        with SessionLocal() as session:
+            template_id = payload.template_id.strip()
+            version = payload.version.strip()
+            if not template_id:
+                raise ValueError("Template id is required")
+            if not version:
+                raise ValueError("Template version is required")
+            existing_row = session.scalars(
+                select(TemplateTable).where(
+                    TemplateTable.tenant_id == tenant_id,
+                    TemplateTable.id == template_id,
+                    TemplateTable.version == version,
+                )
+            ).first()
+            if existing_row is not None:
+                raise ValueError(f"Template version {template_id}@{version} already exists")
+            source_row = None
+            if payload.source_version:
+                source_row = session.scalars(
+                    select(TemplateTable).where(
+                        TemplateTable.tenant_id == tenant_id,
+                        TemplateTable.id == template_id,
+                        TemplateTable.version == payload.source_version,
+                    )
+                ).first()
+                if source_row is None:
+                    raise StopIteration(f"{template_id}@{payload.source_version}")
+            elif template_id in {row.id for row in session.scalars(select(TemplateTable).where(TemplateTable.tenant_id == tenant_id)).all()}:
+                source_row = session.scalars(
+                    select(TemplateTable)
+                    .where(TemplateTable.tenant_id == tenant_id, TemplateTable.id == template_id)
+                    .order_by(desc(TemplateTable.created_at))
+                ).first()
+            now = datetime.now(timezone.utc)
+            row = TemplateTable(
+                tenant_id=tenant_id,
+                id=template_id,
+                version=version,
+                name=payload.name or (source_row.name if source_row else template_id.replace("tmpl_", "").replace("_", " ").title()),
+                description=payload.description or (source_row.description if source_row else f"Draft template for {template_id}."),
+                status=TemplateStatus.DRAFT.value,
+                template_schema=deepcopy(source_row.template_schema) if source_row else {"required": [], "properties": {}, "routing": {}},
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(row)
+            session.flush()
+            event_store_service.append(
+                session,
+                tenant_id=tenant_id,
+                event_type="template.version_created",
+                aggregate_type="template",
+                aggregate_id=f"{row.id}@{row.version}",
+                actor=actor_id,
+                detail=f"Created draft template version {row.id}@{row.version}",
+                payload={"template_id": row.id, "template_version": row.version, "source_version": payload.source_version},
+            )
+            session.commit()
+            session.refresh(row)
+        return self._template_from_row(row)
+
+    def update_template_definition(
+        self,
+        template_id: str,
+        version: str,
+        payload: UpdateTemplateDefinitionRequest,
+        actor_id: str,
+        tenant_id: str,
+    ) -> TemplateRecord:
+        with SessionLocal() as session:
+            row = session.scalars(
+                select(TemplateTable).where(
+                    TemplateTable.tenant_id == tenant_id,
+                    TemplateTable.id == template_id,
+                    TemplateTable.version == version,
+                )
+            ).first()
+            if row is None:
+                raise StopIteration(f"{template_id}@{version}")
+            if row.status != TemplateStatus.DRAFT.value:
+                raise ValueError("Only draft template versions can be edited")
+            validation = self._validate_template_definition(payload.template_schema)
+            errors = [issue for issue in validation.issues if issue.level == "error"]
+            if errors:
+                raise ValueError("; ".join(f"{issue.path}: {issue.message}" for issue in errors))
+            row.name = payload.name
+            row.description = payload.description
+            row.template_schema = payload.template_schema
+            row.updated_at = datetime.now(timezone.utc)
+            session.flush()
+            event_store_service.append(
+                session,
+                tenant_id=tenant_id,
+                event_type="template.definition_updated",
+                aggregate_type="template",
+                aggregate_id=f"{row.id}@{row.version}",
+                actor=actor_id,
+                detail=f"Updated template definition for {row.id}@{row.version}",
+                payload={"template_id": row.id, "template_version": row.version},
+            )
+            session.commit()
+            session.refresh(row)
+        return self._template_from_row(row)
+
+    def validate_template_definition(self, template_id: str, version: str, tenant_id: str) -> TemplateValidationResult:
+        with SessionLocal() as session:
+            row = session.scalars(
+                select(TemplateTable).where(
+                    TemplateTable.tenant_id == tenant_id,
+                    TemplateTable.id == template_id,
+                    TemplateTable.version == version,
+                )
+            ).first()
+        if row is None:
+            raise StopIteration(f"{template_id}@{version}")
+        return self._validate_template_definition(row.template_schema or {})
+
+    def delete_template_version(self, template_id: str, version: str, actor_id: str, tenant_id: str) -> None:
+        with SessionLocal() as session:
+            row = session.scalars(
+                select(TemplateTable).where(
+                    TemplateTable.tenant_id == tenant_id,
+                    TemplateTable.id == template_id,
+                    TemplateTable.version == version,
+                )
+            ).first()
+            if row is None:
+                raise StopIteration(f"{template_id}@{version}")
+            if row.status != TemplateStatus.DRAFT.value:
+                raise ValueError("Only draft template versions can be deleted")
+            session.delete(row)
+            session.flush()
+            event_store_service.append(
+                session,
+                tenant_id=tenant_id,
+                event_type="template.version_deleted",
+                aggregate_type="template",
+                aggregate_id=f"{template_id}@{version}",
+                actor=actor_id,
+                detail=f"Deleted draft template version {template_id}@{version}",
+                payload={"template_id": template_id, "template_version": version},
+            )
+            session.commit()
+
+    def update_template_status(
+        self,
+        template_id: str,
+        version: str,
+        target_status: TemplateStatus,
+        actor_id: str,
+        tenant_id: str,
+        note: str | None = None,
+    ) -> TemplateRecord:
+        with SessionLocal() as session:
+            row = session.scalars(
+                select(TemplateTable).where(
+                    TemplateTable.tenant_id == tenant_id,
+                    TemplateTable.id == template_id,
+                    TemplateTable.version == version,
+                )
+            ).first()
+            if row is None:
+                raise StopIteration(f"{template_id}@{version}")
+            if target_status == TemplateStatus.PUBLISHED:
+                published_rows = session.scalars(
+                    select(TemplateTable).where(
+                        TemplateTable.tenant_id == tenant_id,
+                        TemplateTable.id == template_id,
+                        TemplateTable.status == TemplateStatus.PUBLISHED.value,
+                        TemplateTable.version != version,
+                    )
+                ).all()
+                for published_row in published_rows:
+                    published_row.status = TemplateStatus.DEPRECATED.value
+                    published_row.updated_at = datetime.now(timezone.utc)
+            row.status = target_status.value
+            row.updated_at = datetime.now(timezone.utc)
+            session.flush()
+            event_store_service.append(
+                session,
+                tenant_id=tenant_id,
+                event_type=f"template.{target_status.value}",
+                aggregate_type="template",
+                aggregate_id=f"{row.id}@{row.version}",
+                actor=actor_id,
+                detail=f"Marked template {row.id}@{row.version} as {target_status.value}",
+                payload={"template_id": row.id, "template_version": row.version, "note": note or ""},
+            )
+            session.commit()
+            session.refresh(row)
+        return self._template_from_row(row)
+
+    def list_runs(
+        self,
+        page: int,
+        page_size: int,
+        status: str | None = None,
+        workflow: str | None = None,
+        owner: str | None = None,
+        request_id: str | None = None,
+        tenant_id: str | None = None,
+    ) -> PaginatedResponse[RunRecord]:
+        with SessionLocal() as session:
+            rows = session.scalars(select(RunTable).order_by(desc(RunTable.updated_at))).all()
+            request_tenant_map = {
+                row.id: row.tenant_id
+                for row in session.scalars(select(RequestTable).where(RequestTable.id.in_([item.request_id for item in rows]))).all()
+            } if rows else {}
+        run_details = [self._run_detail_from_row(row) for row in rows]
+        run_rows = [RunRecord.model_validate(detail.model_dump()) for detail in run_details]
+        if tenant_id:
+            run_rows = [row for row in run_rows if request_tenant_map.get(row.request_id) == tenant_id]
+        if status:
+            run_rows = [row for row in run_rows if row.status == status]
+        if workflow:
+            run_rows = [
+                row
+                for row, detail in zip(run_rows, run_details, strict=False)
+                if row.workflow == workflow or detail.workflow_identity == workflow
+            ]
+        if owner:
+            run_rows = [
+                row
+                for row in run_rows
+                if row.owner_team == owner
+                or any(step.owner == owner for step in self.get_run(row.id).steps)
+            ]
+        if request_id:
+            run_rows = [row for row in run_rows if row.request_id == request_id]
+        return self._paginate(run_rows, page, page_size)
+
+    def get_run(self, run_id: str, tenant_id: str | None = None) -> RunDetail:
+        with SessionLocal() as session:
+            row = session.get(RunTable, run_id)
+            if row is not None:
+                self._ensure_request_access(session, row.request_id, tenant_id)
+            dispatch_rows = session.scalars(select(RuntimeDispatchTable).where(RuntimeDispatchTable.run_id == run_id).order_by(desc(RuntimeDispatchTable.dispatched_at))).all()
+            signal_rows = session.scalars(select(RuntimeSignalTable).where(RuntimeSignalTable.run_id == run_id).order_by(desc(RuntimeSignalTable.received_at))).all()
+        if row is None:
+            raise StopIteration(run_id)
+        return self._run_detail_from_row(row, dispatch_rows, signal_rows)
+
+    def command_run(self, run_id: str, payload: RunCommandRequest, tenant_id: str | None = None) -> RunDetail:
+        with SessionLocal() as session:
+            run_row = session.get(RunTable, run_id)
+            if run_row is None:
+                raise StopIteration(run_id)
+            request_row = self._get_request_row(session, run_row.request_id)
+            self._ensure_request_tenant_access(request_row, tenant_id)
+            command = payload.command
+            if command not in {"Pause", "Resume", "Retry Step", "Cancel Run"}:
+                raise ValueError(f"Unsupported run command {command}")
+            self._dispatch_run_to_runtime(session, request_row, run_id, command.lower().replace(" ", "_"), payload.actor_id, force=True)
+            now = datetime.now(timezone.utc)
+            if command == "Pause":
+                run_row.status = RunStatus.PAUSED.value
+                run_row.waiting_reason = "Paused by operator command"
+                run_row.current_step_output_summary = "Runtime accepted pause command."
+            elif command == "Resume":
+                run_row.status = RunStatus.RUNNING.value
+                run_row.waiting_reason = None
+                run_row.current_step_output_summary = "Runtime accepted resume command."
+            elif command == "Retry Step":
+                run_row.status = RunStatus.RUNNING.value
+                run_row.waiting_reason = None
+                run_row.current_step_output_summary = "Runtime accepted retry command."
+                run_row.progress_percent = max(run_row.progress_percent - 5, 10)
+            elif command == "Cancel Run":
+                run_row.status = RunStatus.FAILED.value
+                run_row.waiting_reason = "Canceled by operator command"
+                run_row.failure_reason = "Run canceled through governance control plane"
+                run_row.current_step_output_summary = "Runtime accepted cancel command."
+                request_row.status = RequestStatus.FAILED.value
+                request_row.updated_at = now
+                request_row.updated_by = payload.actor_id
+                request_row.version += 1
+                self._append_event(
+                    session=session,
+                    request_id=request_row.id,
+                    actor=payload.actor_id,
+                    action="Run Canceled",
+                    reason_or_evidence=payload.reason,
+                )
+            run_row.updated_at = now
+            dispatch_rows = session.scalars(select(RuntimeDispatchTable).where(RuntimeDispatchTable.run_id == run_id).order_by(desc(RuntimeDispatchTable.dispatched_at))).all()
+            signal_rows = session.scalars(select(RuntimeSignalTable).where(RuntimeSignalTable.run_id == run_id).order_by(desc(RuntimeSignalTable.received_at))).all()
+            session.commit()
+            session.refresh(run_row)
+            return self._run_detail_from_row(run_row, dispatch_rows, signal_rows)
+
+    def reconcile_run(self, run_id: str, payload: RuntimeRunCallbackRequest) -> RunDetail:
+        with SessionLocal() as session:
+            run_row = session.get(RunTable, run_id)
+            if run_row is None:
+                raise StopIteration(run_id)
+            request_row = self._get_request_row(session, run_row.request_id)
+            existing_signal = session.scalars(
+                select(RuntimeSignalTable).where(
+                    RuntimeSignalTable.run_id == run_id,
+                    RuntimeSignalTable.event_id == payload.event_id,
+                )
+            ).first()
+            if existing_signal is not None:
+                dispatch_rows = session.scalars(select(RuntimeDispatchTable).where(RuntimeDispatchTable.run_id == run_id).order_by(desc(RuntimeDispatchTable.dispatched_at))).all()
+                signal_rows = session.scalars(select(RuntimeSignalTable).where(RuntimeSignalTable.run_id == run_id).order_by(desc(RuntimeSignalTable.received_at))).all()
+                return self._run_detail_from_row(run_row, dispatch_rows, signal_rows)
+            now = datetime.now(timezone.utc)
+            session.add(
+                RuntimeSignalTable(
+                    tenant_id=request_row.tenant_id,
+                    run_id=run_id,
+                    request_id=request_row.id,
+                    event_id=payload.event_id,
+                    source=payload.source,
+                    status=payload.status,
+                    current_step=payload.current_step,
+                    detail=payload.detail,
+                    payload={
+                        **payload.payload,
+                        "progress_percent": payload.progress_percent,
+                        "waiting_reason": payload.waiting_reason,
+                        "failure_reason": payload.failure_reason,
+                    },
+                    received_at=now,
+                )
+            )
+            event_store_service.append(
+                session,
+                tenant_id=request_row.tenant_id,
+                event_type=f"runtime.signal.{payload.status}",
+                aggregate_type="run",
+                aggregate_id=run_id,
+                request_id=request_row.id,
+                run_id=run_id,
+                actor=payload.source,
+                detail=payload.detail,
+                payload=payload.model_dump(mode="python"),
+            )
+            run_row.status = payload.status
+            if payload.current_step:
+                run_row.current_step = payload.current_step
+            if payload.progress_percent is not None:
+                run_row.progress_percent = payload.progress_percent
+            run_row.waiting_reason = payload.waiting_reason
+            run_row.failure_reason = payload.failure_reason
+            run_row.current_step_output_summary = payload.detail
+            run_row.updated_at = now
+
+            if payload.status == RunStatus.COMPLETED.value:
+                request_row.status = RequestStatus.COMPLETED.value
+                request_row.updated_at = now
+                request_row.updated_by = payload.source
+                request_row.version += 1
+                self._update_artifact_review_state(session, request_row.id, artifact_status="completed", review_state="approved", stale_review=False, promotion_relevant=True)
+                self._append_event(session, request_row.id, payload.source, "Runtime Completed", payload.detail)
+            elif payload.status == RunStatus.FAILED.value:
+                request_row.status = RequestStatus.FAILED.value
+                request_row.updated_at = now
+                request_row.updated_by = payload.source
+                request_row.version += 1
+                self._update_artifact_review_state(session, request_row.id, artifact_status="failed", review_state="pending", stale_review=False, promotion_relevant=True)
+                self._append_event(session, request_row.id, payload.source, "Runtime Failed", payload.detail)
+            elif payload.status == RunStatus.RUNNING.value and request_row.status == RequestStatus.QUEUED.value:
+                request_row.status = RequestStatus.IN_EXECUTION.value
+                request_row.updated_at = now
+                request_row.updated_by = payload.source
+                request_row.version += 1
+
+            session.flush()
+            dispatch_rows = session.scalars(select(RuntimeDispatchTable).where(RuntimeDispatchTable.run_id == run_id).order_by(desc(RuntimeDispatchTable.dispatched_at))).all()
+            signal_rows = session.scalars(select(RuntimeSignalTable).where(RuntimeSignalTable.run_id == run_id).order_by(desc(RuntimeSignalTable.received_at))).all()
+            session.commit()
+            session.refresh(run_row)
+            return self._run_detail_from_row(run_row, dispatch_rows, signal_rows)
+
+    def list_artifacts(self, page: int, page_size: int, tenant_id: str | None = None) -> PaginatedResponse[ArtifactRecord]:
+        with SessionLocal() as session:
+            rows = session.scalars(select(ArtifactTable).order_by(desc(ArtifactTable.updated_at))).all()
+            request_tenant_map = {
+                row.id: row.tenant_id
+                for row in session.scalars(select(RequestTable).where(RequestTable.id.in_([item.request_id for item in rows]))).all()
+            } if rows else {}
+        artifact_rows = [self._artifact_record_from_row(row) for row in rows]
+        if tenant_id:
+            artifact_rows = [row for row in artifact_rows if request_tenant_map.get(row.request_id) == tenant_id]
+        return self._paginate(artifact_rows, page, page_size)
+
+    def get_artifact(self, artifact_id: str, tenant_id: str | None = None) -> ArtifactDetail:
+        with SessionLocal() as session:
+            row = session.get(ArtifactTable, artifact_id)
+            if row is not None:
+                self._ensure_request_access(session, row.request_id, tenant_id)
+            event_rows = session.scalars(select(ArtifactEventTable).where(ArtifactEventTable.artifact_id == artifact_id).order_by(ArtifactEventTable.timestamp)).all()
+            lineage_rows = session.scalars(select(ArtifactLineageEdgeTable).where(ArtifactLineageEdgeTable.artifact_id == artifact_id).order_by(ArtifactLineageEdgeTable.created_at)).all()
+        if row is None:
+            raise StopIteration(artifact_id)
+        return self._artifact_detail_from_row(row, event_rows, lineage_rows)
+
+    def list_review_queue(
+        self,
+        page: int,
+        page_size: int,
+        assigned_reviewer: str | None = None,
+        blocking_only: bool = False,
+        stale_only: bool = False,
+        request_id: str | None = None,
+        tenant_id: str | None = None,
+    ) -> PaginatedResponse[ReviewQueueItem]:
+        with SessionLocal() as session:
+            rows = session.scalars(select(ReviewQueueTable).order_by(desc(ReviewQueueTable.priority), ReviewQueueTable.id)).all()
+            request_rows = {
+                row.id: row
+                for row in session.scalars(select(RequestTable).where(RequestTable.id.in_([item.request_id for item in rows]))).all()
+            } if rows else {}
+        queue_rows = [self._review_queue_item_from_row(row, request_rows.get(row.request_id)) for row in rows]
+        if tenant_id:
+            queue_rows = [row for row in queue_rows if request_rows.get(row.request_id) and request_rows[row.request_id].tenant_id == tenant_id]
+        if assigned_reviewer:
+            queue_rows = [row for row in queue_rows if row.assigned_reviewer == assigned_reviewer]
+        if blocking_only:
+            queue_rows = [row for row in queue_rows if row.blocking_status not in {"Approved", "Clear"}]
+        if stale_only:
+            queue_rows = [row for row in queue_rows if row.stale]
+        if request_id:
+            queue_rows = [row for row in queue_rows if row.request_id == request_id]
+        return self._paginate(queue_rows, page, page_size)
+
+    def get_promotion(self, promotion_id: str, tenant_id: str | None = None) -> PromotionDetail:
+        with SessionLocal() as session:
+            row = session.get(PromotionTable, promotion_id)
+            if row is not None:
+                self._ensure_request_access(session, row.request_id, tenant_id)
+            check_rows = session.scalars(select(CheckResultTable).where(CheckResultTable.promotion_id == promotion_id).order_by(CheckResultTable.name)).all()
+            override_rows = session.scalars(select(CheckOverrideTable).where(CheckOverrideTable.promotion_id == promotion_id).order_by(CheckOverrideTable.created_at)).all()
+            check_run_rows = session.scalars(select(CheckRunTable).where(CheckRunTable.promotion_id == promotion_id).order_by(desc(CheckRunTable.queued_at))).all()
+            deployment_rows = session.scalars(
+                select(DeploymentExecutionTable).where(DeploymentExecutionTable.promotion_id == promotion_id).order_by(desc(DeploymentExecutionTable.executed_at))
+            ).all()
+        if row is None:
+            raise StopIteration(promotion_id)
+        return self._promotion_detail_from_row(row, check_rows, override_rows, check_run_rows, deployment_rows)
+
+    def record_review_decision(self, review_id: str, payload: ReviewDecisionRequest, tenant_id: str | None = None) -> ReviewQueueItem:
+        with SessionLocal() as session:
+            review_row = session.get(ReviewQueueTable, review_id)
+            if review_row is None:
+                raise StopIteration(review_id)
+            request_row = self._get_request_row(session, review_row.request_id)
+            self._ensure_request_tenant_access(request_row, tenant_id)
+            decision = payload.decision
+            if decision == "approve":
+                review_row.blocking_status = "Approved"
+                review_row.stale = False
+                self._update_artifact_review_state(session, request_row.id, artifact_status="approved", review_state="approved", stale_review=False)
+                request_row.status = RequestStatus.APPROVED.value
+                if request_row.current_run_id:
+                    run_row = session.get(RunTable, request_row.current_run_id)
+                    if run_row is not None:
+                        run_row.status = RunStatus.COMPLETED.value
+                        run_row.current_step = "Review Approved"
+                        run_row.progress_percent = 100
+                        run_row.waiting_reason = None
+                        run_row.updated_at = datetime.now(timezone.utc)
+            elif decision == "changes_requested":
+                review_row.blocking_status = "Changes requested"
+                review_row.stale = True
+                self._update_artifact_review_state(session, request_row.id, artifact_status="changes_requested", review_state="changes_requested", stale_review=True)
+                request_row.status = RequestStatus.CHANGES_REQUESTED.value
+            else:
+                raise ValueError(f"Unsupported review decision {decision}")
+            request_row.updated_at = datetime.now(timezone.utc)
+            request_row.updated_by = payload.actor_id
+            request_row.version += 1
+            self._append_event(
+                session=session,
+                request_id=request_row.id,
+                actor=payload.actor_id,
+                action=f"Review {decision.replace('_', ' ').title()}",
+                reason_or_evidence=payload.reason,
+            )
+            session.commit()
+            session.refresh(review_row)
+            session.refresh(request_row)
+            return self._review_queue_item_from_row(review_row, request_row)
+
+    def override_review_assignment(self, review_id: str, payload: ReviewAssignmentOverrideRequest, tenant_id: str | None = None) -> ReviewQueueItem:
+        with SessionLocal() as session:
+            review_row = session.get(ReviewQueueTable, review_id)
+            if review_row is None:
+                raise StopIteration(review_id)
+            request_row = self._get_request_row(session, review_row.request_id)
+            self._ensure_request_tenant_access(request_row, tenant_id)
+            previous_reviewer = review_row.assigned_reviewer
+            review_row.assigned_reviewer = payload.assigned_reviewer
+            review_row.blocking_status = f"Reassigned to {payload.assigned_reviewer}"
+            self._append_event(
+                session=session,
+                request_id=request_row.id,
+                actor=payload.actor_id,
+                action="Review Assignment Overridden",
+                reason_or_evidence=f"{payload.reason}. {previous_reviewer} -> {payload.assigned_reviewer}",
+            )
+            event_store_service.append(
+                session,
+                tenant_id=request_row.tenant_id,
+                event_type="review.assignment_overridden",
+                aggregate_type="review",
+                aggregate_id=review_row.id,
+                request_id=request_row.id,
+                actor=payload.actor_id,
+                detail=payload.reason,
+                payload={
+                    "review_id": review_row.id,
+                    "from_reviewer": previous_reviewer,
+                    "to_reviewer": payload.assigned_reviewer,
+                },
+            )
+            request_row.updated_at = datetime.now(timezone.utc)
+            request_row.updated_by = payload.actor_id
+            request_row.version += 1
+            session.commit()
+            session.refresh(review_row)
+            return self._review_queue_item_from_row(review_row, request_row)
+
+    def apply_promotion_action(self, promotion_id: str, payload: PromotionActionRequest, tenant_id: str | None = None) -> PromotionDetail:
+        with SessionLocal() as session:
+            promotion_row = session.get(PromotionTable, promotion_id)
+            if promotion_row is None:
+                raise StopIteration(promotion_id)
+            request_row = self._get_request_row(session, promotion_row.request_id)
+            self._ensure_request_tenant_access(request_row, tenant_id)
+            check_rows = session.scalars(select(CheckResultTable).where(CheckResultTable.promotion_id == promotion_id)).all()
+            override_rows = session.scalars(select(CheckOverrideTable).where(CheckOverrideTable.promotion_id == promotion_id)).all()
+            action = payload.action
+            now = datetime.now(timezone.utc)
+            history = list(promotion_row.promotion_history)
+            if action == "dry_run":
+                promotion_row.execution_readiness = policy_check_service.promotion_readiness(check_rows, override_rows, promotion_row.required_approvals)
+                history.append({"timestamp": now.isoformat().replace("+00:00", "Z"), "actor": payload.actor_id, "action": "Dry run executed"})
+                event_store_service.append(
+                    session,
+                    tenant_id=request_row.tenant_id,
+                    event_type="promotion.dry_run",
+                    aggregate_type="promotion",
+                    aggregate_id=promotion_row.id,
+                    request_id=request_row.id,
+                    promotion_id=promotion_row.id,
+                    actor=payload.actor_id,
+                    detail=payload.reason,
+                    payload={"readiness": promotion_row.execution_readiness},
+                )
+            elif action == "authorize":
+                approvals = [dict(approval) for approval in promotion_row.required_approvals]
+                for approval in approvals:
+                    if approval["state"] == "pending":
+                        approval["state"] = "approved"
+                promotion_row.required_approvals = approvals
+                promotion_row.execution_readiness = policy_check_service.promotion_readiness(check_rows, override_rows, approvals)
+                history.append({"timestamp": now.isoformat().replace("+00:00", "Z"), "actor": payload.actor_id, "action": "Promotion authorized"})
+                event_store_service.append(
+                    session,
+                    tenant_id=request_row.tenant_id,
+                    event_type="promotion.authorized",
+                    aggregate_type="promotion",
+                    aggregate_id=promotion_row.id,
+                    request_id=request_row.id,
+                    promotion_id=promotion_row.id,
+                    actor=payload.actor_id,
+                    detail=payload.reason,
+                    payload={"approvals": approvals},
+                )
+            elif action == "execute":
+                if check_dispatch_service.has_pending_promotion_check_run(session, promotion_id):
+                    raise ValueError("Promotion checks are still queued or running")
+                if not policy_check_service.promotion_ready(check_rows, override_rows, promotion_row.required_approvals):
+                    raise ValueError("Promotion cannot execute until required checks pass or are overridden and approvals are approved")
+                integration_row = session.scalars(
+                    select(IntegrationTable).where(
+                        IntegrationTable.tenant_id == request_row.tenant_id,
+                        IntegrationTable.type == "runtime",
+                        IntegrationTable.status == "connected",
+                    )
+                ).first()
+                if integration_row is None:
+                    raise ValueError("No connected runtime integration is available for this tenant")
+                deployment_payload = {
+                    "promotion_id": promotion_row.id,
+                    "request_id": request_row.id,
+                    "target": promotion_row.target,
+                    "strategy": promotion_row.strategy,
+                    "artifact_ids": [row.id for row in session.scalars(select(ArtifactTable).where(ArtifactTable.request_id == request_row.id)).all()],
+                }
+                deployment_response = deployment_service.execute(integration_row, deployment_payload)
+                deployment_row = DeploymentExecutionTable(
+                    id=self._next_deployment_execution_id(session),
+                    tenant_id=request_row.tenant_id,
+                    promotion_id=promotion_row.id,
+                    request_id=request_row.id,
+                    integration_id=integration_row.id,
+                    target=promotion_row.target,
+                    strategy=promotion_row.strategy,
+                    status=str(deployment_response.get("status", "deployed")),
+                    external_reference=str(deployment_response.get("deployment_id")) if deployment_response.get("deployment_id") else None,
+                    detail=str(deployment_response.get("summary", "Deployment executed successfully.")),
+                    payload=deployment_payload,
+                    response_payload=deployment_response,
+                    executed_at=now,
+                )
+                session.add(deployment_row)
+                event_store_service.append(
+                    session,
+                    tenant_id=request_row.tenant_id,
+                    event_type="promotion.executed",
+                    aggregate_type="promotion",
+                    aggregate_id=promotion_row.id,
+                    request_id=request_row.id,
+                    promotion_id=promotion_row.id,
+                    actor=payload.actor_id,
+                    detail=str(deployment_response.get("summary", "Deployment executed successfully.")),
+                    payload={
+                        "target": promotion_row.target,
+                        "strategy": promotion_row.strategy,
+                        "deployment_execution_id": deployment_row.id,
+                        "external_reference": deployment_row.external_reference,
+                    },
+                )
+                approvals = [dict(approval) for approval in promotion_row.required_approvals]
+                for approval in approvals:
+                    approval["state"] = "approved"
+                promotion_row.required_approvals = approvals
+                promotion_row.execution_readiness = f"Promotion executed successfully via {integration_row.name}."
+                request_row.status = RequestStatus.PROMOTED.value
+                request_row.updated_at = now
+                request_row.updated_by = payload.actor_id
+                request_row.version += 1
+                self._update_artifact_review_state(session, request_row.id, artifact_status="promoted", review_state="approved", stale_review=False, promotion_relevant=True)
+                history.append(
+                    {
+                        "timestamp": now.isoformat().replace("+00:00", "Z"),
+                        "actor": payload.actor_id,
+                        "action": f"Promotion executed via {integration_row.name} ({deployment_row.external_reference or deployment_row.id})",
+                    }
+                )
+                self._append_event(
+                    session=session,
+                    request_id=request_row.id,
+                    actor=payload.actor_id,
+                    action="Promotion Executed",
+                    reason_or_evidence=f"{payload.reason}; external_reference={deployment_row.external_reference or deployment_row.id}",
+                )
+            else:
+                raise ValueError(f"Unsupported promotion action {action}")
+            promotion_row.promotion_history = history
+            session.commit()
+            session.refresh(promotion_row)
+            refreshed_checks = session.scalars(select(CheckResultTable).where(CheckResultTable.promotion_id == promotion_id).order_by(CheckResultTable.name)).all()
+            refreshed_overrides = session.scalars(select(CheckOverrideTable).where(CheckOverrideTable.promotion_id == promotion_id).order_by(CheckOverrideTable.created_at)).all()
+            refreshed_runs = session.scalars(select(CheckRunTable).where(CheckRunTable.promotion_id == promotion_id).order_by(desc(CheckRunTable.queued_at))).all()
+            refreshed_deployments = session.scalars(
+                select(DeploymentExecutionTable).where(DeploymentExecutionTable.promotion_id == promotion_id).order_by(desc(DeploymentExecutionTable.executed_at))
+            ).all()
+            return self._promotion_detail_from_row(promotion_row, refreshed_checks, refreshed_overrides, refreshed_runs, refreshed_deployments)
+
+    def evaluate_check(self, promotion_id: str, check_id: str, payload: CheckEvaluationRequest, tenant_id: str | None = None) -> PromotionDetail:
+        with SessionLocal() as session:
+            promotion_row = session.get(PromotionTable, promotion_id)
+            if promotion_row is None:
+                raise StopIteration(promotion_id)
+            request_row = self._get_request_row(session, promotion_row.request_id)
+            self._ensure_request_tenant_access(request_row, tenant_id)
+            check_row = session.get(CheckResultTable, check_id)
+            if check_row is None or check_row.promotion_id != promotion_id:
+                raise StopIteration(check_id)
+            check_row.state = payload.state
+            check_row.detail = payload.detail
+            check_row.evidence = payload.evidence
+            check_row.evaluated_at = datetime.now(timezone.utc)
+            check_row.evaluated_by = payload.actor_id
+            policy_check_service.sync_promotion_checks(session, promotion_row)
+            promotion_row.execution_readiness = self._promotion_readiness_from_db(session, promotion_row)
+            history = list(promotion_row.promotion_history)
+            history.append({"timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"), "actor": payload.actor_id, "action": f"Check evaluated: {check_row.name}"})
+            promotion_row.promotion_history = history
+            session.commit()
+            session.refresh(promotion_row)
+            return self._promotion_detail_from_row(
+                promotion_row,
+                session.scalars(select(CheckResultTable).where(CheckResultTable.promotion_id == promotion_id).order_by(CheckResultTable.name)).all(),
+                session.scalars(select(CheckOverrideTable).where(CheckOverrideTable.promotion_id == promotion_id).order_by(CheckOverrideTable.created_at)).all(),
+                session.scalars(select(CheckRunTable).where(CheckRunTable.promotion_id == promotion_id).order_by(desc(CheckRunTable.queued_at))).all(),
+                session.scalars(select(DeploymentExecutionTable).where(DeploymentExecutionTable.promotion_id == promotion_id).order_by(desc(DeploymentExecutionTable.executed_at))).all(),
+            )
+
+    def override_check(self, promotion_id: str, check_id: str, payload: CheckOverrideRequest, tenant_id: str | None = None) -> PromotionDetail:
+        with SessionLocal() as session:
+            promotion_row = session.get(PromotionTable, promotion_id)
+            if promotion_row is None:
+                raise StopIteration(promotion_id)
+            request_row = self._get_request_row(session, promotion_row.request_id)
+            self._ensure_request_tenant_access(request_row, tenant_id)
+            check_row = session.get(CheckResultTable, check_id)
+            if check_row is None or check_row.promotion_id != promotion_id:
+                raise StopIteration(check_id)
+            override_id = self._next_check_override_id(session)
+            now = datetime.now(timezone.utc)
+            session.add(
+                CheckOverrideTable(
+                    id=override_id,
+                    check_result_id=check_row.id,
+                    request_id=request_row.id,
+                    promotion_id=promotion_id,
+                    state="approved",
+                    reason=payload.reason,
+                    requested_by=payload.actor_id,
+                    decided_by=payload.actor_id,
+                    created_at=now,
+                    decided_at=now,
+                )
+            )
+            policy_check_service.sync_promotion_checks(session, promotion_row)
+            promotion_row.execution_readiness = self._promotion_readiness_from_db(session, promotion_row)
+            history = list(promotion_row.promotion_history)
+            history.append({"timestamp": now.isoformat().replace("+00:00", "Z"), "actor": payload.actor_id, "action": f"Override approved: {check_row.name}"})
+            promotion_row.promotion_history = history
+            session.commit()
+            session.refresh(promotion_row)
+            return self._promotion_detail_from_row(
+                promotion_row,
+                session.scalars(select(CheckResultTable).where(CheckResultTable.promotion_id == promotion_id).order_by(CheckResultTable.name)).all(),
+                session.scalars(select(CheckOverrideTable).where(CheckOverrideTable.promotion_id == promotion_id).order_by(CheckOverrideTable.created_at)).all(),
+                session.scalars(select(CheckRunTable).where(CheckRunTable.promotion_id == promotion_id).order_by(desc(CheckRunTable.queued_at))).all(),
+                session.scalars(select(DeploymentExecutionTable).where(DeploymentExecutionTable.promotion_id == promotion_id).order_by(desc(DeploymentExecutionTable.executed_at))).all(),
+            )
+
+    def run_promotion_checks(self, promotion_id: str, payload: CheckRunRequest, tenant_id: str | None = None) -> PromotionDetail:
+        with SessionLocal() as session:
+            promotion_row = session.get(PromotionTable, promotion_id)
+            if promotion_row is None:
+                raise StopIteration(promotion_id)
+            request_row = self._get_request_row(session, promotion_row.request_id)
+            self._ensure_request_tenant_access(request_row, tenant_id)
+            check_dispatch_service.enqueue_promotion_checks(session, promotion_id, request_row.id, payload.actor_id, payload.reason)
+            history = list(promotion_row.promotion_history)
+            history.append(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "actor": payload.actor_id,
+                    "action": "Promotion checks queued",
+                }
+            )
+            promotion_row.promotion_history = history
+            session.commit()
+            session.refresh(promotion_row)
+            return self._promotion_detail_from_row(
+                promotion_row,
+                session.scalars(select(CheckResultTable).where(CheckResultTable.promotion_id == promotion_id).order_by(CheckResultTable.name)).all(),
+                session.scalars(select(CheckOverrideTable).where(CheckOverrideTable.promotion_id == promotion_id).order_by(CheckOverrideTable.created_at)).all(),
+                session.scalars(select(CheckRunTable).where(CheckRunTable.promotion_id == promotion_id).order_by(desc(CheckRunTable.queued_at))).all(),
+                session.scalars(select(DeploymentExecutionTable).where(DeploymentExecutionTable.promotion_id == promotion_id).order_by(desc(DeploymentExecutionTable.executed_at))).all(),
+            )
+
+    def override_promotion_approval(self, promotion_id: str, payload: PromotionApprovalOverrideRequest, tenant_id: str | None = None) -> PromotionDetail:
+        with SessionLocal() as session:
+            promotion_row = session.get(PromotionTable, promotion_id)
+            if promotion_row is None:
+                raise StopIteration(promotion_id)
+            request_row = self._get_request_row(session, promotion_row.request_id)
+            self._ensure_request_tenant_access(request_row, tenant_id)
+            approvals = [dict(approval) for approval in promotion_row.required_approvals]
+            target_approval = next((approval for approval in approvals if approval.get("reviewer") == payload.reviewer), None)
+            if target_approval is None:
+                raise ValueError(f"Promotion approval reviewer {payload.reviewer} not found")
+            target_approval["reviewer"] = payload.replacement_reviewer
+            target_approval["state"] = "pending"
+            promotion_row.required_approvals = approvals
+            promotion_row.execution_readiness = self._promotion_readiness_from_db(session, promotion_row)
+            history = list(promotion_row.promotion_history)
+            history.append(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "actor": payload.actor_id,
+                    "action": f"Approval reassigned: {payload.reviewer} -> {payload.replacement_reviewer}",
+                }
+            )
+            promotion_row.promotion_history = history
+            self._append_event(
+                session=session,
+                request_id=request_row.id,
+                actor=payload.actor_id,
+                action="Promotion Approval Overridden",
+                reason_or_evidence=f"{payload.reason}. {payload.reviewer} -> {payload.replacement_reviewer}",
+            )
+            event_store_service.append(
+                session,
+                tenant_id=request_row.tenant_id,
+                event_type="promotion.approval_overridden",
+                aggregate_type="promotion",
+                aggregate_id=promotion_row.id,
+                request_id=request_row.id,
+                promotion_id=promotion_row.id,
+                actor=payload.actor_id,
+                detail=payload.reason,
+                payload={
+                    "from_reviewer": payload.reviewer,
+                    "to_reviewer": payload.replacement_reviewer,
+                    "approvals": approvals,
+                },
+            )
+            session.commit()
+            session.refresh(promotion_row)
+            return self._promotion_detail_from_row(
+                promotion_row,
+                session.scalars(select(CheckResultTable).where(CheckResultTable.promotion_id == promotion_id).order_by(CheckResultTable.name)).all(),
+                session.scalars(select(CheckOverrideTable).where(CheckOverrideTable.promotion_id == promotion_id).order_by(CheckOverrideTable.created_at)).all(),
+                session.scalars(select(CheckRunTable).where(CheckRunTable.promotion_id == promotion_id).order_by(desc(CheckRunTable.queued_at))).all(),
+                session.scalars(select(DeploymentExecutionTable).where(DeploymentExecutionTable.promotion_id == promotion_id).order_by(desc(DeploymentExecutionTable.executed_at))).all(),
+            )
+
+    def run_request_checks(self, request_id: str, payload: RequestCheckRun, tenant_id: str | None = None) -> RequestRecord:
+        with SessionLocal() as session:
+            row = self._get_request_row(session, request_id)
+            self._ensure_request_tenant_access(row, tenant_id)
+            check_dispatch_service.enqueue_request_checks(session, request_id, payload.actor_id, payload.reason)
+            session.commit()
+            session.refresh(row)
+            return self._request_from_row(row)
+
+    def _promotion_detail_from_row(
+        self,
+        row: PromotionTable,
+        check_rows: list[CheckResultTable],
+        override_rows: list[CheckOverrideTable],
+        check_run_rows: list[CheckRunTable] | None = None,
+        deployment_rows: list[DeploymentExecutionTable] | None = None,
+    ) -> PromotionDetail:
+        return PromotionDetail.model_validate(
+            {
+                "id": row.id,
+                "request_id": row.request_id,
+                "target": row.target,
+                "strategy": row.strategy,
+                "required_checks": row.required_checks,
+                "check_results": [
+                    {
+                        "id": check.id,
+                        "request_id": check.request_id,
+                        "promotion_id": check.promotion_id,
+                        "name": check.name,
+                        "state": check.state,
+                        "detail": check.detail,
+                        "severity": check.severity,
+                        "evidence": check.evidence,
+                        "evaluated_at": check.evaluated_at.isoformat().replace("+00:00", "Z"),
+                        "evaluated_by": check.evaluated_by,
+                    }
+                    for check in check_rows
+                ],
+                "check_runs": [self._check_run_from_row(check_run) for check_run in (check_run_rows or [])],
+                "overrides": [
+                    {
+                        "id": override.id,
+                        "check_result_id": override.check_result_id,
+                        "request_id": override.request_id,
+                        "promotion_id": override.promotion_id,
+                        "state": override.state,
+                        "reason": override.reason,
+                        "requested_by": override.requested_by,
+                        "decided_by": override.decided_by,
+                        "created_at": override.created_at.isoformat().replace("+00:00", "Z"),
+                        "decided_at": override.decided_at.isoformat().replace("+00:00", "Z"),
+                    }
+                    for override in override_rows
+                ],
+                "required_approvals": row.required_approvals,
+                "stale_warnings": row.stale_warnings,
+                "execution_readiness": row.execution_readiness,
+                "deployment_executions": [
+                    {
+                        "id": deployment.id,
+                        "promotion_id": deployment.promotion_id,
+                        "request_id": deployment.request_id,
+                        "integration_id": deployment.integration_id,
+                        "target": deployment.target,
+                        "strategy": deployment.strategy,
+                        "status": deployment.status,
+                        "external_reference": deployment.external_reference,
+                        "detail": deployment.detail,
+                        "payload": deployment.payload,
+                        "response_payload": deployment.response_payload,
+                        "executed_at": deployment.executed_at.isoformat().replace("+00:00", "Z"),
+                    }
+                    for deployment in (deployment_rows or [])
+                ],
+                "promotion_history": row.promotion_history,
+            }
+        )
+
+    def list_capabilities(self, page: int, page_size: int, tenant_id: str | None = None) -> PaginatedResponse[CapabilityRecord]:
+        with SessionLocal() as session:
+            stmt = select(CapabilityTable)
+            if tenant_id:
+                stmt = stmt.where(CapabilityTable.tenant_id == tenant_id)
+            rows = session.scalars(stmt.order_by(desc(CapabilityTable.updated_at))).all()
+        capability_rows = [self._capability_record_from_row(row) for row in rows]
+        return self._paginate(capability_rows, page, page_size)
+
+    def get_capability(self, capability_id: str, tenant_id: str | None = None) -> CapabilityDetail:
+        with SessionLocal() as session:
+            row = session.get(CapabilityTable, capability_id)
+            if row is not None and tenant_id and row.tenant_id != tenant_id:
+                raise PermissionError(capability_id)
+        if row is None:
+            raise StopIteration(capability_id)
+        return self._capability_detail_from_row(row)
+
+    def list_workflow_analytics(
+        self,
+        days: int = 30,
+        tenant_id: str | None = None,
+        team_id: str | None = None,
+        user_id: str | None = None,
+        portfolio_id: str | None = None,
+    ) -> list[AnalyticsWorkflowRow]:
+        with SessionLocal() as session:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+            request_rows = session.scalars(select(RequestTable).where(RequestTable.updated_at >= cutoff)).all()
+            scope_rows = session.scalars(select(PortfolioScopeTable).where(PortfolioScopeTable.tenant_id == tenant_id)).all() if tenant_id else []
+            request_rows = self._filter_request_rows_for_analytics(request_rows, tenant_id, team_id, user_id, portfolio_id, scope_rows)
+            request_ids = {row.id for row in request_rows}
+            run_rows = [row for row in session.scalars(select(RunTable).where(RunTable.updated_at >= cutoff)).all() if row.request_id in request_ids]
+            review_rows = [row for row in session.scalars(select(ReviewQueueTable)).all() if row.request_id in request_ids]
+
+        grouped: dict[str, dict[str, object]] = {}
+        for request_row in request_rows:
+            workflow = request_row.workflow_binding_id or request_row.template_id
+            duration = request_row.updated_at - request_row.created_at
+            bucket = grouped.setdefault(
+                workflow,
+                {
+                    "durations": [],
+                    "total": 0,
+                    "failed": 0,
+                    "review_count": 0,
+                    "review_stale": 0,
+                    "cost_points": 0.0,
+                },
+            )
+            bucket["durations"].append(duration)
+            bucket["total"] += 1
+            if request_row.status in {RequestStatus.FAILED.value, RequestStatus.REJECTED.value, RequestStatus.CANCELED.value}:
+                bucket["failed"] += 1
+            bucket["cost_points"] += 1.5 if request_row.priority == "high" else 2.25 if request_row.priority == "urgent" else 1.0
+
+        run_by_request = {run.request_id: run for run in run_rows}
+        for review_row in review_rows:
+            request_run = run_by_request.get(review_row.request_id)
+            workflow = request_run.workflow_identity if request_run else "unbound_review"
+            bucket = grouped.setdefault(
+                workflow,
+                {
+                    "durations": [],
+                    "total": 0,
+                    "failed": 0,
+                    "review_count": 0,
+                    "review_stale": 0,
+                    "cost_points": 0.0,
+                },
+            )
+            bucket["review_count"] += 1
+            if review_row.stale:
+                bucket["review_stale"] += 1
+
+        rows: list[AnalyticsWorkflowRow] = []
+        for workflow, bucket in grouped.items():
+            durations = sorted(bucket["durations"])
+            total = max(int(bucket["total"]), 1)
+            p95_index = min(len(durations) - 1, max(0, int(len(durations) * 0.95) - 1)) if durations else 0
+            rows.append(
+                AnalyticsWorkflowRow(
+                    workflow=workflow,
+                    avg_cycle_time=self._format_timedelta(sum(durations, timedelta()) / len(durations)) if durations else "0m",
+                    p95_duration=self._format_timedelta(durations[p95_index]) if durations else "0m",
+                    failure_rate=self._format_percent(int(bucket["failed"]), total),
+                    review_delay=f"{int(bucket['review_count'])} queued / {int(bucket['review_stale'])} stale",
+                    cost_per_execution=f"${bucket['cost_points'] / total:.2f}",
+                    trend="Stable" if int(bucket["failed"]) == 0 else "Needs attention",
+                )
+            )
+        return sorted(rows, key=lambda row: row.workflow)
+
+    def list_workflow_trends(
+        self,
+        days: int = 30,
+        tenant_id: str | None = None,
+        team_id: str | None = None,
+        user_id: str | None = None,
+        portfolio_id: str | None = None,
+        workflow: str | None = None,
+    ) -> list[WorkflowTrendPoint]:
+        with SessionLocal() as session:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+            request_rows = session.scalars(select(RequestTable).where(RequestTable.updated_at >= cutoff)).all()
+            scope_rows = session.scalars(select(PortfolioScopeTable).where(PortfolioScopeTable.tenant_id == tenant_id)).all() if tenant_id else []
+            request_rows = self._filter_request_rows_for_analytics(request_rows, tenant_id, team_id, user_id, portfolio_id, scope_rows)
+            if workflow:
+                request_rows = [row for row in request_rows if (row.workflow_binding_id or row.template_id) == workflow]
+            request_ids = {row.id for row in request_rows}
+            review_rows = [row for row in session.scalars(select(ReviewQueueTable)).all() if row.request_id in request_ids and row.stale]
+
+        review_stale_by_request: dict[str, int] = {}
+        for row in review_rows:
+            review_stale_by_request[row.request_id] = review_stale_by_request.get(row.request_id, 0) + 1
+
+        grouped: dict[str, dict[str, float]] = {}
+        for request_row in request_rows:
+            period_start = request_row.updated_at.astimezone(timezone.utc).date().isoformat()
+            bucket = grouped.setdefault(
+                period_start,
+                {"request_count": 0.0, "failed_count": 0.0, "cycle_hours": 0.0, "review_stale_count": 0.0, "cost_points": 0.0},
+            )
+            bucket["request_count"] += 1
+            bucket["failed_count"] += 1 if request_row.status in {RequestStatus.FAILED.value, RequestStatus.REJECTED.value, RequestStatus.CANCELED.value} else 0
+            bucket["cycle_hours"] += max((request_row.updated_at - request_row.created_at).total_seconds() / 3600, 0.0)
+            bucket["review_stale_count"] += review_stale_by_request.get(request_row.id, 0)
+            bucket["cost_points"] += 1.5 if request_row.priority == "high" else 2.25 if request_row.priority == "urgent" else 1.0
+
+        rows: list[WorkflowTrendPoint] = []
+        for period_start in sorted(grouped.keys()):
+            bucket = grouped[period_start]
+            request_count = max(int(bucket["request_count"]), 1)
+            rows.append(
+                WorkflowTrendPoint(
+                    period_start=period_start,
+                    request_count=int(bucket["request_count"]),
+                    failed_count=int(bucket["failed_count"]),
+                    avg_cycle_time_hours=round(bucket["cycle_hours"] / request_count, 2),
+                    review_stale_count=int(bucket["review_stale_count"]),
+                    cost_per_execution=round(bucket["cost_points"] / request_count, 2),
+                )
+            )
+        return rows
+
+    def list_agent_analytics(
+        self,
+        days: int = 30,
+        tenant_id: str | None = None,
+        team_id: str | None = None,
+        user_id: str | None = None,
+        portfolio_id: str | None = None,
+    ) -> list[AnalyticsAgentRow]:
+        with SessionLocal() as session:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+            request_rows = session.scalars(select(RequestTable)).all()
+            scope_rows = session.scalars(select(PortfolioScopeTable).where(PortfolioScopeTable.tenant_id == tenant_id)).all() if tenant_id else []
+            request_rows = self._filter_request_rows_for_analytics(request_rows, tenant_id, team_id, user_id, portfolio_id, scope_rows)
+            request_ids = {row.id for row in request_rows}
+            run_rows = [row for row in session.scalars(select(RunTable).where(RunTable.updated_at >= cutoff)).all() if row.request_id in request_ids]
+
+        grouped: dict[str, dict[str, float]] = {}
+        for run_row in run_rows:
+            owners = {step.get("owner") for step in run_row.steps if step.get("owner", "").startswith("agent")}
+            for owner in owners:
+                bucket = grouped.setdefault(owner, {"invocations": 0, "success": 0, "retry": 0, "duration": 0.0, "quality": 0.0})
+                bucket["invocations"] += 1
+                bucket["success"] += 1 if run_row.status == RunStatus.COMPLETED.value else 0
+                bucket["retry"] += 1 if "Retry Step" in run_row.command_surface else 0
+                bucket["duration"] += max(run_row.progress_percent, 1)
+                bucket["quality"] += 95.0 if run_row.status == RunStatus.COMPLETED.value else 80.0 if run_row.status in {RunStatus.RUNNING.value, RunStatus.WAITING.value} else 60.0
+
+        rows: list[AnalyticsAgentRow] = []
+        for agent, bucket in grouped.items():
+            invocations = max(int(bucket["invocations"]), 1)
+            avg_minutes = bucket["duration"] / invocations / 10
+            rows.append(
+                AnalyticsAgentRow(
+                    agent=agent,
+                    invocations=invocations,
+                    success_rate=self._format_percent(int(bucket["success"]), invocations),
+                    retry_rate=self._format_percent(int(bucket["retry"]), invocations),
+                    avg_duration=f"{avg_minutes:.1f}m",
+                    cost_per_invocation=f"${1.25 + (avg_minutes * 0.35):.2f}",
+                    quality_score=f"{bucket['quality'] / invocations:.1f}",
+                )
+            )
+        return sorted(rows, key=lambda row: row.agent)
+
+    def list_agent_trends(
+        self,
+        days: int = 30,
+        tenant_id: str | None = None,
+        team_id: str | None = None,
+        user_id: str | None = None,
+        portfolio_id: str | None = None,
+        agent: str | None = None,
+    ) -> list[AgentTrendPoint]:
+        with SessionLocal() as session:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+            request_rows = session.scalars(select(RequestTable)).all()
+            scope_rows = session.scalars(select(PortfolioScopeTable).where(PortfolioScopeTable.tenant_id == tenant_id)).all() if tenant_id else []
+            request_rows = self._filter_request_rows_for_analytics(request_rows, tenant_id, team_id, user_id, portfolio_id, scope_rows)
+            request_ids = {row.id for row in request_rows}
+            run_rows = [row for row in session.scalars(select(RunTable).where(RunTable.updated_at >= cutoff)).all() if row.request_id in request_ids]
+
+        grouped: dict[str, dict[str, float]] = {}
+        for run_row in run_rows:
+            owners = sorted({step.get("owner") for step in run_row.steps if step.get("owner", "").startswith("agent")})
+            for owner in owners:
+                if agent and owner != agent:
+                    continue
+                period_start = run_row.updated_at.astimezone(timezone.utc).date().isoformat()
+                bucket = grouped.setdefault(
+                    period_start,
+                    {"invocations": 0.0, "success": 0.0, "retry": 0.0, "duration_minutes": 0.0, "quality": 0.0},
+                )
+                bucket["invocations"] += 1
+                bucket["success"] += 1 if run_row.status == RunStatus.COMPLETED.value else 0
+                bucket["retry"] += 1 if "Retry Step" in run_row.command_surface else 0
+                bucket["duration_minutes"] += (max(run_row.progress_percent, 1) / 10)
+                bucket["quality"] += 95.0 if run_row.status == RunStatus.COMPLETED.value else 80.0 if run_row.status in {RunStatus.RUNNING.value, RunStatus.WAITING.value} else 60.0
+
+        rows: list[AgentTrendPoint] = []
+        for period_start in sorted(grouped.keys()):
+            bucket = grouped[period_start]
+            invocations = max(int(bucket["invocations"]), 1)
+            rows.append(
+                AgentTrendPoint(
+                    period_start=period_start,
+                    invocation_count=int(bucket["invocations"]),
+                    success_rate=round((bucket["success"] / invocations) * 100, 2),
+                    retry_rate=round((bucket["retry"] / invocations) * 100, 2),
+                    avg_duration_minutes=round(bucket["duration_minutes"] / invocations, 2),
+                    quality_score=round(bucket["quality"] / invocations, 2),
+                )
+            )
+        return rows
+
+    def list_bottleneck_analytics(self, days: int = 30, tenant_id: str | None = None) -> list[AnalyticsBottleneckRow]:
+        with SessionLocal() as session:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+            request_rows = session.scalars(select(RequestTable)).all()
+            request_ids = {row.id for row in request_rows if tenant_id is None or row.tenant_id == tenant_id}
+            review_rows = [row for row in session.scalars(select(ReviewQueueTable)).all() if row.request_id in request_ids]
+            run_rows = [row for row in session.scalars(select(RunTable).where(RunTable.updated_at >= cutoff)).all() if row.request_id in request_ids]
+
+        rows: list[AnalyticsBottleneckRow] = []
+        for review_row in review_rows:
+            rows.append(
+                AnalyticsBottleneckRow(
+                    workflow="Review Queue",
+                    step=review_row.artifact_or_changeset,
+                    avg_wait_time="4h" if "Due in 4h" in review_row.sla else "2h" if "Due in 2h" in review_row.sla else review_row.sla,
+                    block_count=1 if review_row.blocking_status in {"Blocking request progress", "Changes requested"} else 0,
+                    reviewer_delay=review_row.assigned_reviewer,
+                    trend="Stale" if review_row.stale else "Stable",
+                )
+            )
+        for run_row in run_rows:
+            if run_row.waiting_reason:
+                rows.append(
+                    AnalyticsBottleneckRow(
+                        workflow=run_row.workflow_identity,
+                        step=run_row.current_step,
+                        avg_wait_time=run_row.elapsed_time,
+                        block_count=1 if run_row.status in {RunStatus.WAITING.value, RunStatus.FAILED.value} else 0,
+                        reviewer_delay=run_row.waiting_reason,
+                        trend="Blocked" if run_row.status == RunStatus.WAITING.value else "Recovering",
+                    )
+                )
+        return rows
+
+    def list_audit_entries(self, request_id: str, tenant_id: str | None = None) -> list[AuditEntry]:
+        with SessionLocal() as session:
+            self._ensure_request_access(session, request_id, tenant_id)
+            rows = session.scalars(select(RequestEventTable).where(RequestEventTable.request_id == request_id).order_by(RequestEventTable.timestamp)).all()
+        return [
+            AuditEntry(
+                timestamp=row.timestamp.isoformat().replace("+00:00", "Z"),
+                actor=row.actor,
+                action=row.action,
+                object_type=row.object_type,
+                object_id=row.object_id,
+                reason_or_evidence=row.reason_or_evidence,
+            )
+            for row in rows
+        ]
+
+    def list_policies(self, tenant_id: str | None = None) -> list[PolicyRecord]:
+        with SessionLocal() as session:
+            policy_stmt = select(PolicyTable)
+            gate_stmt = select(TransitionGateTable).where(TransitionGateTable.active.is_(True))
+            if tenant_id:
+                policy_stmt = policy_stmt.where(PolicyTable.tenant_id == tenant_id)
+                gate_stmt = gate_stmt.where(TransitionGateTable.tenant_id == tenant_id)
+            rows = session.scalars(policy_stmt.order_by(desc(PolicyTable.updated_at))).all()
+            gate_rows = session.scalars(gate_stmt.order_by(TransitionGateTable.gate_order)).all()
+        rules_by_policy: dict[str, list[str]] = {}
+        gates_by_policy: dict[str, list[dict[str, str]]] = {}
+        for gate in gate_rows:
+            rules_by_policy.setdefault(gate.policy_id, []).append(f"{gate.transition_target}: {gate.required_check_name}")
+            gates_by_policy.setdefault(gate.policy_id, []).append(
+                {
+                    "transition_target": gate.transition_target,
+                    "required_check_name": gate.required_check_name,
+                }
+            )
+        return [
+            PolicyRecord.model_validate(
+                {
+                    "id": row.id,
+                    "name": row.name,
+                    "status": row.status,
+                    "scope": row.scope,
+                    "rules": rules_by_policy.get(row.id, []),
+                    "transition_gates": gates_by_policy.get(row.id, []),
+                    "updated_at": row.updated_at.isoformat().replace("+00:00", "Z"),
+                }
+            )
+            for row in rows
+        ]
+
+    def update_policy_rules(self, policy_id: str, payload: PolicyRuleUpdateRequest, tenant_id: str | None = None) -> PolicyRecord:
+        with SessionLocal() as session:
+            policy_row = session.get(PolicyTable, policy_id)
+            if policy_row is None:
+                raise StopIteration(policy_id)
+            if tenant_id and policy_row.tenant_id != tenant_id:
+                raise PermissionError(policy_id)
+            existing_rows = session.scalars(select(TransitionGateTable).where(TransitionGateTable.policy_id == policy_id)).all()
+            for row in existing_rows:
+                session.delete(row)
+            parsed_rules = policy_check_service.parse_request_transition_rules(payload.rules)
+            for index, (transition_target, required_check_name) in enumerate(parsed_rules, start=1):
+                session.add(
+                    TransitionGateTable(
+                        id=f"tg_{policy_id}_{index}",
+                        tenant_id=policy_row.tenant_id,
+                        policy_id=policy_id,
+                        gate_scope="request",
+                        transition_target=transition_target,
+                        required_check_name=required_check_name,
+                        gate_order=index,
+                        active=True,
+                    )
+                )
+            policy_row.updated_at = datetime.now(timezone.utc)
+            session.commit()
+            session.refresh(policy_row)
+            gate_rows = session.scalars(
+                select(TransitionGateTable).where(TransitionGateTable.policy_id == policy_id, TransitionGateTable.active.is_(True)).order_by(TransitionGateTable.gate_order)
+            ).all()
+        return PolicyRecord.model_validate(
+            {
+                "id": policy_row.id,
+                "name": policy_row.name,
+                "status": policy_row.status,
+                "scope": policy_row.scope,
+                "rules": [f"{gate.transition_target}: {gate.required_check_name}" for gate in gate_rows],
+                "transition_gates": [
+                    {
+                        "transition_target": gate.transition_target,
+                        "required_check_name": gate.required_check_name,
+                    }
+                    for gate in gate_rows
+                ],
+                "updated_at": policy_row.updated_at.isoformat().replace("+00:00", "Z"),
+            }
+        )
+
+    def list_request_check_runs(self, request_id: str, tenant_id: str | None = None) -> list[CheckRunRecord]:
+        with SessionLocal() as session:
+            self._ensure_request_access(session, request_id, tenant_id)
+            rows = session.scalars(select(CheckRunTable).where(CheckRunTable.request_id == request_id).order_by(desc(CheckRunTable.queued_at))).all()
+        return [self._check_run_from_row(row) for row in rows]
+
+    def list_promotion_check_runs(self, promotion_id: str, tenant_id: str | None = None) -> list[CheckRunRecord]:
+        with SessionLocal() as session:
+            promotion_row = session.get(PromotionTable, promotion_id)
+            if promotion_row is None:
+                raise StopIteration(promotion_id)
+            self._ensure_request_access(session, promotion_row.request_id, tenant_id)
+            rows = session.scalars(select(CheckRunTable).where(CheckRunTable.promotion_id == promotion_id).order_by(desc(CheckRunTable.queued_at))).all()
+        return [self._check_run_from_row(row) for row in rows]
+
+    def list_integrations(self, tenant_id: str | None = None) -> list[IntegrationRecord]:
+        with SessionLocal() as session:
+            stmt = select(IntegrationTable)
+            if tenant_id:
+                stmt = stmt.where(IntegrationTable.tenant_id == tenant_id)
+            rows = session.scalars(stmt.order_by(IntegrationTable.name)).all()
+        records: list[IntegrationRecord] = []
+        for row in rows:
+            resolved_endpoint = None
+            if row.type == "runtime":
+                try:
+                    resolved_endpoint = runtime_dispatch_service.resolve_endpoint(row)
+                except ValueError as exc:
+                    resolved_endpoint = f"Invalid endpoint: {exc}"
+            records.append(
+                IntegrationRecord.model_validate(
+                    {
+                        "id": row.id,
+                        "name": row.name,
+                        "type": row.type,
+                        "status": row.status,
+                        "endpoint": row.endpoint,
+                        "settings": integration_security_service.sanitize_settings_for_response(row.settings),
+                        "has_api_key": integration_security_service.has_secret(row.settings, "api_key"),
+                        "has_access_token": integration_security_service.has_secret(row.settings, "access_token"),
+                        "resolved_endpoint": resolved_endpoint,
+                        "supports_direct_assignment": row.type == "agent_runtime",
+                        "supports_interactive_sessions": row.type == "agent_runtime",
+                        "provider": self._provider_for_integration(row),
+                    }
+                )
+            )
+        return records
+
+    def list_agent_integrations_for_request(self, request_id: str, tenant_id: str | None = None) -> list[IntegrationRecord]:
+        with SessionLocal() as session:
+            request_row = session.get(RequestTable, request_id)
+            self._ensure_request_tenant_access(request_row, tenant_id)
+        return [item for item in self.list_integrations(tenant_id) if item.supports_direct_assignment and item.supports_interactive_sessions]
+
+    def assign_agent_session(self, request_id: str, payload: AssignAgentSessionRequest, tenant_id: str | None = None) -> AgentSessionRecord:
+        with SessionLocal() as session:
+            request_row = session.get(RequestTable, request_id)
+            self._ensure_request_tenant_access(request_row, tenant_id)
+            integration_row = session.get(IntegrationTable, payload.integration_id)
+            if integration_row is None or integration_row.tenant_id != request_row.tenant_id:
+                raise StopIteration(payload.integration_id)
+            if integration_row.type != "agent_runtime":
+                raise ValueError("Selected integration does not support direct interactive agent assignment")
+            now = datetime.now(timezone.utc)
+            session_id = f"ags_{request_id}_{int(now.timestamp())}"
+            agent_label = payload.agent_label or integration_row.name
+            session_row = AgentSessionTable(
+                id=session_id,
+                tenant_id=request_row.tenant_id,
+                request_id=request_id,
+                integration_id=integration_row.id,
+                agent_label=agent_label,
+                status="streaming",
+                awaiting_human=False,
+                summary=f"{agent_label} is generating a response",
+                external_session_ref=None,
+                resume_request_status=request_row.status,
+                assigned_by=payload.actor_id,
+                assigned_at=now,
+                updated_at=now + timedelta(seconds=1),
+            )
+            session.add(session_row)
+            kickoff_message = AgentSessionMessageTable(
+                id=f"{session_id}_m001",
+                tenant_id=request_row.tenant_id,
+                session_id=session_id,
+                request_id=request_id,
+                sender_type="human",
+                sender_id=payload.actor_id,
+                message_type="assignment",
+                body=payload.initial_prompt,
+                created_at=now,
+            )
+            session.add(kickoff_message)
+            agent_reply = AgentSessionMessageTable(
+                id=f"{session_id}_m002",
+                tenant_id=request_row.tenant_id,
+                session_id=session_id,
+                request_id=request_id,
+                sender_type="agent",
+                sender_id=integration_row.id,
+                message_type="response",
+                body="",
+                created_at=now + timedelta(seconds=1),
+            )
+            session.add(agent_reply)
+            request_row.status = RequestStatus.AWAITING_INPUT.value
+            request_row.updated_at = now
+            request_row.updated_by = payload.actor_id
+            request_row.version += 1
+            self._append_event(
+                session=session,
+                request_id=request_id,
+                actor=payload.actor_id,
+                action="Agent Session Assigned",
+                reason_or_evidence=payload.reason,
+            )
+            event_store_service.append(
+                session,
+                tenant_id=request_row.tenant_id,
+                event_type="agent_session.assigned",
+                aggregate_type="agent_session",
+                aggregate_id=session_id,
+                request_id=request_id,
+                actor=payload.actor_id,
+                detail=payload.reason,
+                payload={
+                    "integration_id": integration_row.id,
+                    "integration_name": integration_row.name,
+                    "agent_label": agent_label,
+                },
+            )
+            session.commit()
+            result = self._agent_session_from_row(session_row, integration_row, [kickoff_message, agent_reply])
+        self._start_agent_session_turn_async(request_id, session_id, tenant_id)
+        return result
+
+    def get_agent_session(self, request_id: str, session_id: str, tenant_id: str | None = None) -> AgentSessionDetail:
+        with SessionLocal() as session:
+            request_row = session.get(RequestTable, request_id)
+            self._ensure_request_tenant_access(request_row, tenant_id)
+            session_row = session.get(AgentSessionTable, session_id)
+            if session_row is None or session_row.request_id != request_id or session_row.tenant_id != request_row.tenant_id:
+                raise StopIteration(session_id)
+            integration_row = session.get(IntegrationTable, session_row.integration_id)
+            message_rows = session.scalars(
+                select(AgentSessionMessageTable).where(AgentSessionMessageTable.session_id == session_id).order_by(AgentSessionMessageTable.created_at)
+            ).all()
+        summary = self._agent_session_from_row(session_row, integration_row, message_rows)
+        return AgentSessionDetail(**summary.model_dump(), messages=[self._agent_message_from_row(row) for row in message_rows])
+
+    def post_agent_session_message(
+        self,
+        request_id: str,
+        session_id: str,
+        payload: AgentSessionMessageCreateRequest,
+        tenant_id: str | None = None,
+    ) -> AgentSessionDetail:
+        with SessionLocal() as session:
+            request_row = session.get(RequestTable, request_id)
+            self._ensure_request_tenant_access(request_row, tenant_id)
+            session_row = session.get(AgentSessionTable, session_id)
+            if session_row is None or session_row.request_id != request_id or session_row.tenant_id != request_row.tenant_id:
+                raise StopIteration(session_id)
+            integration_row = session.get(IntegrationTable, session_row.integration_id)
+            existing_count = session.scalar(
+                select(func.count()).select_from(AgentSessionMessageTable).where(AgentSessionMessageTable.session_id == session_id)
+            ) or 0
+            now = datetime.now(timezone.utc)
+            human_message = AgentSessionMessageTable(
+                id=f"{session_id}_m{existing_count + 1:03d}",
+                tenant_id=request_row.tenant_id,
+                session_id=session_id,
+                request_id=request_id,
+                sender_type="human",
+                sender_id=payload.actor_id,
+                message_type=payload.message_type,
+                body=payload.body,
+                created_at=now,
+            )
+            session.add(human_message)
+            agent_message = AgentSessionMessageTable(
+                id=f"{session_id}_m{existing_count + 2:03d}",
+                tenant_id=request_row.tenant_id,
+                session_id=session_id,
+                request_id=request_id,
+                sender_type="agent",
+                sender_id=session_row.integration_id,
+                message_type="response",
+                body="",
+                created_at=now + timedelta(seconds=1),
+            )
+            session.add(agent_message)
+            session_row.status = "streaming"
+            session_row.awaiting_human = False
+            session_row.summary = "Interactive agent response is streaming"
+            session_row.updated_at = now + timedelta(seconds=1)
+            request_row.status = RequestStatus.AWAITING_INPUT.value
+            request_row.updated_at = now
+            request_row.updated_by = payload.actor_id
+            request_row.version += 1
+            self._append_event(
+                session=session,
+                request_id=request_id,
+                actor=payload.actor_id,
+                action="Agent Session Message Posted",
+                reason_or_evidence=payload.reason,
+            )
+            event_store_service.append(
+                session,
+                tenant_id=request_row.tenant_id,
+                event_type="agent_session.message_posted",
+                aggregate_type="agent_session",
+                aggregate_id=session_id,
+                request_id=request_id,
+                actor=payload.actor_id,
+                detail=payload.reason,
+                payload={"message_type": payload.message_type},
+            )
+            session.commit()
+        self._start_agent_session_turn_async(request_id, session_id, tenant_id)
+        return self.get_agent_session(request_id, session_id, tenant_id)
+
+    def complete_agent_session(
+        self,
+        request_id: str,
+        session_id: str,
+        payload: CompleteAgentSessionRequest,
+        tenant_id: str | None = None,
+    ) -> AgentSessionDetail:
+        with SessionLocal() as session:
+            request_row = session.get(RequestTable, request_id)
+            self._ensure_request_tenant_access(request_row, tenant_id)
+            session_row = session.get(AgentSessionTable, session_id)
+            if session_row is None or session_row.request_id != request_id or session_row.tenant_id != request_row.tenant_id:
+                raise StopIteration(session_id)
+            if session_row.status == "streaming":
+                raise ValueError("Cannot accept the session while the agent response is still streaming")
+            target_status = payload.target_status or session_row.resume_request_status
+            if not target_status or target_status == RequestStatus.AWAITING_INPUT.value:
+                target_status = RequestStatus.IN_EXECUTION.value if request_row.current_run_id else RequestStatus.PLANNED.value
+
+            session_row.status = "completed"
+            session_row.awaiting_human = False
+            session_row.summary = f"Accepted response and resumed {target_status.replace('_', ' ')}"
+            session_row.updated_at = datetime.now(timezone.utc)
+
+            request_row.status = target_status
+            request_row.updated_at = datetime.now(timezone.utc)
+            request_row.updated_by = payload.actor_id
+            request_row.version += 1
+
+            self._append_event(
+                session=session,
+                request_id=request_id,
+                actor=payload.actor_id,
+                action="Agent Session Completed",
+                reason_or_evidence=payload.reason,
+            )
+            event_store_service.append(
+                session,
+                tenant_id=request_row.tenant_id,
+                event_type="agent_session.completed",
+                aggregate_type="agent_session",
+                aggregate_id=session_id,
+                request_id=request_id,
+                actor=payload.actor_id,
+                detail=payload.reason,
+                payload={"target_status": target_status},
+            )
+            session.commit()
+        return self.get_agent_session(request_id, session_id, tenant_id)
+
+    def stream_agent_session_response(
+        self,
+        request_id: str,
+        session_id: str,
+        tenant_id: str | None = None,
+    ):
+        snapshot = self.get_agent_session(request_id, session_id, tenant_id)
+        yield {"event": "snapshot", "data": snapshot.model_dump(mode="json")}
+
+        last_body = snapshot.latest_message.body if snapshot.latest_message and snapshot.latest_message.sender_type == "agent" else ""
+        last_message_id = snapshot.latest_message.id if snapshot.latest_message and snapshot.latest_message.sender_type == "agent" else None
+        if snapshot.status != "streaming":
+            return
+
+        self._start_agent_session_turn_async(request_id, session_id, tenant_id)
+        while True:
+            time.sleep(0.25)
+            current = self.get_agent_session(request_id, session_id, tenant_id)
+            current_agent_message = next((message for message in reversed(current.messages) if message.sender_type == "agent"), None)
+            current_body = current_agent_message.body if current_agent_message else ""
+            current_message_id = current_agent_message.id if current_agent_message else None
+            if current_message_id != last_message_id:
+                last_message_id = current_message_id
+                last_body = ""
+            if current_body != last_body:
+                delta = current_body[len(last_body):] if current_body.startswith(last_body) else current_body
+                yield {
+                    "event": "delta",
+                    "data": {
+                        "session_id": session_id,
+                        "message_id": current_message_id,
+                        "delta": delta,
+                        "body": current_body,
+                        "done": current.status != "streaming",
+                    },
+                }
+                last_body = current_body
+            if current.status == "waiting_on_human":
+                yield {"event": "done", "data": current.model_dump(mode="json")}
+                return
+            if current.status == "failed":
+                yield {"event": "error", "data": {"message": current.summary}}
+                return
+
+    def _start_agent_session_turn_async(self, request_id: str, session_id: str, tenant_id: str | None = None) -> None:
+        with self._agent_stream_lock:
+            if session_id in self._agent_stream_inflight:
+                return
+            self._agent_stream_inflight.add(session_id)
+
+        def _runner() -> None:
+            try:
+                self._execute_agent_session_turn(request_id, session_id, tenant_id)
+            finally:
+                with self._agent_stream_lock:
+                    self._agent_stream_inflight.discard(session_id)
+
+        threading.Thread(target=_runner, name=f"rgp-agent-{session_id}", daemon=True).start()
+
+    def _execute_agent_session_turn(self, request_id: str, session_id: str, tenant_id: str | None = None) -> None:
+        try:
+            with SessionLocal() as session:
+                request_row = session.get(RequestTable, request_id)
+                self._ensure_request_tenant_access(request_row, tenant_id)
+                session_row = session.get(AgentSessionTable, session_id)
+                if session_row is None or session_row.request_id != request_id or session_row.tenant_id != request_row.tenant_id:
+                    raise StopIteration(session_id)
+                if session_row.status != "streaming":
+                    return
+                integration_row = session.get(IntegrationTable, session_row.integration_id)
+                message_rows = session.scalars(
+                    select(AgentSessionMessageTable).where(AgentSessionMessageTable.session_id == session_id).order_by(AgentSessionMessageTable.created_at)
+                ).all()
+                if not message_rows:
+                    raise ValueError("Agent session has no transcript")
+                pending_agent_message = next((row for row in reversed(message_rows) if row.sender_type == "agent"), None)
+                latest_human_message = next((row for row in reversed(message_rows) if row.sender_type == "human"), None)
+                if pending_agent_message is None or latest_human_message is None:
+                    raise ValueError("Agent session transcript is incomplete")
+
+                transcript_rows = [row for row in message_rows if row.id != pending_agent_message.id]
+                is_initial_turn = latest_human_message.message_type == "assignment" and session_row.external_session_ref is None
+                if is_initial_turn:
+                    provider_stream = agent_provider_service.stream_start_session(
+                        integration=integration_row,
+                        request_title=request_row.title,
+                        initial_prompt=latest_human_message.body,
+                        transcript=self._agent_transcript_from_rows(transcript_rows),
+                    )
+                else:
+                    provider_stream = agent_provider_service.stream_continue_session(
+                        integration=integration_row,
+                        agent_label=session_row.agent_label,
+                        transcript=self._agent_transcript_from_rows(transcript_rows),
+                        latest_human_message=latest_human_message.body,
+                        external_session_ref=session_row.external_session_ref,
+                    )
+
+                for chunk in provider_stream:
+                    pending_agent_message.body = chunk.assistant_text
+                    session_row.external_session_ref = chunk.external_session_ref or session_row.external_session_ref
+                    session_row.updated_at = datetime.now(timezone.utc)
+                    session.flush()
+                    session.commit()
+
+                session_row.status = "waiting_on_human"
+                session_row.awaiting_human = True
+                session_row.summary = f"{session_row.agent_label} requested follow-up guidance"
+                session_row.updated_at = datetime.now(timezone.utc)
+                session.flush()
+                session.commit()
+        except Exception as exc:
+            with SessionLocal() as session:
+                request_row = session.get(RequestTable, request_id)
+                session_row = session.get(AgentSessionTable, session_id)
+                if request_row is None or session_row is None:
+                    return
+                session_row.status = "failed"
+                session_row.awaiting_human = True
+                session_row.summary = f"Agent streaming failed: {exc}"
+                session_row.updated_at = datetime.now(timezone.utc)
+                session.commit()
+
+    def create_integration(self, payload: CreateIntegrationRequest, tenant_id: str) -> IntegrationRecord:
+        with SessionLocal() as session:
+            existing = session.get(IntegrationTable, payload.id)
+            if existing is not None and existing.tenant_id == tenant_id:
+                raise ValueError(f"Integration {payload.id} already exists")
+            self._validate_integration_configuration(payload.type, payload.endpoint, payload.settings)
+            session.add(
+                IntegrationTable(
+                    id=payload.id,
+                    tenant_id=tenant_id,
+                    name=payload.name,
+                    type=payload.type,
+                    status=payload.status,
+                    endpoint=payload.endpoint,
+                    settings=integration_security_service.prepare_settings_for_storage(None, payload.settings),
+                )
+            )
+            session.commit()
+        return next(item for item in self.list_integrations(tenant_id) if item.id == payload.id)
+
+    def update_integration(self, integration_id: str, payload: UpdateIntegrationRequest, tenant_id: str) -> IntegrationRecord:
+        with SessionLocal() as session:
+            row = session.get(IntegrationTable, integration_id)
+            if row is None or row.tenant_id != tenant_id:
+                raise StopIteration(integration_id)
+            merged_settings = integration_security_service.prepare_settings_for_storage(
+                row.settings,
+                payload.settings,
+                clear_api_key=payload.clear_api_key,
+                clear_access_token=payload.clear_access_token,
+            )
+            self._validate_integration_configuration(payload.type, payload.endpoint, merged_settings)
+            row.name = payload.name
+            row.type = payload.type
+            row.status = payload.status
+            row.endpoint = payload.endpoint
+            row.settings = merged_settings
+            session.commit()
+        return next(item for item in self.list_integrations(tenant_id) if item.id == integration_id)
+
+    def delete_integration(self, integration_id: str, tenant_id: str) -> None:
+        with SessionLocal() as session:
+            row = session.get(IntegrationTable, integration_id)
+            if row is None or row.tenant_id != tenant_id:
+                raise StopIteration(integration_id)
+            session.delete(row)
+            session.commit()
+
+    def list_users(self, tenant_id: str) -> list[UserRecord]:
+        with SessionLocal() as session:
+            rows = session.scalars(select(UserTable).where(UserTable.tenant_id == tenant_id).order_by(UserTable.display_name)).all()
+        return [
+            UserRecord(
+                id=row.id,
+                display_name=row.display_name,
+                email=row.email,
+                role_summary=row.role_summary or [],
+                status=row.status,
+            )
+            for row in rows
+        ]
+
+    def create_user(self, payload: CreateUserRequest, tenant_id: str) -> UserRecord:
+        with SessionLocal() as session:
+            existing = session.get(UserTable, payload.id)
+            if existing is not None and existing.tenant_id == tenant_id:
+                raise ValueError(f"User {payload.id} already exists")
+            now = datetime.now(timezone.utc)
+            row = UserTable(
+                id=payload.id,
+                tenant_id=tenant_id,
+                display_name=payload.display_name,
+                email=payload.email,
+                role_summary=payload.role_summary,
+                status=payload.status,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(row)
+            session.commit()
+        return UserRecord(
+            id=row.id,
+            display_name=row.display_name,
+            email=row.email,
+            role_summary=row.role_summary or [],
+            status=row.status,
+        )
+
+    def update_user(self, user_id: str, payload: UpdateUserRequest, tenant_id: str) -> UserRecord:
+        with SessionLocal() as session:
+            row = session.get(UserTable, user_id)
+            if row is None or row.tenant_id != tenant_id:
+                raise StopIteration(user_id)
+            row.display_name = payload.display_name
+            row.email = payload.email
+            row.role_summary = payload.role_summary
+            row.status = payload.status
+            row.updated_at = datetime.now(timezone.utc)
+            session.commit()
+        return UserRecord(
+            id=row.id,
+            display_name=row.display_name,
+            email=row.email,
+            role_summary=row.role_summary or [],
+            status=row.status,
+        )
+
+    def list_teams(self, tenant_id: str) -> list[TeamRecord]:
+        with SessionLocal() as session:
+            team_rows = session.scalars(select(TeamTable).where(TeamTable.tenant_id == tenant_id).order_by(TeamTable.name)).all()
+            membership_rows = session.scalars(select(TeamMembershipTable).where(TeamMembershipTable.tenant_id == tenant_id)).all()
+            user_rows = {row.id: row for row in session.scalars(select(UserTable).where(UserTable.tenant_id == tenant_id)).all()}
+        memberships_by_team: dict[str, list[TeamMemberRecord]] = {}
+        for membership in membership_rows:
+            user = user_rows.get(membership.user_id)
+            if not user:
+                continue
+            memberships_by_team.setdefault(membership.team_id, []).append(
+                TeamMemberRecord(
+                    user_id=user.id,
+                    display_name=user.display_name,
+                    email=user.email,
+                    role=membership.role,
+                )
+            )
+        return [
+            TeamRecord(
+                id=row.id,
+                name=row.name,
+                kind=row.kind,
+                status=row.status,
+                member_count=len(memberships_by_team.get(row.id, [])),
+                members=sorted(memberships_by_team.get(row.id, []), key=lambda member: member.display_name),
+            )
+            for row in team_rows
+        ]
+
+    def create_team(self, payload: CreateTeamRequest, tenant_id: str) -> TeamRecord:
+        with SessionLocal() as session:
+            existing = session.get(TeamTable, payload.id)
+            if existing is not None and existing.tenant_id == tenant_id:
+                raise ValueError(f"Team {payload.id} already exists")
+            now = datetime.now(timezone.utc)
+            row = TeamTable(
+                id=payload.id,
+                tenant_id=tenant_id,
+                name=payload.name,
+                kind=payload.kind,
+                status=payload.status,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(row)
+            session.commit()
+        return TeamRecord(id=row.id, name=row.name, kind=row.kind, status=row.status, member_count=0, members=[])
+
+    def update_team(self, team_id: str, payload: UpdateTeamRequest, tenant_id: str) -> TeamRecord:
+        with SessionLocal() as session:
+            row = session.get(TeamTable, team_id)
+            if row is None or row.tenant_id != tenant_id:
+                raise StopIteration(team_id)
+            row.name = payload.name
+            row.kind = payload.kind
+            row.status = payload.status
+            row.updated_at = datetime.now(timezone.utc)
+            session.commit()
+        return next(team for team in self.list_teams(tenant_id) if team.id == team_id)
+
+    def add_team_membership(self, payload: AddTeamMembershipRequest, tenant_id: str) -> TeamRecord:
+        with SessionLocal() as session:
+            team_row = session.get(TeamTable, payload.team_id)
+            user_row = session.get(UserTable, payload.user_id)
+            if team_row is None or team_row.tenant_id != tenant_id:
+                raise StopIteration(payload.team_id)
+            if user_row is None or user_row.tenant_id != tenant_id:
+                raise StopIteration(payload.user_id)
+            existing = session.scalars(
+                select(TeamMembershipTable).where(
+                    TeamMembershipTable.tenant_id == tenant_id,
+                    TeamMembershipTable.team_id == payload.team_id,
+                    TeamMembershipTable.user_id == payload.user_id,
+                )
+            ).first()
+            if existing is None:
+                now = datetime.now(timezone.utc)
+                session.add(
+                    TeamMembershipTable(
+                        id=f"tm_{payload.team_id}_{payload.user_id}",
+                        tenant_id=tenant_id,
+                        team_id=payload.team_id,
+                        user_id=payload.user_id,
+                        role=payload.role,
+                        created_at=now,
+                    )
+                )
+            else:
+                existing.role = payload.role
+            session.commit()
+        return next(team for team in self.list_teams(tenant_id) if team.id == payload.team_id)
+
+    def list_portfolios(self, tenant_id: str) -> list[PortfolioRecord]:
+        with SessionLocal() as session:
+            portfolio_rows = session.scalars(select(PortfolioTable).where(PortfolioTable.tenant_id == tenant_id).order_by(PortfolioTable.name)).all()
+            scope_rows = session.scalars(select(PortfolioScopeTable).where(PortfolioScopeTable.tenant_id == tenant_id).order_by(PortfolioScopeTable.scope_key)).all()
+        scopes_by_portfolio: dict[str, list[str]] = {}
+        for scope in scope_rows:
+            scopes_by_portfolio.setdefault(scope.portfolio_id, []).append(scope.scope_key)
+        return [
+            PortfolioRecord(
+                id=row.id,
+                name=row.name,
+                status=row.status,
+                owner_team_id=row.owner_team_id,
+                scope_keys=scopes_by_portfolio.get(row.id, []),
+            )
+            for row in portfolio_rows
+        ]
+
+    def create_portfolio(self, payload: CreatePortfolioRequest, tenant_id: str) -> PortfolioRecord:
+        with SessionLocal() as session:
+            existing = session.get(PortfolioTable, payload.id)
+            if existing is not None and existing.tenant_id == tenant_id:
+                raise ValueError(f"Portfolio {payload.id} already exists")
+            owner_team = session.get(TeamTable, payload.owner_team_id)
+            if owner_team is None or owner_team.tenant_id != tenant_id:
+                raise StopIteration(payload.owner_team_id)
+            now = datetime.now(timezone.utc)
+            session.add(
+                PortfolioTable(
+                    id=payload.id,
+                    tenant_id=tenant_id,
+                    name=payload.name,
+                    status=payload.status,
+                    owner_team_id=payload.owner_team_id,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            for index, scope_key in enumerate(payload.scope_keys, start=1):
+                session.add(
+                    PortfolioScopeTable(
+                        id=f"ps_{payload.id}_{index}",
+                        tenant_id=tenant_id,
+                        portfolio_id=payload.id,
+                        scope_type="team",
+                        scope_key=scope_key,
+                    )
+                )
+            session.commit()
+        return next(portfolio for portfolio in self.list_portfolios(tenant_id) if portfolio.id == payload.id)
+
+    def list_portfolio_summaries(self, tenant_id: str) -> list[PortfolioSummary]:
+        with SessionLocal() as session:
+            portfolio_rows = session.scalars(select(PortfolioTable).where(PortfolioTable.tenant_id == tenant_id).order_by(PortfolioTable.name)).all()
+            scope_rows = session.scalars(select(PortfolioScopeTable).where(PortfolioScopeTable.tenant_id == tenant_id)).all()
+            team_rows = session.scalars(select(TeamTable).where(TeamTable.tenant_id == tenant_id)).all()
+            membership_rows = session.scalars(select(TeamMembershipTable).where(TeamMembershipTable.tenant_id == tenant_id)).all()
+            request_rows = session.scalars(select(RequestTable).where(RequestTable.tenant_id == tenant_id)).all()
+            deployment_rows = session.scalars(select(DeploymentExecutionTable).where(DeploymentExecutionTable.tenant_id == tenant_id)).all()
+        scopes_by_portfolio: dict[str, set[str]] = {}
+        for scope in scope_rows:
+            if scope.scope_type == "team":
+                scopes_by_portfolio.setdefault(scope.portfolio_id, set()).add(scope.scope_key)
+        team_ids = {row.id for row in team_rows}
+        member_counts: dict[str, int] = {}
+        for membership in membership_rows:
+            member_counts[membership.team_id] = member_counts.get(membership.team_id, 0) + 1
+        deployment_by_request = {row.request_id for row in deployment_rows if row.status == "succeeded"}
+        summaries: list[PortfolioSummary] = []
+        for portfolio in portfolio_rows:
+            scoped_team_ids = scopes_by_portfolio.get(portfolio.id, set()) & team_ids
+            scoped_requests = [row for row in request_rows if row.owner_team_id in scoped_team_ids]
+            summaries.append(
+                PortfolioSummary(
+                    portfolio_id=portfolio.id,
+                    portfolio_name=portfolio.name,
+                    owner_team_id=portfolio.owner_team_id,
+                    team_count=len(scoped_team_ids),
+                    member_count=sum(member_counts.get(team_id, 0) for team_id in scoped_team_ids),
+                    request_count=len(scoped_requests),
+                    active_request_count=sum(
+                        1 for row in scoped_requests if row.status in {
+                            RequestStatus.SUBMITTED.value,
+                            RequestStatus.VALIDATED.value,
+                            RequestStatus.CLASSIFIED.value,
+                            RequestStatus.OWNERSHIP_RESOLVED.value,
+                            RequestStatus.PLANNED.value,
+                            RequestStatus.QUEUED.value,
+                            RequestStatus.IN_EXECUTION.value,
+                            RequestStatus.AWAITING_REVIEW.value,
+                            RequestStatus.UNDER_REVIEW.value,
+                            RequestStatus.APPROVED.value,
+                            RequestStatus.PROMOTION_PENDING.value,
+                        }
+                    ),
+                    completed_request_count=sum(1 for row in scoped_requests if row.status == RequestStatus.COMPLETED.value),
+                    deployment_count=sum(1 for row in scoped_requests if row.id in deployment_by_request),
+                )
+            )
+        return summaries
+
+    def list_delivery_dora(
+        self,
+        tenant_id: str,
+        portfolio_id: str | None = None,
+        team_id: str | None = None,
+        user_id: str | None = None,
+    ) -> list[DeliveryDoraRow]:
+        with SessionLocal() as session:
+            request_rows = session.scalars(select(RequestTable).where(RequestTable.tenant_id == tenant_id)).all()
+            deployment_rows = session.scalars(select(DeploymentExecutionTable).where(DeploymentExecutionTable.tenant_id == tenant_id)).all()
+            signal_rows = session.scalars(select(RuntimeSignalTable).where(RuntimeSignalTable.tenant_id == tenant_id)).all()
+            scope_rows = session.scalars(select(PortfolioScopeTable).where(PortfolioScopeTable.tenant_id == tenant_id)).all()
+            portfolio_rows = {row.id: row for row in session.scalars(select(PortfolioTable).where(PortfolioTable.tenant_id == tenant_id)).all()}
+        request_rows = self._filter_request_rows_for_analytics(request_rows, tenant_id, team_id, user_id, portfolio_id, scope_rows)
+
+        request_ids_by_scope: dict[tuple[str, str], list] = {}
+        if team_id:
+            scoped_requests = [row for row in request_rows if row.owner_team_id == team_id]
+            request_ids_by_scope[("team", team_id)] = scoped_requests
+        elif user_id:
+            scoped_requests = [row for row in request_rows if row.owner_user_id == user_id or row.submitter_id == user_id]
+            request_ids_by_scope[("user", user_id)] = scoped_requests
+        elif portfolio_id and portfolio_id in portfolio_rows:
+            team_scopes = {row.scope_key for row in scope_rows if row.portfolio_id == portfolio_id and row.scope_type == "team"}
+            scoped_requests = [row for row in request_rows if row.owner_team_id in team_scopes]
+            request_ids_by_scope[("portfolio", portfolio_id)] = scoped_requests
+        else:
+            by_team: dict[str, list] = {}
+            for row in request_rows:
+                key = row.owner_team_id or "unassigned"
+                by_team.setdefault(key, []).append(row)
+            request_ids_by_scope = {("team", key): value for key, value in by_team.items()}
+
+        restored_at_by_request: dict[str, datetime] = {}
+        for signal in signal_rows:
+            if signal.status == "completed":
+                restored_at_by_request[signal.request_id] = signal.received_at
+
+        rows: list[DeliveryDoraRow] = []
+        for (scope_type, scope_key), scoped_requests in request_ids_by_scope.items():
+            if not scoped_requests:
+                continue
+            deployed_requests = [row for row in scoped_requests if row.status in {RequestStatus.PROMOTED.value, RequestStatus.COMPLETED.value}]
+            failures = [row for row in scoped_requests if row.status == RequestStatus.FAILED.value]
+            lead_times = [
+                max((row.updated_at - row.created_at).total_seconds() / 3600, 0.0)
+                for row in deployed_requests
+            ]
+            mttrs = [
+                max((restored_at_by_request[row.id] - row.updated_at).total_seconds() / 3600, 0.0)
+                for row in failures
+                if row.id in restored_at_by_request
+            ]
+            deployment_frequency = len([row for row in deployment_rows if row.request_id in {request.id for request in deployed_requests} and row.status == "succeeded"])
+            rows.append(
+                DeliveryDoraRow(
+                    scope_type=scope_type,
+                    scope_key=scope_key,
+                    deployment_frequency=f"{deployment_frequency}/30d",
+                    lead_time_hours=round(sum(lead_times) / len(lead_times), 2) if lead_times else 0.0,
+                    change_failure_rate=f"{(len(failures) / max(len(deployed_requests), 1)) * 100:.1f}%",
+                    mean_time_to_restore_hours=round(sum(mttrs) / len(mttrs), 2) if mttrs else 0.0,
+                )
+            )
+        return sorted(rows, key=lambda row: (row.scope_type, row.scope_key))
+
+    def list_delivery_lifecycle(
+        self,
+        tenant_id: str,
+        portfolio_id: str | None = None,
+        team_id: str | None = None,
+        user_id: str | None = None,
+    ) -> list[DeliveryLifecycleRow]:
+        with SessionLocal() as session:
+            request_rows = session.scalars(select(RequestTable).where(RequestTable.tenant_id == tenant_id)).all()
+            run_rows = session.scalars(select(RunTable)).all()
+            review_rows = session.scalars(select(ReviewQueueTable)).all()
+            promotion_rows = session.scalars(select(PromotionTable)).all()
+            runtime_dispatch_rows = session.scalars(select(RuntimeDispatchTable).where(RuntimeDispatchTable.tenant_id == tenant_id)).all()
+            scope_rows = session.scalars(select(PortfolioScopeTable).where(PortfolioScopeTable.tenant_id == tenant_id)).all()
+            portfolio_rows = {row.id: row for row in session.scalars(select(PortfolioTable).where(PortfolioTable.tenant_id == tenant_id)).all()}
+
+        request_rows = self._filter_request_rows_for_analytics(request_rows, tenant_id, team_id, user_id, portfolio_id, scope_rows)
+        scoped_requests_by_scope = self._requests_by_scope(request_rows, scope_rows, portfolio_rows, portfolio_id, team_id, user_id)
+        runs_by_request: dict[str, list] = {}
+        for row in run_rows:
+            runs_by_request.setdefault(row.request_id, []).append(row)
+        reviews_by_request: dict[str, list] = {}
+        for row in review_rows:
+            reviews_by_request.setdefault(row.request_id, []).append(row)
+        promotions_by_request: dict[str, list] = {}
+        for row in promotion_rows:
+            promotions_by_request.setdefault(row.request_id, []).append(row)
+        dispatches_by_run: dict[str, list] = {}
+        for row in runtime_dispatch_rows:
+            dispatches_by_run.setdefault(row.run_id, []).append(row)
+
+        rows: list[DeliveryLifecycleRow] = []
+        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+        for (scope_type, scope_key), scoped_requests in scoped_requests_by_scope.items():
+            if not scoped_requests:
+                continue
+            throughput = sum(1 for row in scoped_requests if row.created_at >= cutoff)
+            lead_times: list[float] = []
+            cycle_times: list[float] = []
+            execution_times: list[float] = []
+            queue_times: list[float] = []
+            review_times: list[float] = []
+            approval_times: list[float] = []
+            promotion_times: list[float] = []
+
+            for request_row in scoped_requests:
+                if request_row.status in {RequestStatus.COMPLETED.value, RequestStatus.PROMOTED.value, RequestStatus.PROMOTION_PENDING.value, RequestStatus.APPROVED.value}:
+                    lead_times.append(max((request_row.updated_at - request_row.created_at).total_seconds() / 3600, 0.0))
+                if request_row.status not in {RequestStatus.DRAFT.value, RequestStatus.CANCELED.value, RequestStatus.VALIDATION_FAILED.value}:
+                    cycle_times.append(max((request_row.updated_at - request_row.created_at).total_seconds() / 3600, 0.0))
+
+                request_runs = runs_by_request.get(request_row.id, [])
+                for run in request_runs:
+                    elapsed_hours = self._parse_duration_to_hours(run.elapsed_time)
+                    if elapsed_hours > 0:
+                        execution_times.append(elapsed_hours)
+                    run_dispatches = sorted(dispatches_by_run.get(run.id, []), key=lambda row: row.dispatched_at)
+                    enqueue = next((row for row in run_dispatches if row.dispatch_type == "enqueue"), None)
+                    start = next((row for row in run_dispatches if row.dispatch_type == "start"), None)
+                    if enqueue and start:
+                        queue_times.append(max((start.dispatched_at - enqueue.dispatched_at).total_seconds() / 3600, 0.0))
+
+                request_reviews = reviews_by_request.get(request_row.id, [])
+                if request_reviews:
+                    review_times.append(float(len(request_reviews)) * 2.0)
+
+                if request_row.status in {RequestStatus.APPROVED.value, RequestStatus.PROMOTION_PENDING.value, RequestStatus.PROMOTED.value, RequestStatus.COMPLETED.value}:
+                    approval_times.append(1.0)
+
+                request_promotions = promotions_by_request.get(request_row.id, [])
+                for promotion in request_promotions:
+                    history = promotion.promotion_history or []
+                    if len(history) >= 2:
+                        try:
+                            first = datetime.fromisoformat(str(history[0]["timestamp"]).replace("Z", "+00:00"))
+                            last = datetime.fromisoformat(str(history[-1]["timestamp"]).replace("Z", "+00:00"))
+                            promotion_times.append(max((last - first).total_seconds() / 3600, 0.0))
+                        except (KeyError, TypeError, ValueError):
+                            promotion_times.append(0.0)
+
+            rows.append(
+                DeliveryLifecycleRow(
+                    scope_type=scope_type,
+                    scope_key=scope_key,
+                    throughput_30d=throughput,
+                    lead_time_hours=round(sum(lead_times) / len(lead_times), 2) if lead_times else 0.0,
+                    cycle_time_hours=round(sum(cycle_times) / len(cycle_times), 2) if cycle_times else 0.0,
+                    execution_time_hours=round(sum(execution_times) / len(execution_times), 2) if execution_times else 0.0,
+                    queue_time_hours=round(sum(queue_times) / len(queue_times), 2) if queue_times else 0.0,
+                    review_time_hours=round(sum(review_times) / len(review_times), 2) if review_times else 0.0,
+                    approval_time_hours=round(sum(approval_times) / len(approval_times), 2) if approval_times else 0.0,
+                    promotion_time_hours=round(sum(promotion_times) / len(promotion_times), 2) if promotion_times else 0.0,
+                )
+            )
+        return sorted(rows, key=lambda row: (row.scope_type, row.scope_key))
+
+    def list_delivery_trends(
+        self,
+        tenant_id: str,
+        days: int = 30,
+        portfolio_id: str | None = None,
+        team_id: str | None = None,
+        user_id: str | None = None,
+    ) -> list[DeliveryTrendPoint]:
+        with SessionLocal() as session:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+            request_rows = session.scalars(select(RequestTable).where(RequestTable.tenant_id == tenant_id, RequestTable.updated_at >= cutoff)).all()
+            deployment_rows = session.scalars(select(DeploymentExecutionTable).where(DeploymentExecutionTable.tenant_id == tenant_id)).all()
+            scope_rows = session.scalars(select(PortfolioScopeTable).where(PortfolioScopeTable.tenant_id == tenant_id)).all()
+        request_rows = self._filter_request_rows_for_analytics(request_rows, tenant_id, team_id, user_id, portfolio_id, scope_rows)
+
+        deployment_request_ids = {row.request_id for row in deployment_rows if row.status == "succeeded"}
+        grouped: dict[str, dict[str, float]] = {}
+        for row in request_rows:
+            period_start = row.updated_at.astimezone(timezone.utc).date().isoformat()
+            bucket = grouped.setdefault(
+                period_start,
+                {"completed": 0.0, "failed": 0.0, "deployments": 0.0, "throughput": 0.0, "lead_time_hours": 0.0, "lead_time_count": 0.0},
+            )
+            bucket["throughput"] += 1
+            bucket["completed"] += 1 if row.status in {RequestStatus.COMPLETED.value, RequestStatus.PROMOTED.value} else 0
+            bucket["failed"] += 1 if row.status == RequestStatus.FAILED.value else 0
+            bucket["deployments"] += 1 if row.id in deployment_request_ids else 0
+            if row.status in {RequestStatus.COMPLETED.value, RequestStatus.PROMOTED.value, RequestStatus.PROMOTION_PENDING.value, RequestStatus.APPROVED.value}:
+                bucket["lead_time_hours"] += max((row.updated_at - row.created_at).total_seconds() / 3600, 0.0)
+                bucket["lead_time_count"] += 1
+
+        rows: list[DeliveryTrendPoint] = []
+        for period_start in sorted(grouped.keys()):
+            bucket = grouped[period_start]
+            lead_time_count = max(int(bucket["lead_time_count"]), 1)
+            rows.append(
+                DeliveryTrendPoint(
+                    period_start=period_start,
+                    completed_count=int(bucket["completed"]),
+                    failed_count=int(bucket["failed"]),
+                    deployment_count=int(bucket["deployments"]),
+                    throughput_count=int(bucket["throughput"]),
+                    lead_time_hours=round(bucket["lead_time_hours"] / lead_time_count, 2) if bucket["lead_time_count"] else 0.0,
+                )
+            )
+        return rows
+
+    def get_delivery_forecast(
+        self,
+        tenant_id: str,
+        history_days: int = 30,
+        forecast_days: int = 14,
+        portfolio_id: str | None = None,
+        team_id: str | None = None,
+        user_id: str | None = None,
+    ) -> DeliveryForecastSummary:
+        trend_rows = self.list_delivery_trends(tenant_id, history_days, portfolio_id, team_id, user_id)
+        if not trend_rows:
+            return DeliveryForecastSummary(
+                forecast_days=forecast_days,
+                avg_daily_throughput=0.0,
+                avg_daily_deployments=0.0,
+                projected_total_throughput=0.0,
+                projected_total_deployments=0.0,
+                projected_lead_time_hours=0.0,
+            )
+
+        avg_daily_throughput = sum(row.throughput_count for row in trend_rows) / len(trend_rows)
+        avg_daily_deployments = sum(row.deployment_count for row in trend_rows) / len(trend_rows)
+        projected_lead_time = sum(row.lead_time_hours for row in trend_rows) / len(trend_rows)
+        return DeliveryForecastSummary(
+            forecast_days=forecast_days,
+            avg_daily_throughput=round(avg_daily_throughput, 2),
+            avg_daily_deployments=round(avg_daily_deployments, 2),
+            projected_total_throughput=round(avg_daily_throughput * forecast_days, 2),
+            projected_total_deployments=round(avg_daily_deployments * forecast_days, 2),
+            projected_lead_time_hours=round(projected_lead_time, 2),
+        )
+
+    def list_delivery_forecast_points(
+        self,
+        tenant_id: str,
+        history_days: int = 30,
+        forecast_days: int = 14,
+        portfolio_id: str | None = None,
+        team_id: str | None = None,
+        user_id: str | None = None,
+    ) -> list[DeliveryForecastPoint]:
+        summary = self.get_delivery_forecast(tenant_id, history_days, forecast_days, portfolio_id, team_id, user_id)
+        start = datetime.now(timezone.utc).date()
+        return [
+            DeliveryForecastPoint(
+                period_start=(start + timedelta(days=offset + 1)).isoformat(),
+                projected_throughput_count=summary.avg_daily_throughput,
+                projected_deployment_count=summary.avg_daily_deployments,
+                projected_lead_time_hours=summary.projected_lead_time_hours,
+            )
+            for offset in range(forecast_days)
+        ]
+
+    def get_performance_operations_summary(self, tenant_id: str) -> PerformanceOperationsSummary:
+        now = datetime.now(timezone.utc)
+        with SessionLocal() as session:
+            requests = session.scalars(select(RequestTable).where(RequestTable.tenant_id == tenant_id)).all()
+            runtime_dispatches = session.scalars(select(RuntimeDispatchTable).where(RuntimeDispatchTable.tenant_id == tenant_id)).all()
+            request_ids = {row.id for row in requests}
+            promotions = session.scalars(select(PromotionTable)).all()
+            promotions = [row for row in promotions if row.request_id in request_ids]
+            promotion_ids = {row.id for row in promotions}
+            check_runs = session.scalars(select(CheckRunTable)).all()
+            reviews = session.scalars(select(ReviewQueueTable)).all()
+
+        check_runs = [
+            row for row in check_runs
+            if (row.request_id and row.request_id in request_ids) or (row.promotion_id and row.promotion_id in promotion_ids)
+        ]
+        reviews = [row for row in reviews if row.request_id in request_ids]
+
+        queued_checks = [row for row in check_runs if row.status == "queued"]
+        running_checks = [row for row in check_runs if row.status == "running"]
+        waiting_runs = [row for row in requests if row.status in {RequestStatus.QUEUED.value, RequestStatus.AWAITING_INPUT.value, RequestStatus.AWAITING_REVIEW.value}]
+        failed_runs = [row for row in requests if row.status == RequestStatus.FAILED.value]
+        stale_reviews = [row for row in reviews if row.stale]
+        pending_promotions = [
+            row for row in promotions
+            if any(str(approval.get("state", "")).lower() == "pending" for approval in (row.required_approvals or []))
+        ]
+
+        check_queue_minutes = [max((now - row.queued_at).total_seconds() / 60, 0.0) for row in queued_checks]
+
+        dispatches_by_run: dict[str, list] = {}
+        for row in runtime_dispatches:
+            dispatches_by_run.setdefault(row.run_id, []).append(row)
+        runtime_queue_minutes: list[float] = []
+        for rows in dispatches_by_run.values():
+            ordered = sorted(rows, key=lambda row: row.dispatched_at)
+            enqueue = next((row for row in ordered if row.dispatch_type == "enqueue"), None)
+            start = next((row for row in ordered if row.dispatch_type == "start"), None)
+            if enqueue and start:
+                runtime_queue_minutes.append(max((start.dispatched_at - enqueue.dispatched_at).total_seconds() / 60, 0.0))
+
+        return PerformanceOperationsSummary(
+            queued_checks=len(queued_checks),
+            running_checks=len(running_checks),
+            waiting_runs=len(waiting_runs),
+            failed_runs=len(failed_runs),
+            stale_reviews=len(stale_reviews),
+            pending_promotions=len(pending_promotions),
+            avg_check_queue_minutes=round(sum(check_queue_minutes) / len(check_queue_minutes), 2) if check_queue_minutes else 0.0,
+            avg_runtime_queue_minutes=round(sum(runtime_queue_minutes) / len(runtime_queue_minutes), 2) if runtime_queue_minutes else 0.0,
+        )
+
+    def list_performance_operations_trends(self, tenant_id: str, days: int = 30) -> list[PerformanceOperationsTrendPoint]:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        with SessionLocal() as session:
+            requests = session.scalars(select(RequestTable).where(RequestTable.tenant_id == tenant_id, RequestTable.updated_at >= cutoff)).all()
+            request_map = {row.id: row for row in requests}
+            request_ids = {row.id for row in requests}
+            promotions = session.scalars(select(PromotionTable)).all()
+            promotions = [row for row in promotions if row.request_id in request_ids]
+            promotion_ids = {row.id for row in promotions}
+            check_runs = session.scalars(select(CheckRunTable).where(CheckRunTable.queued_at >= cutoff)).all()
+            reviews = session.scalars(select(ReviewQueueTable)).all()
+
+        check_runs = [
+            row for row in check_runs
+            if (row.request_id and row.request_id in request_ids) or (row.promotion_id and row.promotion_id in promotion_ids)
+        ]
+        reviews = [row for row in reviews if row.request_id in request_ids]
+
+        grouped: dict[str, dict[str, int]] = {}
+
+        def bucket(date_key: str) -> dict[str, int]:
+            return grouped.setdefault(
+                date_key,
+                {
+                    "queued_checks": 0,
+                    "running_checks": 0,
+                    "waiting_runs": 0,
+                    "failed_runs": 0,
+                    "stale_reviews": 0,
+                    "pending_promotions": 0,
+                },
+            )
+
+        for row in check_runs:
+            current = bucket(row.queued_at.astimezone(timezone.utc).date().isoformat())
+            if row.status == "queued":
+                current["queued_checks"] += 1
+            if row.status == "running":
+                current["running_checks"] += 1
+
+        for row in requests:
+            current = bucket(row.updated_at.astimezone(timezone.utc).date().isoformat())
+            if row.status in {RequestStatus.QUEUED.value, RequestStatus.AWAITING_INPUT.value, RequestStatus.AWAITING_REVIEW.value}:
+                current["waiting_runs"] += 1
+            if row.status == RequestStatus.FAILED.value:
+                current["failed_runs"] += 1
+
+        for row in reviews:
+            request_row = request_map.get(row.request_id)
+            if request_row is None:
+                continue
+            current = bucket(request_row.updated_at.astimezone(timezone.utc).date().isoformat())
+            if row.stale:
+                current["stale_reviews"] += 1
+
+        for row in promotions:
+            history = row.promotion_history or []
+            if not history:
+                continue
+            latest = None
+            try:
+                latest = datetime.fromisoformat(str(history[-1]["timestamp"]).replace("Z", "+00:00"))
+            except (KeyError, TypeError, ValueError):
+                latest = None
+            if latest is None:
+                continue
+            if latest < cutoff:
+                continue
+            current = bucket(latest.astimezone(timezone.utc).date().isoformat())
+            if any(str(approval.get("state", "")).lower() == "pending" for approval in (row.required_approvals or [])):
+                current["pending_promotions"] += 1
+
+        return [
+            PerformanceOperationsTrendPoint(
+                period_start=period_start,
+                queued_checks=values["queued_checks"],
+                running_checks=values["running_checks"],
+                waiting_runs=values["waiting_runs"],
+                failed_runs=values["failed_runs"],
+                stale_reviews=values["stale_reviews"],
+                pending_promotions=values["pending_promotions"],
+            )
+            for period_start, values in sorted(grouped.items())
+        ]
+
+    def _requests_by_scope(self, request_rows, scope_rows, portfolio_rows, portfolio_id: str | None = None, team_id: str | None = None, user_id: str | None = None):
+        if team_id:
+            return {("team", team_id): [row for row in request_rows if row.owner_team_id == team_id]}
+        if user_id:
+            return {("user", user_id): [row for row in request_rows if row.owner_user_id == user_id or row.submitter_id == user_id]}
+        if portfolio_id and portfolio_id in portfolio_rows:
+            team_scopes = {row.scope_key for row in scope_rows if row.portfolio_id == portfolio_id and row.scope_type == "team"}
+            return {("portfolio", portfolio_id): [row for row in request_rows if row.owner_team_id in team_scopes]}
+        by_team: dict[str, list] = {}
+        for row in request_rows:
+            key = row.owner_team_id or "unassigned"
+            by_team.setdefault(key, []).append(row)
+        return {("team", key): value for key, value in by_team.items()}
+
+    def _filter_request_rows_for_analytics(
+        self,
+        request_rows,
+        tenant_id: str | None = None,
+        team_id: str | None = None,
+        user_id: str | None = None,
+        portfolio_id: str | None = None,
+        scope_rows=None,
+    ):
+        filtered = [row for row in request_rows if tenant_id is None or row.tenant_id == tenant_id]
+        if portfolio_id and scope_rows is not None:
+            portfolio_teams = {row.scope_key for row in scope_rows if row.portfolio_id == portfolio_id and row.scope_type == "team"}
+            filtered = [row for row in filtered if row.owner_team_id in portfolio_teams]
+        if team_id:
+            filtered = [row for row in filtered if row.owner_team_id == team_id]
+        if user_id:
+            filtered = [row for row in filtered if row.owner_user_id == user_id or row.submitter_id == user_id]
+        return filtered
+
+    def _parse_duration_to_hours(self, duration: str) -> float:
+        if not duration:
+            return 0.0
+        hours = 0.0
+        hour_match = re.search(r"(\d+)h", duration)
+        minute_match = re.search(r"(\d+)m", duration)
+        if hour_match:
+            hours += int(hour_match.group(1))
+        if minute_match:
+            hours += int(minute_match.group(1)) / 60
+        return hours
+
+    def list_event_ledger(
+        self,
+        page: int,
+        page_size: int,
+        tenant_id: str,
+        request_id: str | None = None,
+        run_id: str | None = None,
+        artifact_id: str | None = None,
+        promotion_id: str | None = None,
+        check_run_id: str | None = None,
+        event_type: str | None = None,
+    ) -> PaginatedResponse[EventLedgerRecord]:
+        with SessionLocal() as session:
+            stmt = select(EventStoreTable).where(EventStoreTable.tenant_id == tenant_id)
+            if request_id:
+                stmt = stmt.where(EventStoreTable.request_id == request_id)
+            if run_id:
+                stmt = stmt.where(EventStoreTable.run_id == run_id)
+            if artifact_id:
+                stmt = stmt.where(EventStoreTable.artifact_id == artifact_id)
+            if promotion_id:
+                stmt = stmt.where(EventStoreTable.promotion_id == promotion_id)
+            if check_run_id:
+                stmt = stmt.where(EventStoreTable.check_run_id == check_run_id)
+            if event_type:
+                stmt = stmt.where(EventStoreTable.event_type == event_type)
+            rows = session.scalars(stmt.order_by(desc(EventStoreTable.occurred_at), desc(EventStoreTable.id))).all()
+        records = [self._event_ledger_record_from_row(row) for row in rows]
+        return self._paginate(records, page, page_size)
+
+    def list_event_outbox(
+        self,
+        page: int,
+        page_size: int,
+        tenant_id: str,
+        request_id: str | None = None,
+        status: str | None = None,
+        topic: str | None = None,
+    ) -> PaginatedResponse[EventOutboxRecord]:
+        with SessionLocal() as session:
+            stmt = select(EventOutboxTable).where(EventOutboxTable.tenant_id == tenant_id)
+            if status:
+                stmt = stmt.where(EventOutboxTable.status == status)
+            if topic:
+                stmt = stmt.where(EventOutboxTable.topic == topic)
+            rows = session.scalars(stmt.order_by(desc(EventOutboxTable.created_at), desc(EventOutboxTable.id))).all()
+        if request_id:
+            rows = [row for row in rows if (row.payload or {}).get("request_id") == request_id]
+        records = [self._event_outbox_record_from_row(row) for row in rows]
+        return self._paginate(records, page, page_size)
+
+    def create_request_draft(self, payload: CreateRequestDraft, actor_id: str = "user_demo", tenant_id: str = "tenant_demo") -> RequestRecord:
+        with SessionLocal() as session:
+            template_row = session.scalars(
+                select(TemplateTable).where(
+                    TemplateTable.id == payload.template_id,
+                    TemplateTable.version == payload.template_version,
+                    TemplateTable.tenant_id == tenant_id,
+                )
+            ).first()
+            if template_row is None:
+                raise ValueError(f"Template {payload.template_id}@{payload.template_version} is not available for tenant {tenant_id}")
+            normalized_input_payload = self._validate_template_payload(
+                template_row.template_schema,
+                payload.input_payload,
+                require_required=False,
+            )
+            next_id = self._next_request_id(session)
+            now = datetime.now(timezone.utc)
+            row = RequestTable(
+                id=next_id,
+                tenant_id=tenant_id,
+                request_type="custom",
+                template_id=payload.template_id,
+                template_version=payload.template_version,
+                title=payload.title,
+                summary=payload.summary,
+                status="draft",
+                priority=payload.priority,
+                submitter_id=actor_id,
+                policy_context={},
+                input_payload=normalized_input_payload,
+                tags=[],
+                created_at=now,
+                created_by=actor_id,
+                updated_at=now,
+                updated_by=actor_id,
+                version=1,
+                is_archived=False,
+            )
+            session.add(row)
+            self._append_event(
+                session=session,
+                request_id=next_id,
+                actor=actor_id,
+                action="Draft Created",
+                reason_or_evidence="Initial draft created through API",
+            )
+            session.commit()
+            session.refresh(row)
+        return self._request_from_row(row)
+
+    def submit_request(self, request_id: str, payload: SubmitRequest, tenant_id: str | None = None) -> RequestRecord:
+        with SessionLocal() as session:
+            row = self._get_request_row(session, request_id)
+            self._ensure_request_tenant_access(row, tenant_id)
+            template_row = session.scalars(
+                select(TemplateTable).where(
+                    TemplateTable.id == row.template_id,
+                    TemplateTable.version == row.template_version,
+                    TemplateTable.tenant_id == row.tenant_id,
+                )
+            ).first()
+            if template_row is None:
+                raise ValueError(f"Bound template {row.template_id}@{row.template_version} is no longer available")
+            row.input_payload = self._validate_template_payload(
+                template_row.template_schema,
+                row.input_payload or {},
+                require_required=True,
+            )
+            routing = self._resolve_request_routing(template_row.template_schema, row.input_payload or {})
+            row.owner_team_id = routing["owner_team_id"] or row.owner_team_id
+            row.workflow_binding_id = routing["workflow_binding_id"] or row.workflow_binding_id
+            row.policy_context = {
+                **dict(row.policy_context or {}),
+                "routing": {
+                    "resolved_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "owner_team_id": row.owner_team_id,
+                    "workflow_binding_id": row.workflow_binding_id,
+                    "reviewers": routing["reviewers"],
+                    "promotion_approvers": routing["promotion_approvers"],
+                },
+            }
+            current_status = RequestStatus(row.status)
+            if current_status not in self.SUBMITTABLE_STATUSES:
+                raise ValueError(f"Request {request_id} cannot be submitted from status {row.status}")
+            row.status = RequestStatus.SUBMITTED.value
+            row.updated_at = datetime.now(timezone.utc)
+            row.updated_by = payload.actor_id
+            row.version += 1
+            check_dispatch_service.enqueue_request_checks(session, request_id, payload.actor_id, payload.reason)
+            self._append_event(
+                session=session,
+                request_id=request_id,
+                actor=payload.actor_id,
+                action="Submitted",
+                reason_or_evidence=payload.reason,
+            )
+            self._append_event(
+                session=session,
+                request_id=request_id,
+                actor=payload.actor_id,
+                action="Routing Resolved",
+                reason_or_evidence=f"owner_team={row.owner_team_id or 'unassigned'} workflow_binding={row.workflow_binding_id or 'unassigned'} reviewers={', '.join(routing['reviewers']) or 'none'}",
+            )
+            session.commit()
+            session.refresh(row)
+        return self._request_from_row(row)
+
+    def amend_request(self, request_id: str, payload: AmendRequest, tenant_id: str | None = None) -> RequestRecord:
+        with SessionLocal() as session:
+            row = self._get_request_row(session, request_id)
+            self._ensure_request_tenant_access(row, tenant_id)
+            current_status = RequestStatus(row.status)
+            if current_status not in self.AMENDABLE_STATUSES:
+                raise ValueError(f"Request {request_id} cannot be amended from status {row.status}")
+            if payload.title is not None:
+                row.title = payload.title
+            if payload.summary is not None:
+                row.summary = payload.summary
+            if payload.priority is not None:
+                row.priority = payload.priority.value
+            if payload.input_payload is not None:
+                row.input_payload = payload.input_payload
+            row.status = RequestStatus.DRAFT.value
+            row.updated_at = datetime.now(timezone.utc)
+            row.updated_by = payload.actor_id
+            row.version += 1
+            self._append_event(
+                session=session,
+                request_id=request_id,
+                actor=payload.actor_id,
+                action="Amended",
+                reason_or_evidence=payload.reason,
+            )
+            session.commit()
+            session.refresh(row)
+        return self._request_from_row(row)
+
+    def cancel_request(self, request_id: str, payload: CancelRequest, tenant_id: str | None = None) -> RequestRecord:
+        with SessionLocal() as session:
+            row = self._get_request_row(session, request_id)
+            self._ensure_request_tenant_access(row, tenant_id)
+            current_status = RequestStatus(row.status)
+            if current_status not in self.CANCELABLE_STATUSES:
+                raise ValueError(f"Request {request_id} cannot be canceled from status {row.status}")
+            row.status = RequestStatus.CANCELED.value
+            row.updated_at = datetime.now(timezone.utc)
+            row.updated_by = payload.actor_id
+            row.version += 1
+            self._append_event(
+                session=session,
+                request_id=request_id,
+                actor=payload.actor_id,
+                action="Canceled",
+                reason_or_evidence=payload.reason,
+            )
+            session.commit()
+            session.refresh(row)
+        return self._request_from_row(row)
+
+    def transition_request(self, request_id: str, payload: TransitionRequest, tenant_id: str | None = None) -> RequestRecord:
+        with SessionLocal() as session:
+            row = self._get_request_row(session, request_id)
+            self._ensure_request_tenant_access(row, tenant_id)
+            current_status = RequestStatus(row.status)
+            target_status = payload.target_status
+            if target_status in {RequestStatus.DRAFT, RequestStatus.SUBMITTED, RequestStatus.CANCELED, RequestStatus.ARCHIVED}:
+                raise ValueError(f"Use the dedicated mutation for target status {target_status.value}")
+            allowed_targets = self.TRANSITION_RULES.get(current_status, set())
+            if target_status not in allowed_targets:
+                raise ValueError(f"Request {request_id} cannot transition from {row.status} to {target_status.value}")
+            required_checks = policy_check_service.active_transition_gate_check_names(session, target_status, row.tenant_id)
+            if required_checks:
+                if check_dispatch_service.has_pending_request_check_run(session, row.id):
+                    raise ValueError(f"Request checks are still queued or running for {request_id}. Retry the transition after they complete")
+                try:
+                    policy_check_service.assert_request_transition_ready(session, row.id, target_status, row.tenant_id)
+                except ValueError as exc:
+                    check_dispatch_service.enqueue_request_checks(
+                        session,
+                        request_id,
+                        payload.actor_id,
+                        f"Transition preflight for {target_status.value}",
+                    )
+                    session.commit()
+                    raise ValueError(f"{exc}. Automated evaluation queued") from exc
+            row.status = target_status.value
+            row.updated_at = datetime.now(timezone.utc)
+            row.updated_by = payload.actor_id
+            row.version += 1
+            self._apply_transition_side_effects(session, row, current_status, target_status, payload.actor_id)
+            self._append_event(
+                session=session,
+                request_id=request_id,
+                actor=payload.actor_id,
+                action=f"Transitioned to {target_status.value}",
+                reason_or_evidence=payload.reason,
+            )
+            session.commit()
+            session.refresh(row)
+        return self._request_from_row(row)
+
+    def clone_request(self, request_id: str, payload: CloneRequest, tenant_id: str | None = None) -> RequestRecord:
+        with SessionLocal() as session:
+            source_row = self._get_request_row(session, request_id)
+            self._ensure_request_tenant_access(source_row, tenant_id)
+            now = datetime.now(timezone.utc)
+            next_id = self._next_request_id(session)
+            cloned_row = RequestTable(
+                id=next_id,
+                tenant_id=source_row.tenant_id,
+                request_type=source_row.request_type,
+                template_id=source_row.template_id,
+                template_version=source_row.template_version,
+                title=payload.title or f"{source_row.title} (Clone)",
+                summary=payload.summary or source_row.summary,
+                status=RequestStatus.DRAFT.value,
+                priority=source_row.priority,
+                sla_policy_id=source_row.sla_policy_id,
+                submitter_id=payload.actor_id,
+                owner_team_id=source_row.owner_team_id,
+                owner_user_id=source_row.owner_user_id,
+                workflow_binding_id=source_row.workflow_binding_id,
+                current_run_id=None,
+                policy_context=source_row.policy_context,
+                input_payload=source_row.input_payload,
+                tags=source_row.tags,
+                created_at=now,
+                created_by=payload.actor_id,
+                updated_at=now,
+                updated_by=payload.actor_id,
+                version=1,
+                is_archived=False,
+            )
+            session.add(cloned_row)
+            self._append_event(
+                session=session,
+                request_id=request_id,
+                actor=payload.actor_id,
+                action="Cloned",
+                reason_or_evidence=f"{payload.reason}. Replacement draft: {next_id}",
+            )
+            self._append_relationship(
+                session=session,
+                source_request_id=request_id,
+                target_request_id=next_id,
+                relationship_type="clone",
+                actor_id=payload.actor_id,
+            )
+            self._append_event(
+                session=session,
+                request_id=next_id,
+                actor=payload.actor_id,
+                action="Draft Created",
+                reason_or_evidence=f"Cloned from request {request_id}",
+            )
+            session.commit()
+            session.refresh(cloned_row)
+        return self._request_from_row(cloned_row)
+
+    def supersede_request(self, request_id: str, payload: SupersedeRequest, tenant_id: str | None = None) -> RequestRecord:
+        with SessionLocal() as session:
+            row = self._get_request_row(session, request_id)
+            replacement_row = self._get_request_row(session, payload.replacement_request_id)
+            self._ensure_request_tenant_access(row, tenant_id)
+            self._ensure_request_tenant_access(replacement_row, tenant_id)
+            if replacement_row.id == row.id:
+                raise ValueError("Replacement request must differ from the request being superseded")
+            if row.status in {RequestStatus.ARCHIVED.value, RequestStatus.CANCELED.value, RequestStatus.COMPLETED.value}:
+                raise ValueError(f"Request {request_id} cannot be superseded from status {row.status}")
+            row.status = RequestStatus.ARCHIVED.value
+            row.is_archived = True
+            row.updated_at = datetime.now(timezone.utc)
+            row.updated_by = payload.actor_id
+            row.version += 1
+            self._append_event(
+                session=session,
+                request_id=request_id,
+                actor=payload.actor_id,
+                action="Superseded",
+                reason_or_evidence=f"{payload.reason}. Replacement request: {payload.replacement_request_id}",
+            )
+            self._append_relationship(
+                session=session,
+                source_request_id=request_id,
+                target_request_id=payload.replacement_request_id,
+                relationship_type="supersedes",
+                actor_id=payload.actor_id,
+            )
+            self._append_event(
+                session=session,
+                request_id=payload.replacement_request_id,
+                actor=payload.actor_id,
+                action="Superseding Request Linked",
+                reason_or_evidence=f"Supersedes request {request_id}",
+            )
+            session.commit()
+            session.refresh(row)
+        return self._request_from_row(row)
+
+    @staticmethod
+    def _request_from_row(row: RequestTable) -> RequestRecord:
+        sla_risk_level, sla_risk_reason = GovernanceRepository._compute_sla_risk(row)
+        return RequestRecord.model_validate(
+            {
+                "id": row.id,
+                "tenant_id": row.tenant_id,
+                "request_type": row.request_type,
+                "template_id": row.template_id,
+                "template_version": row.template_version,
+                "title": row.title,
+                "summary": row.summary,
+                "status": row.status,
+                "priority": row.priority,
+                "sla_policy_id": row.sla_policy_id,
+                "submitter_id": row.submitter_id,
+                "owner_team_id": row.owner_team_id,
+                "owner_user_id": row.owner_user_id,
+                "workflow_binding_id": row.workflow_binding_id,
+                "current_run_id": row.current_run_id,
+                "policy_context": row.policy_context,
+                "input_payload": row.input_payload,
+                "tags": row.tags,
+                "created_at": row.created_at,
+                "created_by": row.created_by,
+                "updated_at": row.updated_at,
+                "updated_by": row.updated_by,
+                "version": row.version,
+                "is_archived": row.is_archived,
+                "sla_risk_level": sla_risk_level,
+                "sla_risk_reason": sla_risk_reason,
+            }
+        )
+
+    @classmethod
+    def _compute_sla_risk(cls, row: RequestTable) -> tuple[str | None, str | None]:
+        policy_id = row.sla_policy_id or "sla_standard_v1"
+        policy = cls.SLA_POLICY_RULES.get(policy_id, cls.SLA_POLICY_RULES["sla_standard_v1"])
+        age_hours = max((datetime.now(timezone.utc) - row.updated_at).total_seconds() / 3600, 0)
+        priority = row.priority if row.priority in {"medium", "high", "urgent"} else "medium"
+
+        if row.status == RequestStatus.FAILED.value:
+            return "critical", "Execution failure"
+        if row.priority == RequestPriority.URGENT.value:
+            if age_hours >= 2:
+                return "critical", "Urgent request exceeded rapid-response threshold"
+            return "high", "Urgent priority under active SLA watch"
+        if row.status in {RequestStatus.AWAITING_REVIEW.value, RequestStatus.UNDER_REVIEW.value, RequestStatus.CHANGES_REQUESTED.value}:
+            threshold = policy["review_hours"][priority]
+            if age_hours >= threshold:
+                return "high", "Review delay"
+        if row.status == RequestStatus.PROMOTION_PENDING.value:
+            threshold = policy["promotion_hours"][priority]
+            if age_hours >= threshold:
+                return "high", "Promotion delay"
+        if row.status in {RequestStatus.QUEUED.value, RequestStatus.IN_EXECUTION.value, RequestStatus.AWAITING_INPUT.value}:
+            threshold = policy["execution_hours"][priority]
+            if age_hours >= threshold:
+                return "medium", "Execution delay"
+        return None, None
+
+    @staticmethod
+    def _ensure_request_tenant_access(row: RequestTable | None, tenant_id: str | None) -> None:
+        if row is None:
+            raise StopIteration
+        if tenant_id and row.tenant_id != tenant_id:
+            raise PermissionError(f"Tenant {tenant_id} cannot access request {row.id}")
+
+    @staticmethod
+    def _template_from_row(row: TemplateTable) -> TemplateRecord:
+        return TemplateRecord.model_validate(
+            {
+                "id": row.id,
+                "version": row.version,
+                "name": row.name,
+                "description": row.description,
+                "status": row.status,
+                "schema": row.template_schema,
+                "created_at": row.created_at,
+                "updated_at": row.updated_at,
+            }
+        )
+
+    @staticmethod
+    def _coerce_template_value(field_name: str, field_schema: dict, value):
+        expected_type = field_schema.get("type")
+        if expected_type == "string" and not isinstance(value, str):
+            raise ValueError(f"Template validation failed for {field_name}: expected string")
+        if expected_type == "integer" and (not isinstance(value, int) or isinstance(value, bool)):
+            raise ValueError(f"Template validation failed for {field_name}: expected integer")
+        if expected_type == "number" and (not isinstance(value, (int, float)) or isinstance(value, bool)):
+            raise ValueError(f"Template validation failed for {field_name}: expected number")
+        if expected_type == "boolean" and not isinstance(value, bool):
+            raise ValueError(f"Template validation failed for {field_name}: expected boolean")
+        if expected_type == "array" and not isinstance(value, list):
+            raise ValueError(f"Template validation failed for {field_name}: expected array")
+        if expected_type == "object" and not isinstance(value, dict):
+            raise ValueError(f"Template validation failed for {field_name}: expected object")
+        allowed_values = field_schema.get("enum")
+        if allowed_values and value not in allowed_values:
+            raise ValueError(f"Template validation failed for {field_name}: expected one of {', '.join(str(item) for item in allowed_values)}")
+        if isinstance(value, str):
+            min_length = field_schema.get("min_length")
+            max_length = field_schema.get("max_length")
+            pattern = field_schema.get("pattern")
+            if min_length is not None and len(value.strip()) < int(min_length):
+                raise ValueError(f"Template validation failed for {field_name}: minimum length is {min_length}")
+            if max_length is not None and len(value) > int(max_length):
+                raise ValueError(f"Template validation failed for {field_name}: maximum length is {max_length}")
+            if pattern and not re.fullmatch(str(pattern), value):
+                raise ValueError(f"Template validation failed for {field_name}: does not match required format")
+        return value
+
+    @staticmethod
+    def _conditional_rule_matches(rule: dict, field_values: dict) -> bool:
+        when = rule.get("when", {})
+        field_name = when.get("field")
+        if not field_name:
+            return False
+        current_value = field_values.get(field_name)
+        if "equals" in when:
+            return current_value == when.get("equals")
+        if "not_equals" in when:
+            return current_value != when.get("not_equals")
+        if "in" in when:
+            return current_value in when.get("in", [])
+        return False
+
+    def _validate_template_payload(self, template_schema: dict, payload: dict, *, require_required: bool) -> dict:
+        properties = template_schema.get("properties", {})
+        required_fields = set(template_schema.get("required", []))
+        conditional_required = template_schema.get("conditional_required", [])
+        normalized = deepcopy(payload)
+
+        for field_name, field_schema in properties.items():
+            if field_name not in normalized and "default" in field_schema:
+                normalized[field_name] = deepcopy(field_schema["default"])
+
+        for field_name in required_fields:
+            value = normalized.get(field_name)
+            if require_required and (value is None or (isinstance(value, str) and not value.strip())):
+                raise ValueError(f"Template validation failed for {field_name}: field is required")
+
+        for rule in conditional_required:
+            target_field = rule.get("field")
+            if not target_field or not self._conditional_rule_matches(rule, normalized):
+                continue
+            value = normalized.get(target_field)
+            if require_required and (value is None or (isinstance(value, str) and not value.strip())):
+                raise ValueError(rule.get("message") or f"Template validation failed for {target_field}: field is required")
+
+        for field_name, value in list(normalized.items()):
+            field_schema = properties.get(field_name)
+            if field_schema is None:
+                continue
+            normalized[field_name] = self._coerce_template_value(field_name, field_schema, value)
+
+        return normalized
+
+    def _validate_template_definition(self, template_schema: dict) -> TemplateValidationResult:
+        issues: list[TemplateValidationIssue] = []
+        if not isinstance(template_schema, dict):
+            return TemplateValidationResult(
+                valid=False,
+                issues=[TemplateValidationIssue(level="error", path="schema", message="Template schema must be an object.")],
+                preview=TemplateValidationPreview(field_count=0, required_fields=[], conditional_rule_count=0, routed_fields=[], fields=[]),
+            )
+
+        properties = template_schema.get("properties", {})
+        required_fields = template_schema.get("required", [])
+        conditional_required = template_schema.get("conditional_required", [])
+        routing = template_schema.get("routing", {})
+
+        if not isinstance(properties, dict):
+            issues.append(TemplateValidationIssue(level="error", path="schema.properties", message="Properties must be an object."))
+            properties = {}
+        if not isinstance(required_fields, list):
+            issues.append(TemplateValidationIssue(level="error", path="schema.required", message="Required must be a list of field keys."))
+            required_fields = []
+        if not isinstance(conditional_required, list):
+            issues.append(TemplateValidationIssue(level="error", path="schema.conditional_required", message="Conditional rules must be a list."))
+            conditional_required = []
+        if not isinstance(routing, dict):
+            issues.append(TemplateValidationIssue(level="error", path="schema.routing", message="Routing must be an object."))
+            routing = {}
+
+        allowed_types = {"string", "number", "integer", "boolean"}
+        property_keys = set(properties.keys())
+        preview_fields: list[TemplateValidationPreviewField] = []
+        routing_rule_count = 0
+
+        for key, definition in properties.items():
+            if not isinstance(definition, dict):
+                issues.append(TemplateValidationIssue(level="error", path=f"schema.properties.{key}", message="Field definition must be an object."))
+                continue
+            field_type = str(definition.get("type", "") or "")
+            if field_type not in allowed_types:
+                issues.append(TemplateValidationIssue(level="error", path=f"schema.properties.{key}.type", message=f"Unsupported field type {field_type or '<missing>'}."))
+            if "title" not in definition:
+                issues.append(TemplateValidationIssue(level="warning", path=f"schema.properties.{key}.title", message="Field title is missing."))
+            enum_values = definition.get("enum", [])
+            if enum_values and not isinstance(enum_values, list):
+                issues.append(TemplateValidationIssue(level="error", path=f"schema.properties.{key}.enum", message="Enum must be a list."))
+            if isinstance(definition.get("min_length"), int) and isinstance(definition.get("max_length"), int):
+                if int(definition["min_length"]) > int(definition["max_length"]):
+                    issues.append(TemplateValidationIssue(level="error", path=f"schema.properties.{key}", message="min_length cannot exceed max_length."))
+            preview_fields.append(
+                TemplateValidationPreviewField(
+                    key=key,
+                    title=str(definition.get("title", key)),
+                    field_type=field_type or "unknown",
+                    required=key in required_fields,
+                    default=definition.get("default"),
+                    enum_values=[str(item) for item in enum_values] if isinstance(enum_values, list) else [],
+                    description=str(definition.get("description")) if definition.get("description") is not None else None,
+                )
+            )
+
+        for field in required_fields:
+            if field not in property_keys:
+                issues.append(TemplateValidationIssue(level="error", path="schema.required", message=f"Required field {field} is not defined in properties."))
+
+        for index, rule in enumerate(conditional_required):
+            if not isinstance(rule, dict):
+                issues.append(TemplateValidationIssue(level="error", path=f"schema.conditional_required[{index}]", message="Conditional rule must be an object."))
+                continue
+            when = rule.get("when", {})
+            fields = rule.get("fields")
+            if fields is None and rule.get("field"):
+                fields = [rule.get("field")]
+            when_field = when.get("field") if isinstance(when, dict) else None
+            if when_field not in property_keys:
+                issues.append(TemplateValidationIssue(level="error", path=f"schema.conditional_required[{index}].when.field", message="Conditional rule references an unknown field."))
+            if not isinstance(fields, list) or not fields:
+                issues.append(TemplateValidationIssue(level="error", path=f"schema.conditional_required[{index}].fields", message="Conditional rule must list one or more dependent fields."))
+                continue
+            for field in fields:
+                if field not in property_keys:
+                    issues.append(TemplateValidationIssue(level="error", path=f"schema.conditional_required[{index}].fields", message=f"Conditional field {field} is not defined in properties."))
+
+        routed_fields: set[str] = set()
+        for route_key, route_mapping in routing.items():
+            if route_key == "owner_team":
+                if not isinstance(route_mapping, str) or not route_mapping.strip():
+                    issues.append(TemplateValidationIssue(level="error", path=f"schema.routing.{route_key}", message="owner_team must be a non-empty string."))
+                continue
+            if route_key == "workflow_binding":
+                if not isinstance(route_mapping, str) or not route_mapping.strip():
+                    issues.append(TemplateValidationIssue(level="error", path=f"schema.routing.{route_key}", message="workflow_binding must be a non-empty string."))
+                continue
+            if route_key in {"reviewers", "promotion_approvers"}:
+                if not isinstance(route_mapping, list) or not all(isinstance(item, str) and item.strip() for item in route_mapping):
+                    issues.append(TemplateValidationIssue(level="error", path=f"schema.routing.{route_key}", message=f"{route_key} must be a list of non-empty strings."))
+                continue
+            if not isinstance(route_mapping, dict):
+                issues.append(TemplateValidationIssue(level="error", path=f"schema.routing.{route_key}", message="Routing mapping must be an object."))
+                continue
+            for field_name, field_mapping in route_mapping.items():
+                routed_fields.add(str(field_name))
+                if field_name not in property_keys:
+                    issues.append(TemplateValidationIssue(level="error", path=f"schema.routing.{route_key}.{field_name}", message="Routing references an unknown field."))
+                if not isinstance(field_mapping, dict):
+                    issues.append(TemplateValidationIssue(level="error", path=f"schema.routing.{route_key}.{field_name}", message="Routing field mapping must be an object."))
+                    continue
+                for match_value, target_value in field_mapping.items():
+                    routing_rule_count += 1
+                    if not str(match_value).strip():
+                        issues.append(TemplateValidationIssue(level="error", path=f"schema.routing.{route_key}.{field_name}", message="Routing match value must be non-empty."))
+                    normalized_target = target_value
+                    if isinstance(target_value, dict) and "value" in target_value:
+                        normalized_target = target_value.get("value")
+                    if route_key in {"reviewers_by_field", "promotion_approvers_by_field"}:
+                        if not isinstance(normalized_target, list) or not all(isinstance(item, str) and item.strip() for item in normalized_target):
+                            issues.append(TemplateValidationIssue(level="error", path=f"schema.routing.{route_key}.{field_name}.{match_value}", message="Target value must be a list of non-empty strings."))
+                    else:
+                        if not isinstance(normalized_target, str) or not normalized_target.strip():
+                            issues.append(TemplateValidationIssue(level="error", path=f"schema.routing.{route_key}.{field_name}.{match_value}", message="Target value must be a non-empty string."))
+
+        list_values: dict[str, list[str]] = {}
+        for list_key, label in {
+            "expected_artifact_types": "Expected artifact types",
+            "check_requirements": "Check requirements",
+            "promotion_requirements": "Promotion requirements",
+        }.items():
+            value = template_schema.get(list_key, [])
+            if value is None:
+                list_values[list_key] = []
+                continue
+            if not isinstance(value, list):
+                issues.append(TemplateValidationIssue(level="error", path=f"schema.{list_key}", message=f"{label} must be a list."))
+                list_values[list_key] = []
+                continue
+            normalized_items: list[str] = []
+            seen_items: set[str] = set()
+            for index, item in enumerate(value):
+                if not isinstance(item, str) or not item.strip():
+                    issues.append(TemplateValidationIssue(level="error", path=f"schema.{list_key}[{index}]", message=f"{label} entries must be non-empty strings."))
+                    continue
+                normalized = item.strip()
+                normalized_items.append(normalized)
+                if normalized in seen_items:
+                    issues.append(TemplateValidationIssue(level="warning", path=f"schema.{list_key}[{index}]", message=f"{label} contains duplicate entry {normalized}."))
+                seen_items.add(normalized)
+                if list_key in {"expected_artifact_types", "check_requirements"} and not re.match(r"^[a-z][a-z0-9_:-]*$", normalized):
+                    issues.append(TemplateValidationIssue(level="error", path=f"schema.{list_key}[{index}]", message=f"{label} must use lowercase identifier syntax."))
+                if list_key == "promotion_requirements":
+                    if ":" not in normalized:
+                        issues.append(TemplateValidationIssue(level="error", path=f"schema.{list_key}[{index}]", message="Promotion requirement must use type:value syntax."))
+                    else:
+                        requirement_type, requirement_value = normalized.split(":", 1)
+                        if requirement_type not in {"approval", "check", "segregation_of_duties"}:
+                            issues.append(TemplateValidationIssue(level="warning", path=f"schema.{list_key}[{index}]", message=f"Unknown promotion requirement type {requirement_type}."))
+                        if not requirement_value.strip():
+                            issues.append(TemplateValidationIssue(level="error", path=f"schema.{list_key}[{index}]", message="Promotion requirement value must be non-empty."))
+            list_values[list_key] = normalized_items
+
+        if not property_keys:
+            issues.append(TemplateValidationIssue(level="warning", path="schema.properties", message="Template has no fields defined."))
+        if "expected_artifact_types" in template_schema and not list_values.get("expected_artifact_types"):
+            issues.append(TemplateValidationIssue(level="warning", path="schema.expected_artifact_types", message="No expected artifact types defined."))
+        if "check_requirements" in template_schema and not list_values.get("check_requirements"):
+            issues.append(TemplateValidationIssue(level="warning", path="schema.check_requirements", message="No check requirements defined."))
+        if "promotion_requirements" in template_schema and not list_values.get("promotion_requirements"):
+            issues.append(TemplateValidationIssue(level="warning", path="schema.promotion_requirements", message="No promotion requirements defined."))
+
+        field_order_map = {
+            key: int(definition.get("order"))
+            for key, definition in properties.items()
+            if isinstance(definition, dict) and definition.get("order") is not None
+        }
+        issues.sort(key=lambda issue: (issue.level != "error", issue.path))
+        preview_fields.sort(key=lambda field: (field_order_map.get(field.key, 10_000), field.key))
+        return TemplateValidationResult(
+            valid=not any(issue.level == "error" for issue in issues),
+            issues=issues,
+            preview=TemplateValidationPreview(
+                field_count=len(preview_fields),
+                required_fields=[str(field) for field in required_fields],
+                conditional_rule_count=len(conditional_required) if isinstance(conditional_required, list) else 0,
+                routing_rule_count=routing_rule_count,
+                artifact_type_count=len(list_values.get("expected_artifact_types", [])),
+                check_requirement_count=len(list_values.get("check_requirements", [])),
+                promotion_requirement_count=len(list_values.get("promotion_requirements", [])),
+                routed_fields=sorted(routed_fields),
+                fields=preview_fields,
+            ),
+        )
+
+    @staticmethod
+    def _resolve_routing_value(mapping_groups: dict, field_values: dict):
+        for source_field, mapping in mapping_groups.items():
+            field_value = field_values.get(source_field)
+            if isinstance(mapping, dict) and field_value in mapping:
+                target = deepcopy(mapping[field_value])
+                if isinstance(target, dict) and "value" in target:
+                    return deepcopy(target["value"])
+                return target
+        return None
+
+    def _resolve_request_routing(self, template_schema: dict, input_payload: dict) -> dict:
+        routing = template_schema.get("routing", {})
+        owner_team = routing.get("owner_team")
+        if owner_team is None:
+            owner_team = self._resolve_routing_value(routing.get("owner_team_by_field", {}), input_payload)
+
+        workflow_binding = routing.get("workflow_binding")
+        if workflow_binding is None:
+            workflow_binding = self._resolve_routing_value(routing.get("workflow_binding_by_field", {}), input_payload)
+
+        reviewers = routing.get("reviewers")
+        if reviewers is None:
+            reviewers = self._resolve_routing_value(routing.get("reviewers_by_field", {}), input_payload)
+        if not isinstance(reviewers, list):
+            reviewers = []
+
+        promotion_approvers = routing.get("promotion_approvers")
+        if promotion_approvers is None:
+            promotion_approvers = self._resolve_routing_value(routing.get("promotion_approvers_by_field", {}), input_payload)
+        if not isinstance(promotion_approvers, list):
+            promotion_approvers = []
+
+        return {
+            "owner_team_id": owner_team,
+            "workflow_binding_id": workflow_binding,
+            "reviewers": reviewers,
+            "promotion_approvers": promotion_approvers,
+        }
+
+    @staticmethod
+    def _run_detail_from_row(
+        row: RunTable,
+        dispatch_rows: list[RuntimeDispatchTable] | None = None,
+        signal_rows: list[RuntimeSignalTable] | None = None,
+    ) -> RunDetail:
+        return RunDetail.model_validate(
+            {
+                "id": row.id,
+                "request_id": row.request_id,
+                "workflow": row.workflow,
+                "status": row.status,
+                "current_step": row.current_step,
+                "elapsed_time": row.elapsed_time,
+                "waiting_reason": row.waiting_reason,
+                "updated_at": row.updated_at.isoformat().replace("+00:00", "Z"),
+                "owner_team": row.owner_team,
+                "workflow_identity": row.workflow_identity,
+                "progress_percent": row.progress_percent,
+                "current_step_input_summary": row.current_step_input_summary,
+                "current_step_output_summary": row.current_step_output_summary,
+                "failure_reason": row.failure_reason,
+                "command_surface": row.command_surface,
+                "steps": row.steps,
+                "run_context": row.run_context,
+                "conversation_thread_id": row.conversation_thread_id,
+                "runtime_dispatches": [
+                    {
+                        "id": dispatch.id,
+                        "run_id": dispatch.run_id,
+                        "request_id": dispatch.request_id,
+                        "integration_id": dispatch.integration_id,
+                        "dispatch_type": dispatch.dispatch_type,
+                        "status": dispatch.status,
+                        "external_reference": dispatch.external_reference,
+                        "detail": dispatch.detail,
+                        "payload": dispatch.payload,
+                        "response_payload": dispatch.response_payload,
+                        "dispatched_at": dispatch.dispatched_at.isoformat().replace("+00:00", "Z"),
+                    }
+                    for dispatch in (dispatch_rows or [])
+                ],
+                "runtime_signals": [
+                    {
+                        "event_id": signal.event_id,
+                        "source": signal.source,
+                        "status": signal.status,
+                        "current_step": signal.current_step,
+                        "detail": signal.detail,
+                        "payload": signal.payload,
+                        "received_at": signal.received_at.isoformat().replace("+00:00", "Z"),
+                    }
+                    for signal in (signal_rows or [])
+                ],
+            }
+        )
+
+    @staticmethod
+    def _get_request_row(session, request_id: str) -> RequestTable:
+        row = session.get(RequestTable, request_id)
+        if row is None:
+            raise StopIteration(request_id)
+        return row
+
+    def _ensure_request_access(self, session, request_id: str, tenant_id: str | None) -> RequestTable:
+        row = self._get_request_row(session, request_id)
+        self._ensure_request_tenant_access(row, tenant_id)
+        return row
+
+    def _append_event(self, session, request_id: str, actor: str, action: str, reason_or_evidence: str) -> None:
+        request_row = session.get(RequestTable, request_id)
+        if request_row is None:
+            request_row = next(
+                (
+                    candidate
+                    for candidate in session.new
+                    if isinstance(candidate, RequestTable) and candidate.id == request_id
+                ),
+                None,
+            )
+        if request_row is None:
+            raise StopIteration(request_id)
+        session.add(
+            RequestEventTable(
+                request_id=request_id,
+                timestamp=datetime.now(timezone.utc),
+                actor=actor,
+                action=action,
+                object_type="request",
+                object_id=request_id,
+                reason_or_evidence=reason_or_evidence,
+            )
+        )
+        event_store_service.append(
+            session,
+            tenant_id=request_row.tenant_id,
+            event_type="request.event_recorded",
+            aggregate_type="request",
+            aggregate_id=request_id,
+            request_id=request_id,
+            actor=actor,
+            detail=action,
+            payload={"reason_or_evidence": reason_or_evidence, "status": request_row.status},
+        )
+
+    @staticmethod
+    def _next_request_id(session) -> str:
+        return f"req_{uuid4().hex[:12]}"
+
+    @staticmethod
+    def _next_run_id(session) -> str:
+        return f"run_{uuid4().hex[:12]}"
+
+    @staticmethod
+    def _next_review_queue_id(session) -> str:
+        return f"revq_{uuid4().hex[:12]}"
+
+    @staticmethod
+    def _next_promotion_id(session) -> str:
+        return f"pro_{uuid4().hex[:12]}"
+
+    @staticmethod
+    def _next_check_result_id(session) -> str:
+        return f"chk_{uuid4().hex[:12]}"
+
+    @staticmethod
+    def _next_check_override_id(session) -> str:
+        return f"ovr_{uuid4().hex[:12]}"
+
+    @staticmethod
+    def _next_artifact_id(session) -> str:
+        return f"art_{uuid4().hex[:12]}"
+
+    @staticmethod
+    def _next_artifact_version_id(session) -> str:
+        return f"artv_{uuid4().hex[:12]}"
+
+    @staticmethod
+    def _next_deployment_execution_id(session) -> str:
+        return f"dep_{uuid4().hex[:12]}"
+
+    @staticmethod
+    def _next_runtime_dispatch_id(session) -> str:
+        return f"rtd_{uuid4().hex[:12]}"
+
+    @staticmethod
+    def _append_relationship(
+        session,
+        source_request_id: str,
+        target_request_id: str,
+        relationship_type: str,
+        actor_id: str,
+    ) -> None:
+        session.add(
+            RequestRelationshipTable(
+                source_request_id=source_request_id,
+                target_request_id=target_request_id,
+                relationship_type=relationship_type,
+                created_at=datetime.now(timezone.utc),
+                created_by=actor_id,
+            )
+        )
+
+    @staticmethod
+    def _relationship_from_predecessor_row(row: RequestRelationshipTable) -> RequestRelationship:
+        return RequestRelationship(request_id=row.source_request_id, relationship_type=row.relationship_type)
+
+    @staticmethod
+    def _relationship_from_successor_row(row: RequestRelationshipTable) -> RequestRelationship:
+        return RequestRelationship(request_id=row.target_request_id, relationship_type=row.relationship_type)
+
+    @staticmethod
+    def _review_queue_item_from_row(row: ReviewQueueTable, request_row: RequestTable | None) -> ReviewQueueItem:
+        blocking_status = row.blocking_status
+        if not blocking_status and request_row is not None:
+            if request_row.status in {
+                RequestStatus.APPROVED.value,
+                RequestStatus.PROMOTION_PENDING.value,
+                RequestStatus.PROMOTED.value,
+                RequestStatus.COMPLETED.value,
+            }:
+                blocking_status = "Approved"
+        return ReviewQueueItem.model_validate(
+            {
+                "id": row.id,
+                "request_id": row.request_id,
+                "review_scope": row.review_scope,
+                "artifact_or_changeset": row.artifact_or_changeset,
+                "type": row.type,
+                "priority": row.priority,
+                "sla": row.sla,
+                "blocking_status": blocking_status,
+                "assigned_reviewer": row.assigned_reviewer,
+                "stale": row.stale,
+            }
+        )
+
+    def _apply_transition_side_effects(
+        self,
+        session,
+        row: RequestTable,
+        current_status: RequestStatus,
+        target_status: RequestStatus,
+        actor_id: str,
+    ) -> None:
+        if target_status in {RequestStatus.PLANNED, RequestStatus.QUEUED, RequestStatus.IN_EXECUTION, RequestStatus.AWAITING_REVIEW}:
+            self._ensure_run_for_request(session, row, target_status)
+
+        if target_status == RequestStatus.QUEUED:
+            row.workflow_binding_id = row.workflow_binding_id or f"wf_{row.template_id}_{row.template_version.replace('.', '_')}"
+            if row.current_run_id:
+                self._dispatch_run_to_runtime(session, row, row.current_run_id, "enqueue", actor_id)
+
+        if target_status == RequestStatus.IN_EXECUTION and row.current_run_id:
+            self._ensure_artifact_for_request(session, row, actor_id, artifact_status="in_revision", review_state="pending", append_version=True)
+            run_row = session.get(RunTable, row.current_run_id)
+            if run_row is not None:
+                run_row.status = RunStatus.RUNNING.value
+                run_row.current_step = "Execute Governed Workflow"
+                run_row.waiting_reason = None
+                run_row.progress_percent = max(run_row.progress_percent, 35)
+                run_row.current_step_input_summary = "Request entered governed execution."
+                run_row.current_step_output_summary = "Execution in progress."
+                run_row.updated_at = datetime.now(timezone.utc)
+            self._dispatch_run_to_runtime(session, row, row.current_run_id, "start", actor_id)
+
+        if target_status == RequestStatus.AWAITING_REVIEW:
+            artifact_row = self._ensure_artifact_for_request(session, row, actor_id, artifact_status="awaiting_review", review_state="pending", append_version=True)
+            self._ensure_review_queue_item(session, row)
+            check_dispatch_service.enqueue_request_checks(session, row.id, actor_id, "Review-entry request checks queued")
+            review_row = session.scalars(select(ReviewQueueTable).where(ReviewQueueTable.request_id == row.id)).first()
+            if review_row is not None:
+                review_row.artifact_or_changeset = f"{artifact_row.name} {artifact_row.current_version}"
+            if row.current_run_id:
+                run_row = session.get(RunTable, row.current_run_id)
+                if run_row is not None:
+                    run_row.status = RunStatus.WAITING.value
+                    run_row.current_step = "Human Review"
+                    run_row.waiting_reason = "Awaiting reviewer approval"
+                    run_row.progress_percent = max(run_row.progress_percent, 75)
+                    run_row.updated_at = datetime.now(timezone.utc)
+
+        if target_status == RequestStatus.UNDER_REVIEW:
+            self._update_artifact_review_state(session, row.id, artifact_status="under_review", review_state="pending", stale_review=False)
+            self._update_review_queue_status(session, row.id, "Review in progress")
+
+        if target_status == RequestStatus.CHANGES_REQUESTED:
+            self._update_artifact_review_state(session, row.id, artifact_status="changes_requested", review_state="changes_requested", stale_review=True)
+            self._update_review_queue_status(session, row.id, "Changes requested")
+
+        if target_status == RequestStatus.APPROVED:
+            self._update_artifact_review_state(session, row.id, artifact_status="approved", review_state="approved", stale_review=False)
+            self._update_review_queue_status(session, row.id, "Approved")
+            check_dispatch_service.enqueue_request_checks(session, row.id, actor_id, "Approval request checks queued")
+            if row.current_run_id:
+                run_row = session.get(RunTable, row.current_run_id)
+                if run_row is not None:
+                    run_row.status = RunStatus.COMPLETED.value
+                    run_row.current_step = "Review Approved"
+                    run_row.waiting_reason = None
+                    run_row.progress_percent = 100
+                    run_row.current_step_output_summary = "Review approved and ready for promotion or completion."
+                    run_row.updated_at = datetime.now(timezone.utc)
+
+        if target_status == RequestStatus.PROMOTION_PENDING:
+            self._update_artifact_review_state(session, row.id, artifact_status="promotion_pending", review_state="approved", stale_review=False, promotion_relevant=True)
+            self._ensure_promotion_record(session, row, actor_id)
+            promotion_row = session.scalars(select(PromotionTable).where(PromotionTable.request_id == row.id)).first()
+            if promotion_row is not None:
+                check_dispatch_service.enqueue_promotion_checks(session, promotion_row.id, row.id, actor_id, "Promotion gate checks queued")
+
+        if target_status == RequestStatus.PROMOTED:
+            self._update_artifact_review_state(session, row.id, artifact_status="promoted", review_state="approved", stale_review=False, promotion_relevant=True)
+            promotion_row = session.scalars(select(PromotionTable).where(PromotionTable.request_id == row.id)).first()
+            if promotion_row is not None:
+                promotion_row.execution_readiness = "Promotion executed successfully."
+                promotion_history = list(promotion_row.promotion_history)
+                promotion_history.append(
+                    {
+                        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        "actor": actor_id,
+                        "action": "Promotion executed",
+                    }
+                )
+                promotion_row.promotion_history = promotion_history
+
+        if target_status == RequestStatus.COMPLETED and row.current_run_id:
+            self._update_artifact_review_state(session, row.id, artifact_status="completed", review_state="approved", stale_review=False, promotion_relevant=True)
+            run_row = session.get(RunTable, row.current_run_id)
+            if run_row is not None:
+                run_row.status = RunStatus.COMPLETED.value
+                run_row.current_step = "Completed"
+                run_row.waiting_reason = None
+                run_row.progress_percent = 100
+                run_row.updated_at = datetime.now(timezone.utc)
+
+    def _ensure_run_for_request(self, session, row: RequestTable, target_status: RequestStatus) -> None:
+        if row.current_run_id:
+            run_row = session.get(RunTable, row.current_run_id)
+            if run_row is not None:
+                return
+        now = datetime.now(timezone.utc)
+        run_id = self._next_run_id(session)
+        workflow_name = row.template_id.replace("tmpl_", "").replace("_", " ").title()
+        session.add(
+            RunTable(
+                id=run_id,
+                request_id=row.id,
+                workflow=f"{workflow_name} Workflow",
+                status=RunStatus.QUEUED.value if target_status == RequestStatus.QUEUED else RunStatus.RUNNING.value if target_status == RequestStatus.IN_EXECUTION else RunStatus.WAITING.value,
+                current_step="Queue Request" if target_status == RequestStatus.QUEUED else "Execute Governed Workflow" if target_status == RequestStatus.IN_EXECUTION else "Human Review",
+                elapsed_time="0m",
+                waiting_reason="Awaiting execution slot" if target_status == RequestStatus.QUEUED else "Awaiting reviewer approval" if target_status == RequestStatus.AWAITING_REVIEW else None,
+                updated_at=now,
+                owner_team=row.owner_team_id or "team_ops",
+                workflow_identity=row.workflow_binding_id or f"wf_{row.template_id}_{row.template_version.replace('.', '_')}",
+                progress_percent=10 if target_status == RequestStatus.QUEUED else 40 if target_status == RequestStatus.IN_EXECUTION else 80,
+                current_step_input_summary=f"Request {row.id} entered {target_status.value}.",
+                current_step_output_summary="Governed processing initialized.",
+                failure_reason=None,
+                command_surface=["Pause", "Resume", "Retry Step", "Cancel Run"],
+                steps=[
+                    {"id": "step_1", "name": "Queue Request", "status": StepStatus.COMPLETED.value if target_status != RequestStatus.QUEUED else StepStatus.ACTIVE.value, "owner": "system"},
+                    {"id": "step_2", "name": "Execute Governed Workflow", "status": StepStatus.ACTIVE.value if target_status == RequestStatus.IN_EXECUTION else StepStatus.PENDING.value, "owner": "agent-runtime"},
+                    {"id": "step_3", "name": "Human Review", "status": StepStatus.BLOCKED.value if target_status == RequestStatus.AWAITING_REVIEW else StepStatus.PENDING.value, "owner": "review_queue"},
+                ],
+                run_context=[["Template", f"{row.template_id}@{row.template_version}"], ["Priority", row.priority], ["Request Status", target_status.value]],
+                conversation_thread_id=f"thr_{run_id}",
+            )
+        )
+        row.current_run_id = run_id
+
+    def _dispatch_run_to_runtime(self, session, request_row: RequestTable, run_id: str, dispatch_type: str, actor_id: str, force: bool = False) -> None:
+        integration_row = session.scalars(
+            select(IntegrationTable).where(
+                IntegrationTable.tenant_id == request_row.tenant_id,
+                IntegrationTable.type == "runtime",
+                IntegrationTable.status == "connected",
+            )
+        ).first()
+        if integration_row is None:
+            raise ValueError("No connected runtime integration is available for this tenant")
+        existing = session.scalars(
+            select(RuntimeDispatchTable).where(
+                RuntimeDispatchTable.run_id == run_id,
+                RuntimeDispatchTable.dispatch_type == dispatch_type,
+            )
+        ).first()
+        if existing is not None and not force:
+            return
+        payload = {
+            "request_id": request_row.id,
+            "run_id": run_id,
+            "dispatch_type": dispatch_type,
+            "workflow_binding_id": request_row.workflow_binding_id or f"wf_{request_row.template_id}_{request_row.template_version.replace('.', '_')}",
+            "template_id": request_row.template_id,
+            "template_version": request_row.template_version,
+            "priority": request_row.priority,
+            "actor_id": actor_id,
+        }
+        response_payload = runtime_dispatch_service.dispatch(integration_row, payload)
+        session.add(
+            RuntimeDispatchTable(
+                id=self._next_runtime_dispatch_id(session),
+                tenant_id=request_row.tenant_id,
+                run_id=run_id,
+                request_id=request_row.id,
+                integration_id=integration_row.id,
+                dispatch_type=dispatch_type,
+                status=str(response_payload.get("status", "accepted")),
+                external_reference=str(response_payload.get("dispatch_id")) if response_payload.get("dispatch_id") else None,
+                detail=str(response_payload.get("summary", f"Runtime accepted {dispatch_type} dispatch.")),
+                payload=payload,
+                response_payload=response_payload,
+                dispatched_at=datetime.now(timezone.utc),
+            )
+        )
+        event_store_service.append(
+            session,
+            tenant_id=request_row.tenant_id,
+            event_type=f"runtime.dispatch.{dispatch_type}",
+            aggregate_type="run",
+            aggregate_id=run_id,
+            request_id=request_row.id,
+            run_id=run_id,
+            actor=actor_id,
+            detail=str(response_payload.get("summary", f"Runtime accepted {dispatch_type} dispatch.")),
+            payload=payload,
+        )
+        run_row = session.get(RunTable, run_id)
+        if run_row is not None:
+            run_row.current_step_output_summary = str(response_payload.get("summary", run_row.current_step_output_summary))
+            run_row.run_context = [
+                *run_row.run_context,
+                ["Runtime Dispatch", dispatch_type],
+                ["Runtime Reference", str(response_payload.get("dispatch_id", "accepted"))],
+            ]
+
+    def _ensure_artifact_for_request(
+        self,
+        session,
+        row: RequestTable,
+        actor_id: str,
+        artifact_status: str,
+        review_state: str,
+        append_version: bool,
+    ) -> ArtifactTable:
+        artifact_row = session.scalars(select(ArtifactTable).where(ArtifactTable.request_id == row.id).order_by(desc(ArtifactTable.updated_at))).first()
+        now = datetime.now(timezone.utc)
+        if artifact_row is None:
+            artifact_id = self._next_artifact_id(session)
+            version_id = self._next_artifact_version_id(session)
+            label = "v1"
+            content = self._artifact_content_for_request(row, label)
+            content_ref = self._artifact_content_ref(artifact_id, version_id)
+            object_store_service.put_text(content_ref, content)
+            artifact_row = ArtifactTable(
+                id=artifact_id,
+                type=self._artifact_type_for_request(row),
+                name=row.title,
+                current_version=label,
+                status=artifact_status,
+                request_id=row.id,
+                updated_at=now,
+                owner=row.owner_team_id or "team_ops",
+                review_state=review_state,
+                promotion_relevant=False,
+                versions=[
+                    {
+                        "id": version_id,
+                        "label": label,
+                        "status": artifact_status,
+                        "created_at": now.isoformat().replace("+00:00", "Z"),
+                        "author": actor_id,
+                        "summary": f"Initial governed artifact generated for request {row.id}.",
+                        "content": content,
+                        "content_ref": content_ref,
+                    }
+                ],
+                selected_version_id=version_id,
+                stale_review=False,
+            )
+            session.add(artifact_row)
+            self._append_artifact_event(
+                session=session,
+                artifact_id=artifact_id,
+                artifact_version_id=version_id,
+                actor=actor_id,
+                action="Artifact Created",
+                detail=f"Initial artifact {label} created for request {row.id}.",
+            )
+            self._append_artifact_lineage(
+                session=session,
+                artifact_id=artifact_id,
+                from_version_id=None,
+                to_version_id=version_id,
+                relation="generated_from_request",
+            )
+            return artifact_row
+
+        artifact_row.status = artifact_status
+        artifact_row.review_state = review_state
+        artifact_row.updated_at = now
+        if append_version:
+            versions = [dict(version) for version in artifact_row.versions]
+            next_version_number = len(versions) + 1
+            label = f"v{next_version_number}"
+            version_id = self._next_artifact_version_id(session)
+            content = self._artifact_content_for_request(row, label)
+            content_ref = self._artifact_content_ref(artifact_row.id, version_id)
+            object_store_service.put_text(content_ref, content)
+            if versions and versions[-1]["status"] not in {"approved", "promoted", "completed"}:
+                versions[-1]["status"] = "superseded"
+            versions.append(
+                {
+                    "id": version_id,
+                    "label": label,
+                    "status": artifact_status,
+                    "created_at": now.isoformat().replace("+00:00", "Z"),
+                    "author": actor_id,
+                    "summary": f"Governed artifact advanced to {artifact_status}.",
+                    "content": content,
+                    "content_ref": content_ref,
+                }
+            )
+            artifact_row.versions = versions
+            artifact_row.current_version = label
+            artifact_row.selected_version_id = version_id
+            self._append_artifact_event(
+                session=session,
+                artifact_id=artifact_row.id,
+                artifact_version_id=version_id,
+                actor=actor_id,
+                action="Artifact Version Created",
+                detail=f"Artifact advanced to {label} with status {artifact_status}.",
+            )
+            self._append_artifact_lineage(
+                session=session,
+                artifact_id=artifact_row.id,
+                from_version_id=versions[-2]["id"] if len(versions) > 1 else None,
+                to_version_id=version_id,
+                relation="supersedes",
+            )
+        else:
+            versions = [dict(version) for version in artifact_row.versions]
+            if versions:
+                versions[-1]["status"] = artifact_status
+                artifact_row.versions = versions
+        return artifact_row
+
+    def _update_artifact_review_state(
+        self,
+        session,
+        request_id: str,
+        artifact_status: str,
+        review_state: str,
+        stale_review: bool,
+        promotion_relevant: bool | None = None,
+    ) -> None:
+        artifact_row = session.scalars(select(ArtifactTable).where(ArtifactTable.request_id == request_id).order_by(desc(ArtifactTable.updated_at))).first()
+        if artifact_row is None:
+            return
+        artifact_row.status = artifact_status
+        artifact_row.review_state = review_state
+        artifact_row.stale_review = stale_review
+        artifact_row.updated_at = datetime.now(timezone.utc)
+        if promotion_relevant is not None:
+            artifact_row.promotion_relevant = promotion_relevant
+        versions = [dict(version) for version in artifact_row.versions]
+        if versions:
+            versions[-1]["status"] = artifact_status
+            artifact_row.versions = versions
+            self._append_artifact_event(
+                session=session,
+                artifact_id=artifact_row.id,
+                artifact_version_id=versions[-1]["id"],
+                actor="system",
+                action="Artifact Status Updated",
+                detail=f"Artifact status updated to {artifact_status}.",
+            )
+
+    @staticmethod
+    def _artifact_type_for_request(row: RequestTable) -> str:
+        if "assessment" in row.template_id or "assessment" in row.request_type:
+            return "assessment"
+        return "curriculum_unit"
+
+    @staticmethod
+    def _artifact_content_for_request(row: RequestTable, version_label: str) -> str:
+        return (
+            f"{row.title}\n"
+            f"Version: {version_label}\n"
+            f"Template: {row.template_id}@{row.template_version}\n"
+            f"Summary: {row.summary}\n"
+        )
+
+    @staticmethod
+    def _artifact_content_ref(artifact_id: str, version_id: str) -> str:
+        return f"artifacts/{artifact_id}/{version_id}.txt"
+
+    def _append_artifact_event(
+        self,
+        session,
+        artifact_id: str,
+        artifact_version_id: str | None,
+        actor: str,
+        action: str,
+        detail: str,
+    ) -> None:
+        artifact_row = session.get(ArtifactTable, artifact_id)
+        session.add(
+            ArtifactEventTable(
+                artifact_id=artifact_id,
+                artifact_version_id=artifact_version_id,
+                timestamp=datetime.now(timezone.utc),
+                actor=actor,
+                action=action,
+                detail=detail,
+            )
+        )
+        if artifact_row is not None:
+            request_row = self._get_request_row(session, artifact_row.request_id)
+            event_store_service.append(
+                session,
+                tenant_id=request_row.tenant_id,
+                event_type="artifact.event_recorded",
+                aggregate_type="artifact",
+                aggregate_id=artifact_id,
+                request_id=request_row.id,
+                artifact_id=artifact_id,
+                actor=actor,
+                detail=action,
+                payload={"artifact_version_id": artifact_version_id, "message": detail},
+            )
+
+    @staticmethod
+    def _append_artifact_lineage(
+        session,
+        artifact_id: str,
+        from_version_id: str | None,
+        to_version_id: str,
+        relation: str,
+    ) -> None:
+        session.add(
+            ArtifactLineageEdgeTable(
+                artifact_id=artifact_id,
+                from_version_id=from_version_id,
+                to_version_id=to_version_id,
+                relation=relation,
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+
+    @staticmethod
+    def _update_review_queue_status(session, request_id: str, blocking_status: str) -> None:
+        queue_row = session.scalars(select(ReviewQueueTable).where(ReviewQueueTable.request_id == request_id).order_by(desc(ReviewQueueTable.id))).first()
+        if queue_row is not None:
+            queue_row.blocking_status = blocking_status
+            queue_row.stale = blocking_status == "Changes requested"
+
+    def _ensure_review_queue_item(self, session, row: RequestTable) -> None:
+        routing = dict((row.policy_context or {}).get("routing") or {})
+        assigned_reviewer = (routing.get("reviewers") or [row.owner_team_id or "reviewer_queue"])[0]
+        existing = session.scalars(select(ReviewQueueTable).where(ReviewQueueTable.request_id == row.id)).first()
+        if existing is not None:
+            existing.blocking_status = "Blocking request progress"
+            existing.stale = False
+            existing.assigned_reviewer = assigned_reviewer
+            return
+        session.add(
+            ReviewQueueTable(
+                id=self._next_review_queue_id(session),
+                request_id=row.id,
+                review_scope="artifact_version",
+                artifact_or_changeset=f"{row.title} review package",
+                type="governance_review",
+                priority=row.priority,
+                sla="Due in 4h",
+                blocking_status="Blocking request progress",
+                assigned_reviewer=assigned_reviewer,
+                stale=False,
+            )
+        )
+
+    def _ensure_promotion_record(self, session, row: RequestTable, actor_id: str) -> None:
+        routing = dict((row.policy_context or {}).get("routing") or {})
+        promotion_approvers = routing.get("promotion_approvers") or [row.owner_team_id or "ops_reviewer"]
+        existing = session.scalars(select(PromotionTable).where(PromotionTable.request_id == row.id)).first()
+        if existing is not None:
+            existing.required_approvals = [
+                {"reviewer": approver, "state": "pending", "scope": "promotion"} for approver in promotion_approvers
+            ]
+            policy_check_service.ensure_promotion_check_records(session, existing, actor_id)
+            policy_check_service.sync_promotion_checks(session, existing)
+            existing.execution_readiness = self._promotion_readiness_from_db(session, existing)
+            return
+        promotion = PromotionTable(
+            id=self._next_promotion_id(session),
+            request_id=row.id,
+            target="Production Governance Target",
+            strategy="Governed direct promotion",
+            required_checks=[],
+            required_approvals=[
+                {"reviewer": approver, "state": "pending", "scope": "promotion"} for approver in promotion_approvers
+            ],
+            stale_warnings=[],
+            execution_readiness="Blocked until pending checks and approvals are satisfied.",
+            promotion_history=[
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "actor": actor_id,
+                    "action": "Promotion request created",
+                }
+            ],
+        )
+        session.add(promotion)
+        session.flush()
+        policy_check_service.ensure_promotion_check_records(session, promotion, actor_id)
+        policy_check_service.sync_promotion_checks(session, promotion)
+        promotion.execution_readiness = self._promotion_readiness_from_db(session, promotion)
+
+    def _promotion_ready(self, check_rows, override_rows, approvals: list[dict]) -> bool:
+        return policy_check_service.promotion_ready(check_rows, override_rows, approvals)
+
+    def _promotion_readiness(self, check_rows, override_rows, approvals: list[dict]) -> str:
+        return policy_check_service.promotion_readiness(check_rows, override_rows, approvals)
+
+    def _promotion_readiness_from_db(self, session, promotion_row: PromotionTable) -> str:
+        return policy_check_service.promotion_readiness_from_db(session, promotion_row)
+
+    @staticmethod
+    def _next_action_for_request(status: RequestStatus, has_run: bool, has_promotion: bool) -> str:
+        if status == RequestStatus.DRAFT:
+            return "Submit request"
+        if status == RequestStatus.SUBMITTED:
+            return "Validate request"
+        if status == RequestStatus.VALIDATION_FAILED:
+            return "Amend request"
+        if status == RequestStatus.VALIDATED:
+            return "Classify request"
+        if status == RequestStatus.CLASSIFIED:
+            return "Resolve ownership"
+        if status == RequestStatus.OWNERSHIP_RESOLVED:
+            return "Plan workflow"
+        if status == RequestStatus.PLANNED:
+            return "Queue execution"
+        if status == RequestStatus.QUEUED:
+            return "Start governed run" if has_run else "Create governed run"
+        if status == RequestStatus.IN_EXECUTION:
+            return "Monitor active run"
+        if status == RequestStatus.AWAITING_INPUT:
+            return "Provide required input"
+        if status in {RequestStatus.AWAITING_REVIEW, RequestStatus.UNDER_REVIEW}:
+            return "Complete review"
+        if status == RequestStatus.CHANGES_REQUESTED:
+            return "Revise and resubmit"
+        if status == RequestStatus.APPROVED:
+            return "Prepare promotion or completion"
+        if status == RequestStatus.PROMOTION_PENDING:
+            return "Resolve promotion gate" if has_promotion else "Create promotion gate"
+        if status == RequestStatus.PROMOTED:
+            return "Complete request"
+        if status == RequestStatus.FAILED:
+            return "Re-plan or cancel request"
+        if status == RequestStatus.COMPLETED:
+            return "Review completed record"
+        if status == RequestStatus.CANCELED:
+            return "No action required"
+        if status == RequestStatus.ARCHIVED:
+            return "Inspect archived record"
+        if status == RequestStatus.REJECTED:
+            return "Decide whether to supersede or cancel"
+        return "Monitor request"
+
+    @staticmethod
+    def _artifact_record_from_row(row: ArtifactTable) -> ArtifactRecord:
+        return ArtifactRecord.model_validate(
+            {
+                "id": row.id,
+                "type": row.type,
+                "name": row.name,
+                "current_version": row.current_version,
+                "status": row.status,
+                "request_id": row.request_id,
+                "updated_at": row.updated_at.isoformat().replace("+00:00", "Z"),
+                "owner": row.owner,
+                "review_state": row.review_state,
+                "promotion_relevant": row.promotion_relevant,
+            }
+        )
+
+    @staticmethod
+    def _check_run_from_row(row: CheckRunTable) -> CheckRunRecord:
+        return CheckRunRecord.model_validate(
+            {
+                "id": row.id,
+                "request_id": row.request_id,
+                "promotion_id": row.promotion_id,
+                "scope": row.scope,
+                "status": row.status,
+                "trigger_reason": row.trigger_reason,
+                "enqueued_by": row.enqueued_by,
+                "worker_task_id": row.worker_task_id,
+                "error_message": row.error_message,
+                "queued_at": row.queued_at.isoformat().replace("+00:00", "Z"),
+                "started_at": row.started_at.isoformat().replace("+00:00", "Z") if row.started_at else None,
+                "completed_at": row.completed_at.isoformat().replace("+00:00", "Z") if row.completed_at else None,
+            }
+        )
+
+    @staticmethod
+    def _event_ledger_record_from_row(row: EventStoreTable) -> EventLedgerRecord:
+        return EventLedgerRecord.model_validate(
+            {
+                "id": row.id,
+                "tenant_id": row.tenant_id,
+                "event_type": row.event_type,
+                "aggregate_type": row.aggregate_type,
+                "aggregate_id": row.aggregate_id,
+                "request_id": row.request_id,
+                "run_id": row.run_id,
+                "artifact_id": row.artifact_id,
+                "promotion_id": row.promotion_id,
+                "check_run_id": row.check_run_id,
+                "actor": row.actor,
+                "detail": row.detail,
+                "payload": row.payload or {},
+                "occurred_at": row.occurred_at.isoformat().replace("+00:00", "Z"),
+            }
+        )
+
+    @staticmethod
+    def _event_outbox_record_from_row(row: EventOutboxTable) -> EventOutboxRecord:
+        return EventOutboxRecord.model_validate(
+            {
+                "id": row.id,
+                "event_store_id": row.event_store_id,
+                "tenant_id": row.tenant_id,
+                "topic": row.topic,
+                "partition_key": row.partition_key,
+                "payload": row.payload or {},
+                "status": row.status,
+                "backend": row.backend,
+                "error_message": row.error_message,
+                "created_at": row.created_at.isoformat().replace("+00:00", "Z"),
+                "published_at": row.published_at.isoformat().replace("+00:00", "Z") if row.published_at else None,
+            }
+        )
+
+    @staticmethod
+    def _provider_for_integration(row: IntegrationTable | None) -> str | None:
+        if row is None:
+            return None
+        settings = row.settings or {}
+        configured = settings.get("provider")
+        if isinstance(configured, str) and configured:
+            return configured
+        lowered = row.name.lower()
+        if "copilot" in lowered or "microsoft" in lowered:
+            return "microsoft"
+        if "codex" in lowered or "openai" in lowered:
+            return "openai"
+        if "claude" in lowered or "anthropic" in lowered:
+            return "anthropic"
+        return None
+
+    def _validate_integration_configuration(self, integration_type: str, endpoint: str, settings_dict: dict | None) -> None:
+        provider = None
+        if isinstance(settings_dict, dict):
+            configured = settings_dict.get("provider")
+            provider = configured.strip().lower() if isinstance(configured, str) and configured.strip() else None
+
+        if provider == "openai":
+            base_url = integration_security_service.setting(SimpleNamespace(settings=settings_dict), "base_url") or "https://api.openai.com/v1"
+            integration_security_service.validate_outbound_target(
+                base_url,
+                allowed_hosts=settings.integration_openai_allowed_hosts,
+                allow_http_loopback=settings.integration_allow_http_loopback,
+            )
+        elif provider == "anthropic":
+            base_url = integration_security_service.setting(SimpleNamespace(settings=settings_dict), "base_url") or "https://api.anthropic.com/v1"
+            integration_security_service.validate_outbound_target(
+                base_url,
+                allowed_hosts=settings.integration_anthropic_allowed_hosts,
+                allow_http_loopback=settings.integration_allow_http_loopback,
+            )
+        elif provider == "microsoft":
+            base_url = integration_security_service.setting(SimpleNamespace(settings=settings_dict), "base_url") or "https://graph.microsoft.com/beta/copilot"
+            integration_security_service.validate_outbound_target(
+                base_url,
+                allowed_hosts=settings.integration_microsoft_allowed_hosts,
+                allow_http_loopback=settings.integration_allow_http_loopback,
+            )
+
+        if integration_type == "runtime" and endpoint.startswith(("http://", "https://")):
+            integration_security_service.validate_outbound_target(
+                endpoint,
+                allowed_hosts=settings.integration_runtime_allowed_hosts,
+                allow_http_loopback=settings.integration_allow_http_loopback,
+            )
+        if integration_type == "deployment" and endpoint.startswith(("http://", "https://")):
+            integration_security_service.validate_outbound_target(
+                endpoint,
+                allowed_hosts=settings.integration_deployment_allowed_hosts,
+                allow_http_loopback=settings.integration_allow_http_loopback,
+            )
+
+    @staticmethod
+    def _agent_message_from_row(row: AgentSessionMessageTable) -> AgentSessionMessageRecord:
+        return AgentSessionMessageRecord(
+            id=row.id,
+            session_id=row.session_id,
+            request_id=row.request_id,
+            sender_type=row.sender_type,
+            sender_id=row.sender_id,
+            message_type=row.message_type,
+            body=row.body,
+            created_at=row.created_at.isoformat().replace("+00:00", "Z"),
+        )
+
+    def _agent_session_from_row(
+        self,
+        row: AgentSessionTable,
+        integration_row: IntegrationTable | None,
+        message_rows: list[AgentSessionMessageTable] | None = None,
+    ) -> AgentSessionRecord:
+        ordered_messages = list(sorted(message_rows or [], key=lambda item: item.created_at))
+        latest_message = self._agent_message_from_row(ordered_messages[-1]) if ordered_messages else None
+        return AgentSessionRecord(
+            id=row.id,
+            request_id=row.request_id,
+            integration_id=row.integration_id,
+            integration_name=integration_row.name if integration_row else row.integration_id,
+            agent_label=row.agent_label,
+            provider=self._provider_for_integration(integration_row),
+            status=row.status,
+            awaiting_human=row.awaiting_human,
+            summary=row.summary,
+            external_session_ref=row.external_session_ref,
+            resume_request_status=row.resume_request_status,
+            assigned_by=row.assigned_by,
+            assigned_at=row.assigned_at.isoformat().replace("+00:00", "Z"),
+            updated_at=row.updated_at.isoformat().replace("+00:00", "Z"),
+            latest_message=latest_message,
+            message_count=len(ordered_messages),
+        )
+
+    @staticmethod
+    def _agent_transcript_from_rows(rows: list[AgentSessionMessageTable]) -> list[dict[str, str]]:
+        transcript: list[dict[str, str]] = []
+        for row in sorted(rows, key=lambda item: item.created_at):
+            role = "assistant" if row.sender_type == "agent" else "user"
+            transcript.append({"role": role, "content": row.body})
+        return transcript
+
+    def _artifact_detail_from_row(
+        self,
+        row: ArtifactTable,
+        event_rows: list[ArtifactEventTable] | None = None,
+        lineage_rows: list[ArtifactLineageEdgeTable] | None = None,
+    ) -> ArtifactDetail:
+        versions = []
+        for version in row.versions:
+            hydrated_version = dict(version)
+            content_ref = hydrated_version.get("content_ref")
+            if content_ref and object_store_service.exists(content_ref):
+                hydrated_version["content"] = object_store_service.get_text(content_ref)
+            versions.append(hydrated_version)
+        return ArtifactDetail.model_validate(
+            {
+                "artifact": self._artifact_record_from_row(row),
+                "versions": versions,
+                "selected_version_id": row.selected_version_id,
+                "review_state": row.review_state,
+                "stale_review": row.stale_review,
+                "history": [
+                    ArtifactEvent(
+                        timestamp=event_row.timestamp.isoformat().replace("+00:00", "Z"),
+                        actor=event_row.actor,
+                        action=event_row.action,
+                        detail=event_row.detail,
+                        artifact_version_id=event_row.artifact_version_id,
+                    )
+                    for event_row in (event_rows or [])
+                ],
+                "lineage": [
+                    ArtifactLineageEdge(
+                        from_version_id=lineage_row.from_version_id,
+                        to_version_id=lineage_row.to_version_id,
+                        relation=lineage_row.relation,
+                        created_at=lineage_row.created_at.isoformat().replace("+00:00", "Z"),
+                    )
+                    for lineage_row in (lineage_rows or [])
+                ],
+            }
+        )
+
+    @staticmethod
+    def _format_timedelta(value: timedelta) -> str:
+        total_minutes = max(int(value.total_seconds() // 60), 0)
+        hours, minutes = divmod(total_minutes, 60)
+        if hours and minutes:
+            return f"{hours}h {minutes}m"
+        if hours:
+            return f"{hours}h"
+        return f"{minutes}m"
+
+    @staticmethod
+    def _format_percent(numerator: int, denominator: int) -> str:
+        if denominator <= 0:
+            return "0%"
+        return f"{(numerator / denominator) * 100:.0f}%"
+
+    @staticmethod
+    def _capability_record_from_row(row: CapabilityTable) -> CapabilityRecord:
+        return CapabilityRecord.model_validate(
+            {
+                "id": row.id,
+                "name": row.name,
+                "type": row.type,
+                "version": row.version,
+                "status": row.status,
+                "owner": row.owner,
+                "updated_at": row.updated_at.isoformat().replace("+00:00", "Z"),
+                "usage_count": row.usage_count,
+            }
+        )
+
+    def _capability_detail_from_row(self, row: CapabilityTable) -> CapabilityDetail:
+        return CapabilityDetail.model_validate(
+            {
+                "capability": self._capability_record_from_row(row),
+                "definition": row.definition,
+                "lineage": row.lineage,
+                "usage": row.usage,
+                "performance": row.performance,
+                "history": row.history,
+            }
+        )
+
+
+governance_repository = GovernanceRepository()

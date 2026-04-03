@@ -1,0 +1,148 @@
+@startuml
+title Enterprise AI-Buildable Specification Process Flow
+
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam defaultFontName Arial
+skinparam activity {
+  BorderColor #444444
+  BackgroundColor #F8F9FA
+  DiamondBackgroundColor #FFF8E1
+  DiamondBorderColor #B26A00
+  StartColor #2E7D32
+  EndColor #2E7D32
+  BarColor #666666
+  ArrowColor #444444
+}
+
+start
+
+:Define System Constitution;
+note right
+Purpose
+Boundaries
+Invariants
+Governance model
+Lifecycle model
+end note
+
+:Define Requirements;
+note right
+Functional
+Non-functional
+Security
+Identity
+Data governance
+Operations
+end note
+
+:Define Architecture (C4);
+note right
+System Context
+Containers
+Components
+Deployment
+end note
+
+:Define UX Information Architecture;
+note right
+Canonical object model
+Navigation
+Queues
+Drill-down rules
+end note
+
+:Define UX Style Guide;
+note right
+Vocabulary
+Interaction rules
+State visibility
+Anti-patterns
+end note
+
+:Define Design System;
+note right
+Tokens
+Layout
+Components
+States
+Accessibility
+end note
+
+:Define Domain Model;
+note right
+Entities
+Fields
+Enums
+Relationships
+Lifecycle states
+end note
+
+:Define Screen Contracts;
+note right
+Routes
+Purpose
+Data dependencies
+Actions
+UI states
+end note
+
+:Define Component Contracts;
+note right
+Props
+Behavior
+Allowed usage
+Forbidden usage
+end note
+
+:Define Decision Tables;
+note right
+Review rules
+Approval thresholds
+Routing
+Promotion logic
+end note
+
+:Define Integration Contracts;
+note right
+External systems
+Inputs / outputs
+Auth
+Retries
+Ownership of truth
+end note
+
+:Create Execution Specification Pack;
+note right
+API contracts
+Event model
+State transitions
+Permissions
+Concurrency
+Repo structure
+end note
+
+:Define Acceptance & Test Harness;
+note right
+Golden paths
+Edge cases
+Integration tests
+Performance tests
+end note
+
+if (Specification complete and sufficiently unambiguous?) then (yes)
+  :AI Coding Agent Implementation;
+  :Validation Loop;
+  if (Failures, ambiguity, or drift found?) then (yes)
+    :Return to relevant specification stage;
+    -->[refine] :Define Requirements;
+  else (no)
+    :Production-Ready System;
+    stop
+  endif
+else (no)
+  :Refine missing artifacts;
+  --> :Define Requirements;
+endif
+
+@enduml

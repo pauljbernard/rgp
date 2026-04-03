@@ -1,0 +1,163 @@
+@startuml RGP_C4_Deployment
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Deployment.puml
+
+title Request Governance Platform - Deployment Diagram
+
+Person(user, "Users", "Submitters, reviewers, operators, executives, administrators")
+
+Deployment_Node(client, "Client Devices", "Browser / Desktop / Mobile") {
+  Container(client_app, "Web Browser / Client", "HTTPS Client", "Accesses RGP web UI and APIs")
+}
+
+Deployment_Node(identity, "Enterprise Identity", "OIDC / SAML / SCIM") {
+  System_Ext(idp, "Identity Provider", "Authentication, federation, provisioning")
+}
+
+Deployment_Node(azure, "Azure Subscription", "Primary cloud environment") {
+
+  Deployment_Node(edge, "Edge / Ingress", "Azure Front Door / WAF / API Gateway") {
+    Container(frontdoor, "Ingress Gateway", "Managed ingress", "TLS termination, routing, WAF, API protection")
+  }
+
+  Deployment_Node(apps, "Application Tier", "AKS / App Service / Container Apps") {
+    Container(web, "RGP Web Application", "React / Next.js", "User interface for requests, reviews, promotion, and analytics")
+    Container(api, "Governance API", "FastAPI / .NET API", "Primary governance and control plane API")
+    Container(coord, "Coordination Service", "Service", "Workflow binding, dispatch, signal normalization")
+    Container(conv, "Conversation & Command Service", "Service", "Scoped conversations and command handling")
+    Container(review, "Review & Promotion Service", "Service", "Review routing, stale detection, approvals, promotion gates")
+    Container(cap, "Capability Registry Service", "Service", "Tracks agents, workflows, tools, templates, policies")
+    Container(policysvc, "Policy & Check Service", "Service", "Checks, policy evaluation, overrides")
+    Container(analytics, "Workflow Intelligence Service", "Service", "Lifecycle metrics, bottlenecks, trends, forecasting")
+    Container(notifier, "Notification Service", "Service", "Email, chat, webhook, escalation delivery")
+  }
+
+  Deployment_Node(async, "Async & Streaming Tier", "Eventing / Queueing") {
+    Container(queue, "Message Bus", "Service Bus / Kafka / Event Hubs", "Async jobs, runtime signal ingestion, analytics pipelines")
+  }
+
+  Deployment_Node(data, "Data Tier", "Managed data services") {
+    ContainerDb(operationaldb, "Operational Database", "Azure Database for PostgreSQL", "Requests, templates, state, reviews, promotions")
+    ContainerDb(eventstore, "Event Store", "Event DB / append-only store", "Immutable governance event streams")
+    ContainerDb(metricsdb, "Metrics Warehouse", "Lakehouse / analytical DB", "Workflow intelligence and historical aggregates")
+    ContainerDb(cache, "Cache", "Redis", "Session, read acceleration, transient coordination data")
+    ContainerDb(artifactstore, "Artifact Store", "Azure Blob Storage", "Artifacts, reports, diffs, exported evidence")
+    ContainerDb(secretstore, "Secret Store", "Azure Key Vault", "Secrets, keys, certificates")
+  }
+
+  Deployment_Node(obs, "Observability Tier", "Monitoring and tracing") {
+    Container(monitor, "Monitoring & Logging", "Azure Monitor / Log Analytics", "Metrics, logs, alerts, dashboards")
+    Container(trace, "Tracing", "OpenTelemetry collector / tracing backend", "End-to-end trace correlation")
+  }
+}
+
+Deployment_Node(foundry_env, "Microsoft Foundry", "Managed runtime substrate") {
+  System_Ext(foundry, "Foundry Agent Runtime", "Hosted agent execution runtime")
+}
+
+Deployment_Node(maf_env, "Agent Framework Runtime", "Workflow execution substrate") {
+  System_Ext(maf, "Agent Framework Workflows", "Workflow orchestration and multi-agent coordination")
+}
+
+Deployment_Node(github_env, "GitHub", "External engineering platform") {
+  System_Ext(github, "GitHub Repositories", "Source code, branches, PR mirroring, repository state")
+  System_Ext(mcp, "GitHub MCP Server", "Repository operations, issues/PR adapters, code actions")
+}
+
+Deployment_Node(policy_ext, "External Policy Services", "Compliance / policy engines") {
+  System_Ext(policy, "External Policy / Compliance Engines", "Policy validation and compliance decisions")
+}
+
+Deployment_Node(notify_ext, "External Notification Channels", "Messaging systems") {
+  System_Ext(email, "Email Provider", "Email delivery")
+  System_Ext(chat, "Chat / Messaging Platform", "Chat alerts and notifications")
+  System_Ext(pager, "Incident / Paging Platform", "Critical escalation and incident routing")
+}
+
+Deployment_Node(bi_ext, "Analytics Consumers", "Optional downstream systems") {
+  System_Ext(bi, "BI / Data Platform", "Executive reporting and enterprise analytics")
+}
+
+Rel(user, client_app, "Uses")
+Rel(client_app, frontdoor, "HTTPS")
+Rel(frontdoor, web, "Routes UI traffic to")
+Rel(frontdoor, api, "Routes API traffic to")
+
+Rel(web, api, "Calls")
+Rel(api, cache, "Reads/Writes")
+Rel(api, operationaldb, "Reads/Writes")
+Rel(api, eventstore, "Appends governance events")
+Rel(api, queue, "Publishes async tasks")
+
+Rel(api, coord, "Invokes")
+Rel(api, conv, "Invokes")
+Rel(api, review, "Invokes")
+Rel(api, cap, "Invokes")
+Rel(api, policysvc, "Invokes")
+Rel(api, analytics, "Queries")
+
+Rel(coord, queue, "Publishes/Consumes dispatch jobs")
+Rel(coord, operationaldb, "Reads/Writes request/run state")
+Rel(coord, eventstore, "Appends normalized execution events")
+Rel(coord, foundry, "Dispatches agent execution to")
+Rel(coord, maf, "Dispatches workflows to")
+Rel(coord, github, "Coordinates repository-backed work through")
+Rel(coord, mcp, "Executes governed repository actions through")
+
+Rel(conv, operationaldb, "Reads/Writes threads and commands")
+Rel(conv, eventstore, "Appends interaction events")
+Rel(conv, queue, "Publishes async notifications")
+
+Rel(review, operationaldb, "Reads/Writes reviews, approvals, promotions")
+Rel(review, eventstore, "Appends review/promotion events")
+Rel(review, policysvc, "Requests check evaluations from")
+
+Rel(cap, operationaldb, "Reads/Writes capability registry")
+Rel(cap, artifactstore, "Stores definition artifacts")
+Rel(cap, eventstore, "Appends capability lifecycle events")
+Rel(cap, foundry, "Deploys hosted agent definitions to")
+Rel(cap, maf, "Publishes workflow definitions to")
+
+Rel(policysvc, operationaldb, "Reads policy bindings and check state")
+Rel(policysvc, eventstore, "Appends check and override events")
+Rel(policysvc, policy, "Calls")
+
+Rel(analytics, eventstore, "Consumes governance event streams from")
+Rel(analytics, operationaldb, "Reads state snapshots from")
+Rel(analytics, metricsdb, "Writes aggregates and trends to")
+Rel(analytics, queue, "Consumes analytics jobs from")
+Rel(analytics, bi, "Publishes curated metrics to")
+
+Rel(notifier, queue, "Consumes notification jobs from")
+Rel(notifier, email, "Sends via")
+Rel(notifier, chat, "Sends via")
+Rel(notifier, pager, "Sends via")
+
+Rel(api, secretstore, "Reads secrets/certs from")
+Rel(coord, secretstore, "Reads credentials from")
+Rel(cap, secretstore, "Reads deployment secrets from")
+Rel(policysvc, secretstore, "Reads external policy credentials from")
+
+Rel(api, monitor, "Emits logs/metrics to")
+Rel(coord, monitor, "Emits logs/metrics to")
+Rel(conv, monitor, "Emits logs/metrics to")
+Rel(review, monitor, "Emits logs/metrics to")
+Rel(cap, monitor, "Emits logs/metrics to")
+Rel(policysvc, monitor, "Emits logs/metrics to")
+Rel(analytics, monitor, "Emits logs/metrics to")
+
+Rel(api, trace, "Emits traces to")
+Rel(coord, trace, "Emits traces to")
+Rel(conv, trace, "Emits traces to")
+Rel(review, trace, "Emits traces to")
+Rel(cap, trace, "Emits traces to")
+Rel(policysvc, trace, "Emits traces to")
+Rel(analytics, trace, "Emits traces to")
+
+Rel(api, idp, "Authenticates via")
+Rel(web, idp, "SSO via")
+Rel(idp, api, "Identity assertions / provisioning")
+
+Rel(mcp, github, "Reads/Writes repository state in")
+Rel(foundry, maf, "Executes workflow-driven agent logic from")
+
+@enduml

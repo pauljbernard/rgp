@@ -1,0 +1,26 @@
+{
+  "name": "rgp",
+  "private": true,
+  "license": "SEE LICENSE IN LICENSE.md",
+  "packageManager": "pnpm@10.7.0",
+  "scripts": {
+    "dev:web": "pnpm --filter @rgp/web dev",
+    "build:web": "pnpm --filter @rgp/web build",
+    "lint:web": "pnpm --filter @rgp/web lint",
+    "typecheck:web": "pnpm --filter @rgp/web typecheck",
+    "test:ui": "pnpm --filter @rgp/ui test",
+    "test:ui:coverage": "pnpm --filter @rgp/ui test:coverage",
+    "test:web": "pnpm --filter @rgp/web test",
+    "test:web:coverage": "pnpm --filter @rgp/web test:coverage",
+    "test:api-unit": "bash -lc 'cd /Volumes/data/development/rgp/apps/api && source .venv/bin/activate && cd /Volumes/data/development/rgp && python -m unittest discover -s tests/unit -p \"test_*.py\" -v'",
+    "test:api-unit:coverage": "bash -lc 'cd /Volumes/data/development/rgp/apps/api && source .venv/bin/activate && cd /Volumes/data/development/rgp && mkdir -p coverage && python -m coverage run --source=app.services,app.core -m unittest discover -s tests/unit -p \"test_*.py\" -v && python -m coverage json -o coverage/api-unit-coverage.json'",
+    "test:unit": "pnpm test:ui && pnpm test:web && pnpm test:api-unit",
+    "test:unit:coverage": "pnpm test:ui:coverage && pnpm test:web:coverage && pnpm test:api-unit:coverage && node scripts/report-unit-coverage.mjs",
+    "test:integration": "bash -lc 'cd /Volumes/data/development/rgp/apps/api && source .venv/bin/activate && cd /Volumes/data/development/rgp && python -m unittest discover -s tests/integration -p \"test_*.py\" -v'",
+    "test:performance": "bash -lc 'cd /Volumes/data/development/rgp/apps/api && source .venv/bin/activate && cd /Volumes/data/development/rgp && python -m unittest discover -s tests/performance -p \"test_*.py\" -v'",
+    "test:journey": "pnpm --filter @rgp/web test:journey",
+    "test:security": "bash -lc 'cd /Volumes/data/development/rgp/apps/api && source .venv/bin/activate && cd /Volumes/data/development/rgp && python scripts/security_scan.py'",
+    "test:comprehensive": "pnpm test:unit && pnpm test:integration && pnpm test:performance && pnpm test:journey && pnpm test:security",
+    "check": "pnpm lint:web && pnpm typecheck:web && pnpm build:web"
+  }
+}
