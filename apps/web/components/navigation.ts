@@ -7,5 +7,6 @@ export const primaryNavItems = [
   { label: "Capabilities", href: "/capabilities" },
   { label: "Workspaces", href: "/workspaces" },
   { label: "Analytics", href: "/analytics/workflows" },
+  { label: "Help", href: "/help" },
   { label: "Admin", href: "/admin/templates" }
 ] as const;

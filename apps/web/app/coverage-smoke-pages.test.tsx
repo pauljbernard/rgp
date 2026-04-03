@@ -17,6 +17,12 @@ import ArtifactsPage from "./artifacts/page";
 import ArtifactDetailPage from "./artifacts/[artifactId]/page";
 import CapabilitiesPage from "./capabilities/page";
 import CapabilityDetailPage from "./capabilities/[capabilityId]/page";
+import HelpAnalyticsPage from "./help/analytics/page";
+import HelpAdminPage from "./help/admin/page";
+import HelpJourneysPage from "./help/journeys/page";
+import HelpOperationsPage from "./help/operations/page";
+import HelpOverviewPage from "./help/page";
+import HelpRequestsPage from "./help/requests/page";
 import PromotionPage from "./promotions/[promotionId]/page";
 import PromotionPendingPage from "./promotions/pending/page";
 import RequestAgentsPage from "./requests/[requestId]/agents/page";
@@ -338,6 +344,32 @@ describe("coverage smoke pages", () => {
 
     render(await BottleneckAnalyticsPage({ searchParams: Promise.resolve({ days: "30" }) }));
     expect(screen.getByText("Bottleneck Analytics")).toBeInTheDocument();
+  });
+
+  it("renders help pages", async () => {
+    render(await HelpOverviewPage());
+    expect(screen.getByText("Help and User Guide")).toBeInTheDocument();
+    expect(screen.getByText("Guide Map")).toBeInTheDocument();
+
+    render(await HelpRequestsPage());
+    expect(screen.getByText("Help: Requests")).toBeInTheDocument();
+    expect(screen.getByText("Create Request Form")).toBeInTheDocument();
+
+    render(await HelpOperationsPage());
+    expect(screen.getByText("Help: Operations")).toBeInTheDocument();
+    expect(screen.getByText("Operational Areas")).toBeInTheDocument();
+
+    render(await HelpAdminPage());
+    expect(screen.getByText("Help: Admin")).toBeInTheDocument();
+    expect(screen.getByText("Admin Areas")).toBeInTheDocument();
+
+    render(await HelpAnalyticsPage());
+    expect(screen.getByText("Help: Analytics")).toBeInTheDocument();
+    expect(screen.getByText("Analytics Pages")).toBeInTheDocument();
+
+    render(await HelpJourneysPage());
+    expect(screen.getByText("Help: User Journeys")).toBeInTheDocument();
+    expect(screen.getByText("Supported User Journeys")).toBeInTheDocument();
   });
 
   it("renders request pages", async () => {
