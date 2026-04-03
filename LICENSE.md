@@ -64,5 +64,5 @@ Commercial exceptions, separate commercial licenses, and any future relicensing 
 
 Outside contributions are accepted only under terms that preserve those rights. See:
 
-- [CONTRIBUTING.md](/Volumes/data/development/rgp/CONTRIBUTING.md)
-- [CLA.md](/Volumes/data/development/rgp/CLA.md)
+- [CONTRIBUTING.md](./CONTRIBUTING.md)
+- [CLA.md](./CLA.md)

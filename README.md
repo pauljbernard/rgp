@@ -96,14 +96,14 @@ This repository uses a split licensing model.
 Commercial use is not permitted under the public repository licenses.
 
 This is a noncommercial source-available posture, not an OSI-approved open-source software
-license. See [LICENSE.md](/Volumes/data/development/rgp/LICENSE.md).
+license. See [LICENSE.md](./LICENSE.md).
 
 ## Contributions And Commercial Rights
 
 Outside contributions are accepted only under the repository's contributor policy and CLA:
 
-- [CONTRIBUTING.md](/Volumes/data/development/rgp/CONTRIBUTING.md)
-- [CLA.md](/Volumes/data/development/rgp/CLA.md)
+- [CONTRIBUTING.md](./CONTRIBUTING.md)
+- [CLA.md](./CLA.md)
 
 In substance:
 

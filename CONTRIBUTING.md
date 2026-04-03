@@ -8,7 +8,7 @@ Before any outside contribution is accepted, contributors must agree to the repo
 
 By submitting a pull request, patch, documentation change, issue-attached code sample, or any other contribution intended for inclusion in this repository, you represent that you have the legal right to submit that contribution and you agree to the terms in:
 
-- [CLA.md](/Volumes/data/development/rgp/CLA.md)
+- [CLA.md](./CLA.md)
 
 If you do not agree to those terms, do not submit a contribution for inclusion in this repository.
 
