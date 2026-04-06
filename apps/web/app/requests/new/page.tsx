@@ -154,14 +154,19 @@ export default async function NewRequestPage({
                   Start the request by choosing the published template that defines its intake, routing, and governance rules.
                 </p>
               </div>
-              {selectedTemplate ? (
-                <a
-                  href={`/requests/new?template=${encodeURIComponent(`${selectedTemplate.id}@${selectedTemplate.version}`)}`}
-                  className="rounded-md border border-chrome bg-white px-3 py-2 text-sm font-medium text-slate-700"
-                >
-                  Back to Form
+              <div className="flex items-center gap-2">
+                {selectedTemplate ? (
+                  <a
+                    href={`/requests/new?template=${encodeURIComponent(`${selectedTemplate.id}@${selectedTemplate.version}`)}`}
+                    className="rounded-md border border-chrome bg-white px-3 py-2 text-sm font-medium text-slate-700"
+                  >
+                    Back to Form
+                  </a>
+                ) : null}
+                <a href="/requests" className="rounded-md border border-chrome bg-white px-3 py-2 text-sm font-medium text-slate-700">
+                  Close
                 </a>
-              ) : null}
+              </div>
             </div>
             {errorMessage ? (
               <div className="mt-4 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">

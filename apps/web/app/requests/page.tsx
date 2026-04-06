@@ -6,6 +6,7 @@ import { Badge, DataTable, FilterPanel, MetricStack, PageShell, QueueTabs, Secti
 const requestQueueTabs = [
   { key: "all", label: "All Requests", href: "/requests" },
   { key: "blocked", label: "Blocked Requests", href: "/requests/blocked" },
+  { key: "federated-conflicts", label: "Federated Conflicts", href: "/requests/federated-conflicts" },
   { key: "promotion", label: "Promotion Pending", href: "/promotions/pending" },
   { key: "sla-risk", label: "SLA Risk", href: "/requests/sla-risk" }
 ];
@@ -13,7 +14,7 @@ const requestQueueTabs = [
 export default async function RequestsPage({
   searchParams
 }: {
-  searchParams: Promise<{ status?: string; owner_team_id?: string; workflow?: string; request_id?: string; page?: string; sort?: string; order?: string; selected?: string; cols?: string }>;
+  searchParams: Promise<{ status?: string; owner_team_id?: string; workflow?: string; request_id?: string; federation?: string; page?: string; sort?: string; order?: string; selected?: string; cols?: string }>;
 }) {
   const filters = await searchParams;
   const page = Number(filters.page ?? "1") || 1;
@@ -21,7 +22,7 @@ export default async function RequestsPage({
   const sort = filters.sort ?? "updated_at";
   const order = filters.order === "asc" ? "asc" : "desc";
   const selectedKeys = (filters.selected ?? "").split(",").filter(Boolean);
-  const defaultColumns = ["id", "type", "title", "status", "owner", "priority", "workflow", "phase", "blocking", "sla", "updated"];
+  const defaultColumns = ["id", "type", "title", "status", "owner", "priority", "workflow", "federation", "phase", "blocking", "sla", "updated"];
   const visibleColumnKeys = new Set((filters.cols ?? defaultColumns.join(",")).split(",").filter(Boolean));
   const sortedItems = [...data.items].sort((left, right) => {
     const direction = order === "asc" ? 1 : -1;
@@ -73,6 +74,7 @@ export default async function RequestsPage({
     { key: "owner", label: "Owner" },
     { key: "priority", label: "Priority" },
     { key: "workflow", label: "Workflow" },
+    { key: "federation", label: "Federation" },
     { key: "phase", label: "Phase" },
     { key: "blocking", label: "Blocking" },
     { key: "sla", label: "SLA Risk" },
@@ -100,11 +102,12 @@ export default async function RequestsPage({
             { label: "Status", value: filters.status ?? "All", active: Boolean(filters.status) },
             { label: "Priority", value: "Use table sorting", active: false },
             { label: "Owner", value: filters.owner_team_id ?? "All teams", active: Boolean(filters.owner_team_id) },
-            { label: "Workflow", value: filters.workflow ?? "All workflows", active: Boolean(filters.workflow) }
+            { label: "Workflow", value: filters.workflow ?? "All workflows", active: Boolean(filters.workflow) },
+            { label: "Federation", value: filters.federation ?? "All requests", active: Boolean(filters.federation) }
           ]}
           actions={
             <>
-              <Link href={withPage(1, { status: undefined })} className="rounded-md border border-chrome bg-white px-3 py-1.5 text-xs font-medium text-slate-700">
+              <Link href={withPage(1, { status: undefined, federation: undefined })} className="rounded-md border border-chrome bg-white px-3 py-1.5 text-xs font-medium text-slate-700">
                 Clear
               </Link>
               <Link href={withPage(1, { status: "awaiting_review" })} className="rounded-md border border-chrome bg-white px-3 py-1.5 text-xs font-medium text-slate-700">
@@ -113,10 +116,13 @@ export default async function RequestsPage({
               <Link href={withPage(1, { status: "promotion_pending" })} className="rounded-md border border-chrome bg-white px-3 py-1.5 text-xs font-medium text-slate-700">
                 Promotion Pending
               </Link>
+              <Link href={withPage(1, { federation: "with_conflict" })} className="rounded-md border border-chrome bg-white px-3 py-1.5 text-xs font-medium text-slate-700">
+                Federated Conflicts
+              </Link>
             </>
           }
         />
-        <form method="get" className="grid gap-3 rounded-xl border border-chrome bg-panel px-5 py-4 shadow-panel md:grid-cols-4">
+        <form method="get" className="grid gap-3 rounded-xl border border-chrome bg-panel px-5 py-4 shadow-panel md:grid-cols-5">
           <label className="grid gap-1 text-sm text-slate-700">
             <span className="text-xs font-medium text-slate-500">Status</span>
             <select name="status" defaultValue={filters.status ?? ""} className="rounded-md border border-chrome bg-white px-3 py-2">
@@ -139,7 +145,15 @@ export default async function RequestsPage({
             <span className="text-xs font-medium text-slate-500">Workflow</span>
             <input name="workflow" defaultValue={filters.workflow ?? ""} placeholder="wf_curriculum_v3" className="rounded-md border border-chrome bg-white px-3 py-2" />
           </label>
-          <div className="flex items-end gap-2">
+          <label className="grid gap-1 text-sm text-slate-700">
+            <span className="text-xs font-medium text-slate-500">Federation</span>
+            <select name="federation" defaultValue={filters.federation ?? ""} className="rounded-md border border-chrome bg-white px-3 py-2">
+              <option value="">All requests</option>
+              <option value="with_projection">Projected to external systems</option>
+              <option value="with_conflict">Federated conflicts</option>
+            </select>
+          </label>
+          <div className="flex items-end gap-2 md:col-span-4">
             <button type="submit" className="rounded-md bg-accent px-4 py-2 text-sm font-semibold text-white">Apply Filters</button>
             <Link href="/requests" className="rounded-md border border-chrome bg-white px-4 py-2 text-sm font-medium text-slate-700">Reset</Link>
           </div>
@@ -194,6 +208,14 @@ export default async function RequestsPage({
             { key: "owner", header: "Owner", sortHref: sortHref("owner_team_id"), sortDirection: sort === "owner_team_id" ? order : undefined, render: (row) => row.owner_team_id ?? "Unassigned" },
             { key: "priority", header: "Priority", sortHref: sortHref("priority"), sortDirection: sort === "priority" ? order : undefined, render: (row) => row.priority },
             { key: "workflow", header: "Workflow", render: (row) => row.workflow_binding_id ?? row.template_id },
+            {
+              key: "federation",
+              header: "Federation",
+              render: (row) =>
+                row.federated_projection_count > 0
+                  ? `${row.federated_projection_count} projection${row.federated_projection_count === 1 ? "" : "s"}${row.federated_conflict_count > 0 ? ` • ${row.federated_conflict_count} conflict${row.federated_conflict_count === 1 ? "" : "s"}` : ""}`
+                  : "None"
+            },
             { key: "phase", header: "Current Phase", render: (row) => (["in_execution", "awaiting_input"].includes(row.status) ? "Execution" : ["awaiting_review", "under_review", "changes_requested"].includes(row.status) ? "Review" : "Intake") },
             { key: "blocking", header: "Blocking Status", render: (row) => (row.status === "changes_requested" ? "Blocked" : row.status === "promotion_pending" ? "Promotion Pending" : "Clear") },
             { key: "sla", header: "SLA Risk", render: (row) => row.sla_risk_level ? `${row.sla_risk_level}: ${row.sla_risk_reason}` : "Normal" },

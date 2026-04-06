@@ -60,6 +60,8 @@ export type RequestRecord = {
   is_archived: boolean;
   sla_risk_level: string | null;
   sla_risk_reason: string | null;
+  federated_projection_count: number;
+  federated_conflict_count: number;
 };
 
 export type RequestDetail = {
@@ -143,6 +145,8 @@ export type RunRecord = {
   waiting_reason: string | null;
   updated_at: string;
   owner_team: string;
+  federated_projection_count: number;
+  federated_conflict_count: number;
 };
 
 export type RunStep = {
@@ -192,6 +196,7 @@ export type RunDetail = RunRecord & {
   conversation_thread_id: string;
   runtime_dispatches: RuntimeDispatchRecord[];
   runtime_signals: RuntimeSignalRecord[];
+  federated_projections: ProjectionMappingRecord[];
 };
 
 export type ArtifactRecord = {
@@ -240,6 +245,217 @@ export type ArtifactLineageEdge = {
   to_version_id: string;
   relation: string;
   created_at: string;
+};
+
+export type KnowledgeArtifactRecord = {
+  id: string;
+  tenant_id: string;
+  name: string;
+  description: string | null;
+  content: string | null;
+  content_type: string;
+  version: number;
+  status: string;
+  policy_scope: Record<string, unknown> | null;
+  provenance: Array<Record<string, unknown>>;
+  tags: string[];
+  created_by: string;
+  created_at: string | null;
+  updated_at: string | null;
+};
+
+export type KnowledgeVersionRecord = {
+  id: string;
+  artifact_id: string;
+  version: number;
+  content: string | null;
+  summary: string | null;
+  author: string;
+  created_at: string | null;
+};
+
+export type PlanningConstructRecord = {
+  id: string;
+  tenant_id: string;
+  type: string;
+  name: string;
+  description: string | null;
+  owner_team_id: string | null;
+  status: string;
+  priority: number;
+  target_date: string | null;
+  capacity_budget: number | null;
+  created_at: string | null;
+  updated_at: string | null;
+};
+
+export type PlanningMembershipRecord = {
+  id: string;
+  planning_construct_id: string;
+  request_id: string;
+  sequence: number;
+  priority: number;
+  added_at: string | null;
+};
+
+export type PlanningProgressRecord = {
+  construct_id: string;
+  total: number;
+  status_counts: Record<string, number>;
+  completion_pct: number;
+};
+
+export type PlanningRoadmapEntry = {
+  id: string;
+  type: string;
+  name: string;
+  status: string;
+  priority: number;
+  target_date: string | null;
+  capacity_budget: number | null;
+  member_count: number;
+  completion_pct: number;
+  completed_count: number;
+  in_progress_count: number;
+  blocked_count: number;
+  schedule_state: string;
+  owner_team_id: string | null;
+};
+
+export type PlanningConstructDetail = {
+  construct: PlanningConstructRecord;
+  memberships: PlanningMembershipRecord[];
+  progress: PlanningProgressRecord;
+};
+
+export type DomainPackRecord = {
+  id: string;
+  tenant_id: string;
+  name: string;
+  version: string;
+  description: string | null;
+  status: string;
+  contributed_templates: string[];
+  contributed_artifact_types: string[];
+  contributed_workflows: string[];
+  contributed_policies: string[];
+  activated_at: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+};
+
+export type DomainPackInstallation = {
+  id: string;
+  tenant_id: string;
+  pack_id: string;
+  installed_version: string;
+  status: string;
+  installed_by: string;
+  installed_at: string | null;
+};
+
+export type DomainPackDetail = {
+  pack: DomainPackRecord;
+  installations: DomainPackInstallation[];
+};
+
+export type DomainPackContributionDelta = {
+  category: string;
+  added: string[];
+  removed: string[];
+};
+
+export type DomainPackComparison = {
+  current_pack_id: string;
+  current_version: string;
+  baseline_pack_id: string | null;
+  baseline_version: string | null;
+  deltas: DomainPackContributionDelta[];
+  summary: string;
+};
+
+export type DomainPackLineageEntry = {
+  pack_id: string;
+  version: string;
+  status: string;
+  created_at: string | null;
+  activated_at: string | null;
+  contribution_count: number;
+};
+
+export type AssignmentGroupRecord = {
+  id: string;
+  tenant_id: string;
+  name: string;
+  skill_tags: string[];
+  max_capacity: number | null;
+  current_load: number;
+  status: string;
+  created_at: string | null;
+};
+
+export type EscalationRuleRecord = {
+  id: string;
+  tenant_id: string;
+  name: string;
+  condition: Record<string, unknown>;
+  escalation_target: string;
+  escalation_type: string;
+  delay_minutes: number;
+  status: string;
+  created_at: string | null;
+};
+
+export type EscalationExecutionRecord = {
+  request_id: string;
+  rule_id: string;
+  escalation_type: string;
+  escalation_target: string;
+  outcome: string;
+  executed_at: string | null;
+};
+
+export type SlaDefinitionRecord = {
+  id: string;
+  tenant_id: string;
+  name: string;
+  scope_type: string;
+  scope_id: string | null;
+  response_target_hours: number | null;
+  resolution_target_hours: number | null;
+  review_deadline_hours: number | null;
+  warning_threshold_pct: number;
+  status: string;
+  created_at: string | null;
+};
+
+export type SlaBreachAuditRecord = {
+  id: string;
+  tenant_id: string;
+  sla_definition_id: string;
+  request_id: string;
+  breach_type: string;
+  target_hours: number;
+  actual_hours: number;
+  severity: string;
+  remediation_action: string | null;
+  breached_at: string | null;
+};
+
+export type RemediateSlaBreachRequest = {
+  remediation_action: string;
+};
+
+export type RoutingRecommendationRecord = {
+  request_id: string;
+  recommended_group_id: string | null;
+  recommended_group_name: string | null;
+  matched_skills: string[];
+  route_basis: string[];
+  current_load: number | null;
+  max_capacity: number | null;
+  sla_status: string;
+  escalation_targets: string[];
 };
 
 export type ReviewQueueItem = {
@@ -376,6 +592,9 @@ export type AnalyticsWorkflowRow = {
   review_delay: string;
   cost_per_execution: string;
   trend: string;
+  federated_projection_count: number;
+  federated_conflict_count: number;
+  federated_coverage: string;
 };
 
 export type AnalyticsAgentRow = {
@@ -704,6 +923,13 @@ export type AuditEntry = {
   object_type: string;
   object_id: string;
   reason_or_evidence: string;
+  event_class: string;
+  source_system?: string | null;
+  integration_id?: string | null;
+  projection_id?: string | null;
+  related_entity_type?: string | null;
+  related_entity_id?: string | null;
+  lineage: string[];
 };
 
 export type PolicyRecord = {
@@ -736,6 +962,35 @@ export type IntegrationRecord = {
   provider?: string | null;
 };
 
+export type ProjectionMappingRecord = {
+  id: string;
+  tenant_id: string;
+  integration_id: string;
+  entity_type: string;
+  entity_id: string;
+  external_system: string;
+  external_ref?: string | null;
+  external_state?: Record<string, unknown> | null;
+  projection_status: string;
+  last_projected_at?: string | null;
+  last_synced_at?: string | null;
+  adapter_type?: string | null;
+  adapter_capabilities: string[];
+  sync_source?: string | null;
+  conflicts: Array<Record<string, unknown>>;
+  supported_resolution_actions: string[];
+  resolution_guidance?: string | null;
+};
+
+export type ReconciliationLogRecord = {
+  id: string;
+  projection_id: string;
+  action: string;
+  detail?: string | null;
+  resolved_by?: string | null;
+  created_at?: string | null;
+};
+
 export type AgentSessionMessageRecord = {
   id: string;
   session_id: string;
@@ -753,6 +1008,8 @@ export type AgentSessionRecord = {
   integration_id: string;
   integration_name: string;
   agent_label: string;
+  collaboration_mode: string;
+  agent_operating_profile: string;
   provider?: string | null;
   status: string;
   awaiting_human: boolean;
@@ -767,6 +1024,50 @@ export type AgentSessionRecord = {
 
 export type AgentSessionDetail = AgentSessionRecord & {
   messages: AgentSessionMessageRecord[];
+};
+
+export type ContextBundleRecord = {
+  id: string;
+  tenant_id: string;
+  request_id: string;
+  session_id?: string | null;
+  version: number;
+  bundle_type: string;
+  contents: Record<string, unknown>;
+  policy_scope?: Record<string, unknown> | null;
+  assembled_by: string;
+  assembled_at?: string | null;
+  provenance: Array<Record<string, unknown>>;
+};
+
+export type ContextAccessLogRecord = {
+  id: string;
+  bundle_id: string;
+  accessor_type: string;
+  accessor_id: string;
+  accessed_resource: string;
+  access_result: string;
+  policy_basis?: Record<string, unknown> | null;
+  accessed_at?: string | null;
+};
+
+export type AgentSessionToolRecord = {
+  name: string;
+  description: string;
+  input_schema: Record<string, unknown>;
+  required_collaboration_mode?: string | null;
+  allowed_roles: string[];
+  availability: string;
+  availability_reason?: string | null;
+};
+
+export type AgentSessionContextDetail = {
+  bundle: ContextBundleRecord;
+  available_tools: AgentSessionToolRecord[];
+  restricted_tools: AgentSessionToolRecord[];
+  degraded_tools: AgentSessionToolRecord[];
+  capability_warnings: string[];
+  access_log: ContextAccessLogRecord[];
 };
 
 export type CreateIntegrationInput = {

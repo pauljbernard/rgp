@@ -39,7 +39,9 @@ vi.mock("@/lib/server-api", () => ({
         version: 1,
         is_archived: false,
         sla_risk_level: "high",
-        sla_risk_reason: "Review delay"
+        sla_risk_reason: "Review delay",
+        federated_projection_count: 2,
+        federated_conflict_count: 1
       }
     ],
     page: 1,
@@ -60,6 +62,8 @@ describe("RequestsPage", () => {
     expect(screen.getByText("Owner Team")).toBeInTheDocument();
     expect(screen.getByRole("row", { name: /team_curriculum_science/ })).toBeInTheDocument();
     expect(screen.getByText("high: Review delay")).toBeInTheDocument();
+    expect(screen.getByText("2 projections • 1 conflict")).toBeInTheDocument();
+    expect(screen.getAllByRole("link", { name: "Federated Conflicts" }).some((link) => link.getAttribute("href") === "/requests/federated-conflicts")).toBe(true);
     expect(screen.getByRole("link", { name: "Create Request" })).toHaveAttribute("href", "/requests/new");
   });
 });

@@ -267,5 +267,42 @@ class SlaEnforcementService:
             rows = q.order_by(SlaBreachAuditTable.breached_at.desc()).all()
             return [_breach_record(r) for r in rows]
 
+    def remediate_breach(
+        self,
+        breach_id: str,
+        remediation_action: str,
+        tenant_id: str,
+        actor: str,
+    ) -> dict:
+        with SessionLocal() as session:
+            row = (
+                session.query(SlaBreachAuditTable)
+                .filter(
+                    SlaBreachAuditTable.id == breach_id,
+                    SlaBreachAuditTable.tenant_id == tenant_id,
+                )
+                .first()
+            )
+            if not row:
+                raise ValueError(f"Unknown SLA breach: {breach_id}")
+
+            row.remediation_action = remediation_action
+            session.flush()
+
+            event_store_service.append(
+                session,
+                tenant_id=tenant_id,
+                event_type="sla.breach_remediated",
+                aggregate_type="sla_breach",
+                aggregate_id=breach_id,
+                actor=actor,
+                detail=f"SLA breach {breach_id} marked as remediated: {remediation_action}",
+                request_id=row.request_id,
+                payload={"remediation_action": remediation_action},
+            )
+            session.commit()
+            session.refresh(row)
+            return _breach_record(row)
+
 
 sla_enforcement_service = SlaEnforcementService()

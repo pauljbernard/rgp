@@ -9,16 +9,21 @@ from uuid import uuid4
 from sqlalchemy import desc, func, select
 
 from app.core.config import settings
-from app.db.models import AgentSessionMessageTable, AgentSessionTable, ArtifactEventTable, ArtifactLineageEdgeTable, ArtifactTable, CapabilityTable, CheckOverrideTable, CheckResultTable, CheckRunTable, DeploymentExecutionTable, EventOutboxTable, EventStoreTable, IntegrationTable, OrganizationTable, PolicyTable, PortfolioScopeTable, PortfolioTable, PromotionTable, RequestEventTable, RequestRelationshipTable, RequestTable, ReviewQueueTable, RunTable, RuntimeDispatchTable, RuntimeSignalTable, TeamMembershipTable, TeamTable, TemplateTable, TenantTable, TransitionGateTable, UserTable
+from app.db.models import AgentSessionMessageTable, AgentSessionTable, ArtifactEventTable, ArtifactLineageEdgeTable, ArtifactTable, CapabilityTable, CheckOverrideTable, CheckResultTable, CheckRunTable, ContextAccessLogTable, ContextBundleTable, DeploymentExecutionTable, EventOutboxTable, EventStoreTable, IntegrationTable, OrganizationTable, PolicyTable, PortfolioScopeTable, PortfolioTable, ProjectionMappingTable, PromotionTable, ReconciliationLogTable, RequestEventTable, RequestRelationshipTable, RequestTable, ReviewQueueTable, RunTable, RuntimeDispatchTable, RuntimeSignalTable, TeamMembershipTable, TeamTable, TemplateTable, TenantTable, TransitionGateTable, UserTable
 from app.db.session import SessionLocal
+from app.domain.mcp.access_control import _mode_satisfies, filter_tools_by_policy
+from app.domain.mcp.registry import mcp_tool_registry
 from app.models.common import PaginatedResponse
+from app.models.context import ContextAccessLogRecord, ContextBundleRecord
 from app.models.security import Principal, PrincipalRole, PublicRegistrationRequest, RegistrationSubmissionResponse
 from app.models.governance import (
     AnalyticsAgentRow,
+    AgentSessionContextDetail,
     AgentSessionDetail,
     AgentSessionMessageCreateRequest,
     AgentSessionMessageRecord,
     AgentSessionRecord,
+    AgentSessionToolRecord,
     AnalyticsBottleneckRow,
     AnalyticsWorkflowRow,
     AgentTrendPoint,
@@ -76,6 +81,7 @@ from app.models.governance import (
     TeamRecord,
     TenantRecord,
     UpdateIntegrationRequest,
+    UpdateAgentSessionGovernanceRequest,
     UpdateOrganizationRequest,
     UpdateTenantRequest,
     UpdateTeamRequest,
@@ -86,6 +92,8 @@ from app.models.governance import (
 )
 from app.models.request import AmendRequest, CancelRequest, CloneRequest, CreateRequestDraft, RequestCheckRun, RequestPriority, RequestRecord, RequestStatus, SubmitRequest, SupersedeRequest, TransitionRequest
 from app.services.check_dispatch_service import check_dispatch_service
+from app.services.collaboration_mode_service import collaboration_mode_service
+from app.services.context_bundle_service import context_bundle_service
 from app.services.deployment_service import deployment_service
 from app.services.agent_provider_service import agent_provider_service
 from app.services.event_store_service import event_store_service
@@ -93,6 +101,7 @@ from app.services.integration_security_service import integration_security_servi
 from app.services.local_account_service import local_account_service
 from app.services.object_store_service import object_store_service
 from app.services.policy_check_service import policy_check_service
+from app.services.projection_service import projection_service
 from app.services.runtime_dispatch_service import runtime_dispatch_service
 from app.domain.state_machine import (
     TRANSITION_RULES as _SM_TRANSITION_RULES,
@@ -146,6 +155,7 @@ class GovernanceRepository:
         owner_team_id: str | None = None,
         workflow: str | None = None,
         request_id: str | None = None,
+        federation: str | None = None,
         tenant_id: str | None = None,
     ) -> PaginatedResponse[RequestRecord]:
         with SessionLocal() as session:
@@ -161,7 +171,16 @@ class GovernanceRepository:
                         select(RunTable).where((RunTable.workflow == workflow) | (RunTable.workflow_identity == workflow))
                     ).all()
                 }
-        records = [self._request_from_row(row) for row in rows]
+            request_ids = [row.id for row in rows]
+            projection_rows = (
+                session.scalars(select(ProjectionMappingTable).where(ProjectionMappingTable.entity_type == "request", ProjectionMappingTable.entity_id.in_(request_ids))).all()
+                if request_ids
+                else []
+            )
+        projections_by_request: dict[str, list[ProjectionMappingTable]] = {}
+        for projection_row in projection_rows:
+            projections_by_request.setdefault(projection_row.entity_id, []).append(projection_row)
+        records = [self._request_from_row(row, projections_by_request.get(row.id, [])) for row in rows]
         if status:
             records = [record for record in records if record.status == status]
         if owner_team_id:
@@ -174,6 +193,10 @@ class GovernanceRepository:
                 for record in records
                 if record.workflow_binding_id == workflow or record.template_id == workflow or (workflow_request_ids and record.id in workflow_request_ids)
             ]
+        if federation == "with_projection":
+            records = [record for record in records if record.federated_projection_count > 0]
+        elif federation == "with_conflict":
+            records = [record for record in records if record.federated_conflict_count > 0]
         return self._paginate(records, page, page_size)
 
     def get_request(self, request_id: str, tenant_id: str | None = None) -> RequestDetail:
@@ -488,6 +511,7 @@ class GovernanceRepository:
         workflow: str | None = None,
         owner: str | None = None,
         request_id: str | None = None,
+        federation: str | None = None,
         tenant_id: str | None = None,
     ) -> PaginatedResponse[RunRecord]:
         with SessionLocal() as session:
@@ -496,39 +520,61 @@ class GovernanceRepository:
                 row.id: row.tenant_id
                 for row in session.scalars(select(RequestTable).where(RequestTable.id.in_([item.request_id for item in rows]))).all()
             } if rows else {}
-        run_details = [self._run_detail_from_row(row) for row in rows]
-        run_rows = [RunRecord.model_validate(detail.model_dump()) for detail in run_details]
+            projection_rows = session.scalars(
+                select(ProjectionMappingTable).where(
+                    ProjectionMappingTable.entity_type == "request",
+                    ProjectionMappingTable.entity_id.in_([item.request_id for item in rows]) if rows else False,
+                )
+            ).all() if rows else []
+        projections_by_request: dict[str, list[ProjectionMappingTable]] = {}
+        for projection in projection_rows:
+            projections_by_request.setdefault(projection.entity_id, []).append(projection)
+        run_details = [self._run_detail_from_row(row, projection_rows=projections_by_request.get(row.request_id, [])) for row in rows]
+        pairs = [(RunRecord.model_validate(detail.model_dump()), detail) for detail in run_details]
         if tenant_id:
-            run_rows = [row for row in run_rows if request_tenant_map.get(row.request_id) == tenant_id]
+            pairs = [(row, detail) for row, detail in pairs if request_tenant_map.get(row.request_id) == tenant_id]
         if status:
-            run_rows = [row for row in run_rows if row.status == status]
+            pairs = [(row, detail) for row, detail in pairs if row.status == status]
         if workflow:
-            run_rows = [
-                row
-                for row, detail in zip(run_rows, run_details, strict=False)
-                if row.workflow == workflow or detail.workflow_identity == workflow
-            ]
+            pairs = [(row, detail) for row, detail in pairs if row.workflow == workflow or detail.workflow_identity == workflow]
         if owner:
-            run_rows = [
-                row
-                for row in run_rows
-                if row.owner_team == owner
-                or any(step.owner == owner for step in self.get_run(row.id).steps)
+            pairs = [
+                (row, detail)
+                for row, detail in pairs
+                if row.owner_team == owner or any(step.owner == owner for step in detail.steps)
             ]
         if request_id:
-            run_rows = [row for row in run_rows if row.request_id == request_id]
-        return self._paginate(run_rows, page, page_size)
+            pairs = [(row, detail) for row, detail in pairs if row.request_id == request_id]
+        if federation == "with_projection":
+            pairs = [(row, detail) for row, detail in pairs if row.federated_projection_count > 0]
+        elif federation == "with_conflict":
+            pairs = [(row, detail) for row, detail in pairs if row.federated_conflict_count > 0]
+        return self._paginate([row for row, _detail in pairs], page, page_size)
 
     def get_run(self, run_id: str, tenant_id: str | None = None) -> RunDetail:
         with SessionLocal() as session:
             row = session.get(RunTable, run_id)
+            request_row = None
             if row is not None:
-                self._ensure_request_access(session, row.request_id, tenant_id)
+                request_row = self._ensure_request_access(session, row.request_id, tenant_id)
             dispatch_rows = session.scalars(select(RuntimeDispatchTable).where(RuntimeDispatchTable.run_id == run_id).order_by(desc(RuntimeDispatchTable.dispatched_at))).all()
             signal_rows = session.scalars(select(RuntimeSignalTable).where(RuntimeSignalTable.run_id == run_id).order_by(desc(RuntimeSignalTable.received_at))).all()
+            projection_rows = (
+                session.scalars(
+                    select(ProjectionMappingTable)
+                    .where(
+                        ProjectionMappingTable.entity_type == "request",
+                        ProjectionMappingTable.entity_id == request_row.id,
+                        ProjectionMappingTable.tenant_id == request_row.tenant_id,
+                    )
+                    .order_by(desc(ProjectionMappingTable.last_synced_at), desc(ProjectionMappingTable.last_projected_at))
+                ).all()
+                if request_row is not None
+                else []
+            )
         if row is None:
             raise StopIteration(run_id)
-        return self._run_detail_from_row(row, dispatch_rows, signal_rows)
+        return self._run_detail_from_row(row, dispatch_rows, signal_rows, projection_rows)
 
     def command_run(self, run_id: str, payload: RunCommandRequest, tenant_id: str | None = None) -> RunDetail:
         with SessionLocal() as session:
@@ -574,9 +620,18 @@ class GovernanceRepository:
             run_row.updated_at = now
             dispatch_rows = session.scalars(select(RuntimeDispatchTable).where(RuntimeDispatchTable.run_id == run_id).order_by(desc(RuntimeDispatchTable.dispatched_at))).all()
             signal_rows = session.scalars(select(RuntimeSignalTable).where(RuntimeSignalTable.run_id == run_id).order_by(desc(RuntimeSignalTable.received_at))).all()
+            projection_rows = session.scalars(
+                select(ProjectionMappingTable)
+                .where(
+                    ProjectionMappingTable.entity_type == "request",
+                    ProjectionMappingTable.entity_id == request_row.id,
+                    ProjectionMappingTable.tenant_id == request_row.tenant_id,
+                )
+                .order_by(desc(ProjectionMappingTable.last_synced_at), desc(ProjectionMappingTable.last_projected_at))
+            ).all()
             session.commit()
             session.refresh(run_row)
-            return self._run_detail_from_row(run_row, dispatch_rows, signal_rows)
+            return self._run_detail_from_row(run_row, dispatch_rows, signal_rows, projection_rows)
 
     def reconcile_run(self, run_id: str, payload: RuntimeRunCallbackRequest) -> RunDetail:
         with SessionLocal() as session:
@@ -593,7 +648,16 @@ class GovernanceRepository:
             if existing_signal is not None:
                 dispatch_rows = session.scalars(select(RuntimeDispatchTable).where(RuntimeDispatchTable.run_id == run_id).order_by(desc(RuntimeDispatchTable.dispatched_at))).all()
                 signal_rows = session.scalars(select(RuntimeSignalTable).where(RuntimeSignalTable.run_id == run_id).order_by(desc(RuntimeSignalTable.received_at))).all()
-                return self._run_detail_from_row(run_row, dispatch_rows, signal_rows)
+                projection_rows = session.scalars(
+                    select(ProjectionMappingTable)
+                    .where(
+                        ProjectionMappingTable.entity_type == "request",
+                        ProjectionMappingTable.entity_id == request_row.id,
+                        ProjectionMappingTable.tenant_id == request_row.tenant_id,
+                    )
+                    .order_by(desc(ProjectionMappingTable.last_synced_at), desc(ProjectionMappingTable.last_projected_at))
+                ).all()
+                return self._run_detail_from_row(run_row, dispatch_rows, signal_rows, projection_rows)
             now = datetime.now(timezone.utc)
             session.add(
                 RuntimeSignalTable(
@@ -659,9 +723,18 @@ class GovernanceRepository:
             session.flush()
             dispatch_rows = session.scalars(select(RuntimeDispatchTable).where(RuntimeDispatchTable.run_id == run_id).order_by(desc(RuntimeDispatchTable.dispatched_at))).all()
             signal_rows = session.scalars(select(RuntimeSignalTable).where(RuntimeSignalTable.run_id == run_id).order_by(desc(RuntimeSignalTable.received_at))).all()
+            projection_rows = session.scalars(
+                select(ProjectionMappingTable)
+                .where(
+                    ProjectionMappingTable.entity_type == "request",
+                    ProjectionMappingTable.entity_id == request_row.id,
+                    ProjectionMappingTable.tenant_id == request_row.tenant_id,
+                )
+                .order_by(desc(ProjectionMappingTable.last_synced_at), desc(ProjectionMappingTable.last_projected_at))
+            ).all()
             session.commit()
             session.refresh(run_row)
-            return self._run_detail_from_row(run_row, dispatch_rows, signal_rows)
+            return self._run_detail_from_row(run_row, dispatch_rows, signal_rows, projection_rows)
 
     def list_artifacts(self, page: int, page_size: int, tenant_id: str | None = None) -> PaginatedResponse[ArtifactRecord]:
         with SessionLocal() as session:
@@ -1219,6 +1292,11 @@ class GovernanceRepository:
             request_ids = {row.id for row in request_rows}
             run_rows = [row for row in session.scalars(select(RunTable).where(RunTable.updated_at >= cutoff)).all() if row.request_id in request_ids]
             review_rows = [row for row in session.scalars(select(ReviewQueueTable)).all() if row.request_id in request_ids]
+            projection_rows = [
+                row
+                for row in session.scalars(select(ProjectionMappingTable).where(ProjectionMappingTable.entity_type == "request")).all()
+                if row.entity_id in request_ids
+            ]
 
         grouped: dict[str, dict[str, object]] = {}
         for request_row in request_rows:
@@ -1233,6 +1311,9 @@ class GovernanceRepository:
                     "review_count": 0,
                     "review_stale": 0,
                     "cost_points": 0.0,
+                    "projection_count": 0,
+                    "requests_with_projection": set(),
+                    "conflict_count": 0,
                 },
             )
             bucket["durations"].append(duration)
@@ -1254,17 +1335,45 @@ class GovernanceRepository:
                     "review_count": 0,
                     "review_stale": 0,
                     "cost_points": 0.0,
+                    "projection_count": 0,
+                    "requests_with_projection": set(),
+                    "conflict_count": 0,
                 },
             )
             bucket["review_count"] += 1
             if review_row.stale:
                 bucket["review_stale"] += 1
 
+        request_workflow = {row.id: row.workflow_binding_id or row.template_id for row in request_rows}
+        for projection_row in projection_rows:
+            workflow = request_workflow.get(projection_row.entity_id)
+            if not workflow:
+                continue
+            bucket = grouped.setdefault(
+                workflow,
+                {
+                    "durations": [],
+                    "total": 0,
+                    "failed": 0,
+                    "review_count": 0,
+                    "review_stale": 0,
+                    "cost_points": 0.0,
+                    "projection_count": 0,
+                    "requests_with_projection": set(),
+                    "conflict_count": 0,
+                },
+            )
+            bucket["projection_count"] += 1
+            bucket["requests_with_projection"].add(projection_row.entity_id)
+            if projection_service.detect_conflicts(projection_row.id):
+                bucket["conflict_count"] += 1
+
         rows: list[AnalyticsWorkflowRow] = []
         for workflow, bucket in grouped.items():
             durations = sorted(bucket["durations"])
             total = max(int(bucket["total"]), 1)
             p95_index = min(len(durations) - 1, max(0, int(len(durations) * 0.95) - 1)) if durations else 0
+            requests_with_projection = len(bucket["requests_with_projection"])
             rows.append(
                 AnalyticsWorkflowRow(
                     workflow=workflow,
@@ -1274,6 +1383,9 @@ class GovernanceRepository:
                     review_delay=f"{int(bucket['review_count'])} queued / {int(bucket['review_stale'])} stale",
                     cost_per_execution=f"${bucket['cost_points'] / total:.2f}",
                     trend="Stable" if int(bucket["failed"]) == 0 else "Needs attention",
+                    federated_projection_count=int(bucket["projection_count"]),
+                    federated_conflict_count=int(bucket["conflict_count"]),
+                    federated_coverage=self._format_percent(requests_with_projection, total),
                 )
             )
         return sorted(rows, key=lambda row: row.workflow)
@@ -1462,7 +1574,28 @@ class GovernanceRepository:
         with SessionLocal() as session:
             self._ensure_request_access(session, request_id, tenant_id)
             rows = session.scalars(select(RequestEventTable).where(RequestEventTable.request_id == request_id).order_by(RequestEventTable.timestamp)).all()
-        return [
+            projection_rows = session.scalars(
+                select(ProjectionMappingTable).where(
+                    ProjectionMappingTable.entity_type == "request",
+                    ProjectionMappingTable.entity_id == request_id,
+                    ProjectionMappingTable.tenant_id == (tenant_id or session.get(RequestTable, request_id).tenant_id),
+                )
+            ).all()
+            projection_logs: list[tuple[ProjectionMappingTable, ReconciliationLogTable]] = []
+            if projection_rows:
+                projection_ids = [row.id for row in projection_rows]
+                log_rows = session.scalars(
+                    select(ReconciliationLogTable)
+                    .where(ReconciliationLogTable.projection_id.in_(projection_ids))
+                    .order_by(ReconciliationLogTable.created_at)
+                ).all()
+                projection_by_id = {row.id: row for row in projection_rows}
+                projection_logs = [
+                    (projection_by_id[log_row.projection_id], log_row)
+                    for log_row in log_rows
+                    if log_row.projection_id in projection_by_id
+                ]
+        entries = [
             AuditEntry(
                 timestamp=row.timestamp.isoformat().replace("+00:00", "Z"),
                 actor=row.actor,
@@ -1470,9 +1603,191 @@ class GovernanceRepository:
                 object_type=row.object_type,
                 object_id=row.object_id,
                 reason_or_evidence=row.reason_or_evidence,
+                event_class="canonical",
+                source_system="RGP",
+                related_entity_type="request",
+                related_entity_id=request_id,
+                lineage=[f"request:{request_id}", f"{row.object_type}:{row.object_id}"],
             )
             for row in rows
         ]
+        entries.extend(
+            AuditEntry(
+                timestamp=log_row.created_at.isoformat().replace("+00:00", "Z"),
+                actor=log_row.resolved_by or "system",
+                action=self._audit_action_label(log_row.action, projection_row),
+                object_type="projection",
+                object_id=projection_row.id,
+                reason_or_evidence=log_row.detail or f"{projection_row.external_system} {log_row.action}",
+                event_class=self._audit_event_class(log_row.action),
+                source_system=projection_row.external_system,
+                integration_id=projection_row.integration_id,
+                projection_id=projection_row.id,
+                related_entity_type=projection_row.entity_type,
+                related_entity_id=projection_row.entity_id,
+                lineage=[
+                    f"{projection_row.entity_type}:{projection_row.entity_id}",
+                    f"projection:{projection_row.id}",
+                    f"external:{projection_row.external_system}",
+                    *([f"external_ref:{projection_row.external_ref}"] if projection_row.external_ref else []),
+                ],
+            )
+            for projection_row, log_row in projection_logs
+        )
+        return sorted(entries, key=lambda entry: entry.timestamp)
+
+    def list_run_audit_entries(self, run_id: str, tenant_id: str | None = None) -> list[AuditEntry]:
+        with SessionLocal() as session:
+            run_row = session.get(RunTable, run_id)
+            if run_row is None:
+                raise StopIteration(run_id)
+            request_row = self._ensure_request_access(session, run_row.request_id, tenant_id)
+        entries = self.list_audit_entries(run_row.request_id, request_row.tenant_id)
+        entries.append(
+            AuditEntry(
+                timestamp=run_row.updated_at.isoformat().replace("+00:00", "Z"),
+                actor="system",
+                action="Run Status Snapshot",
+                object_type="run",
+                object_id=run_id,
+                reason_or_evidence=f"status={run_row.status} workflow={run_row.workflow_identity}",
+                event_class="canonical",
+                source_system="RGP",
+                related_entity_type="request",
+                related_entity_id=run_row.request_id,
+                lineage=[f"workflow:{run_row.workflow_identity}", f"request:{run_row.request_id}", f"run:{run_id}"],
+            )
+        )
+        return sorted(entries, key=lambda entry: entry.timestamp)
+
+    def list_workflow_audit_entries(self, workflow: str, tenant_id: str | None = None, limit: int = 200) -> list[AuditEntry]:
+        with SessionLocal() as session:
+            request_rows = session.scalars(
+                select(RequestTable).where(
+                    (RequestTable.workflow_binding_id == workflow) | (RequestTable.template_id == workflow)
+                )
+            ).all()
+            if tenant_id:
+                request_rows = [row for row in request_rows if row.tenant_id == tenant_id]
+            request_ids = {row.id for row in request_rows}
+            run_rows = session.scalars(
+                select(RunTable).where((RunTable.workflow == workflow) | (RunTable.workflow_identity == workflow))
+            ).all()
+            if tenant_id:
+                run_rows = [row for row in run_rows if row.request_id in request_ids]
+            request_ids.update(row.request_id for row in run_rows)
+            if not request_ids:
+                return []
+            event_rows = session.scalars(
+                select(RequestEventTable)
+                .where(RequestEventTable.request_id.in_(sorted(request_ids)))
+                .order_by(RequestEventTable.timestamp)
+            ).all()
+            projection_rows = session.scalars(
+                select(ProjectionMappingTable).where(
+                    ProjectionMappingTable.entity_type == "request",
+                    ProjectionMappingTable.entity_id.in_(sorted(request_ids)),
+                )
+            ).all()
+            if tenant_id:
+                projection_rows = [row for row in projection_rows if row.tenant_id == tenant_id]
+            projection_by_id = {row.id: row for row in projection_rows}
+            log_rows = (
+                session.scalars(
+                    select(ReconciliationLogTable)
+                    .where(ReconciliationLogTable.projection_id.in_(list(projection_by_id.keys())))
+                    .order_by(ReconciliationLogTable.created_at)
+                ).all()
+                if projection_by_id
+                else []
+            )
+        entries = [
+            AuditEntry(
+                timestamp=row.timestamp.isoformat().replace("+00:00", "Z"),
+                actor=row.actor,
+                action=row.action,
+                object_type=row.object_type,
+                object_id=row.object_id,
+                reason_or_evidence=row.reason_or_evidence,
+                event_class="canonical",
+                source_system="RGP",
+                related_entity_type="workflow",
+                related_entity_id=workflow,
+                lineage=[f"workflow:{workflow}", f"request:{row.request_id}", f"{row.object_type}:{row.object_id}"],
+            )
+            for row in event_rows
+        ]
+        entries.extend(
+            AuditEntry(
+                timestamp=run_row.updated_at.isoformat().replace("+00:00", "Z"),
+                actor="system",
+                action="Run Status Snapshot",
+                object_type="run",
+                object_id=run_row.id,
+                reason_or_evidence=f"status={run_row.status} request={run_row.request_id}",
+                event_class="canonical",
+                source_system="RGP",
+                related_entity_type="workflow",
+                related_entity_id=workflow,
+                lineage=[f"workflow:{workflow}", f"request:{run_row.request_id}", f"run:{run_row.id}"],
+            )
+            for run_row in run_rows
+        )
+        entries.extend(
+            AuditEntry(
+                timestamp=log_row.created_at.isoformat().replace("+00:00", "Z"),
+                actor=log_row.resolved_by or "system",
+                action=self._audit_action_label(log_row.action, projection_row),
+                object_type="projection",
+                object_id=projection_row.id,
+                reason_or_evidence=log_row.detail or f"{projection_row.external_system} {log_row.action}",
+                event_class=self._audit_event_class(log_row.action),
+                source_system=projection_row.external_system,
+                integration_id=projection_row.integration_id,
+                projection_id=projection_row.id,
+                related_entity_type="workflow",
+                related_entity_id=workflow,
+                lineage=[
+                    f"workflow:{workflow}",
+                    f"{projection_row.entity_type}:{projection_row.entity_id}",
+                    f"projection:{projection_row.id}",
+                    f"external:{projection_row.external_system}",
+                    *([f"external_ref:{projection_row.external_ref}"] if projection_row.external_ref else []),
+                ],
+            )
+            for log_row in log_rows
+            for projection_row in [projection_by_id.get(log_row.projection_id)]
+            if projection_row is not None
+        )
+        entries = sorted(entries, key=lambda entry: entry.timestamp)
+        if limit > 0:
+            return entries[-limit:]
+        return entries
+
+    @staticmethod
+    def _audit_event_class(action: str) -> str:
+        normalized = action.lower()
+        if normalized == "conflict":
+            return "federated_conflict"
+        if normalized in {"resolved", "merge", "retry_sync", "reprovision", "resume_session"}:
+            return "federated_resolution"
+        if normalized in {"created", "updated", "observed_external_state", "sync"}:
+            return "federated_sync"
+        return "federated_event"
+
+    @staticmethod
+    def _audit_action_label(action: str, projection_row: ProjectionMappingTable) -> str:
+        normalized = action.lower()
+        adapter_type = None
+        if isinstance(projection_row.external_state, dict):
+            adapter_type = projection_row.external_state.get("adapter_type")
+        if normalized == "observed_external_state":
+            return "Observed External State"
+        if normalized == "conflict":
+            return f"Conflict Detected ({adapter_type or projection_row.external_system})"
+        if normalized == "resolved":
+            return f"Reconciliation Applied ({adapter_type or projection_row.external_system})"
+        return action.replace("_", " ").title()
 
     def list_policies(self, tenant_id: str | None = None) -> list[PolicyRecord]:
         with SessionLocal() as session:
@@ -1611,6 +1926,64 @@ class GovernanceRepository:
             self._ensure_request_tenant_access(request_row, tenant_id)
         return [item for item in self.list_integrations(tenant_id) if item.supports_direct_assignment and item.supports_interactive_sessions]
 
+    def preview_agent_assignment_context(
+        self,
+        request_id: str,
+        integration_id: str,
+        collaboration_mode: str = "agent_assisted",
+        agent_operating_profile: str = "general",
+        tenant_id: str | None = None,
+    ) -> AgentSessionContextDetail:
+        with SessionLocal() as session:
+            request_row = session.get(RequestTable, request_id)
+            self._ensure_request_tenant_access(request_row, tenant_id)
+            integration_row = session.get(IntegrationTable, integration_id)
+            if integration_row is None or integration_row.tenant_id != request_row.tenant_id:
+                raise StopIteration(integration_id)
+        bundle = context_bundle_service.preview_bundle(
+            request_id=request_id,
+            session_id=None,
+            bundle_type="assignment_preview",
+            assembled_by="system",
+            tenant_id=request_row.tenant_id,
+        )
+        tools, restricted_tools, degraded_tools, warnings = self._build_agent_session_tools(
+            integration_row=integration_row,
+            bundle=bundle,
+            collaboration_mode=collaboration_mode,
+            agent_operating_profile=agent_operating_profile,
+        )
+        bundle.contents = {
+            **(bundle.contents or {}),
+            "available_tools": [tool.model_dump(mode="json") for tool in tools],
+            "restricted_tools": [tool.model_dump(mode="json") for tool in restricted_tools],
+            "degraded_tools": [tool.model_dump(mode="json") for tool in degraded_tools],
+            "external_bindings": [
+                {
+                    "integration_id": integration_row.id,
+                    "integration_name": integration_row.name,
+                    "provider": self._provider_for_integration(integration_row),
+                    "endpoint": integration_security_service.setting(integration_row, "base_url") or integration_row.endpoint,
+                }
+            ],
+        }
+        bundle.policy_scope = {
+            "collaboration_mode": collaboration_mode,
+            "agent_operating_profile": agent_operating_profile,
+            "tool_names": [tool.name for tool in tools],
+            "restricted_tool_names": [tool.name for tool in restricted_tools],
+            "degraded_tool_names": [tool.name for tool in degraded_tools],
+            "warnings": warnings,
+        }
+        return AgentSessionContextDetail(
+            bundle=bundle,
+            available_tools=tools,
+            restricted_tools=restricted_tools,
+            degraded_tools=degraded_tools,
+            capability_warnings=warnings,
+            access_log=[],
+        )
+
     def assign_agent_session(self, request_id: str, payload: AssignAgentSessionRequest, tenant_id: str | None = None) -> AgentSessionRecord:
         with SessionLocal() as session:
             request_row = session.get(RequestTable, request_id)
@@ -1629,6 +2002,8 @@ class GovernanceRepository:
                 request_id=request_id,
                 integration_id=integration_row.id,
                 agent_label=agent_label,
+                collaboration_mode=payload.collaboration_mode,
+                agent_operating_profile=payload.agent_operating_profile,
                 status="streaming",
                 awaiting_human=False,
                 summary=f"{agent_label} is generating a response",
@@ -1690,6 +2065,32 @@ class GovernanceRepository:
                 },
             )
             session.commit()
+            if payload.collaboration_mode in {"agent_assisted", "agent_led"}:
+                try:
+                    current_mode = collaboration_mode_service.get_current_mode(request_id, request_row.tenant_id)
+                    if current_mode != payload.collaboration_mode:
+                        from app.models.collaboration import SwitchModeRequest
+
+                        collaboration_mode_service.switch_mode(
+                            request_id=request_id,
+                            payload=SwitchModeRequest(
+                                actor_id=payload.actor_id,
+                                target_mode=payload.collaboration_mode,
+                                reason="Agent session assignment selected collaboration mode",
+                            ),
+                            tenant_id=request_row.tenant_id,
+                        )
+                except ValueError:
+                    pass
+            self._refresh_agent_session_context(
+                request_id=request_id,
+                session_id=session_id,
+                tenant_id=request_row.tenant_id,
+                actor_id=payload.actor_id,
+                integration_row=integration_row,
+                collaboration_mode=payload.collaboration_mode,
+                agent_operating_profile=payload.agent_operating_profile,
+            )
             result = self._agent_session_from_row(session_row, integration_row, [kickoff_message, agent_reply])
         self._start_agent_session_turn_async(request_id, session_id, tenant_id)
         return result
@@ -1707,6 +2108,77 @@ class GovernanceRepository:
             ).all()
         summary = self._agent_session_from_row(session_row, integration_row, message_rows)
         return AgentSessionDetail(**summary.model_dump(), messages=[self._agent_message_from_row(row) for row in message_rows])
+
+    def get_agent_session_context(
+        self,
+        request_id: str,
+        session_id: str,
+        tenant_id: str | None = None,
+    ) -> AgentSessionContextDetail:
+        with SessionLocal() as session:
+            request_row = session.get(RequestTable, request_id)
+            self._ensure_request_tenant_access(request_row, tenant_id)
+            session_row = session.get(AgentSessionTable, session_id)
+            if session_row is None or session_row.request_id != request_id or session_row.tenant_id != request_row.tenant_id:
+                raise StopIteration(session_id)
+            integration_row = session.get(IntegrationTable, session_row.integration_id)
+            bundle_row = (
+                session.query(ContextBundleTable)
+                .filter(
+                    ContextBundleTable.request_id == request_id,
+                    ContextBundleTable.session_id == session_id,
+                    ContextBundleTable.tenant_id == request_row.tenant_id,
+                )
+                .order_by(desc(ContextBundleTable.assembled_at))
+                .first()
+            )
+            access_rows = []
+            if bundle_row is not None:
+                access_rows = (
+                    session.query(ContextAccessLogTable)
+                    .filter(ContextAccessLogTable.bundle_id == bundle_row.id)
+                    .order_by(desc(ContextAccessLogTable.accessed_at))
+                    .limit(25)
+                    .all()
+                )
+
+        if bundle_row is None:
+            bundle = self._refresh_agent_session_context(
+                request_id=request_id,
+                session_id=session_id,
+                tenant_id=request_row.tenant_id,
+                actor_id=session_row.assigned_by,
+                integration_row=integration_row,
+                collaboration_mode=session_row.collaboration_mode,
+                agent_operating_profile=session_row.agent_operating_profile,
+            )
+            with SessionLocal() as refresh_session:
+                refreshed_access_rows = (
+                    refresh_session.query(ContextAccessLogTable)
+                    .filter(ContextAccessLogTable.bundle_id == bundle.id)
+                    .order_by(desc(ContextAccessLogTable.accessed_at))
+                    .limit(25)
+                    .all()
+                )
+            access_log = [ContextAccessLogRecord.model_validate(row) for row in refreshed_access_rows]
+        else:
+            bundle = ContextBundleRecord.model_validate(bundle_row)
+            access_log = [ContextAccessLogRecord.model_validate(row) for row in access_rows]
+
+        tools, restricted_tools, degraded_tools, warnings = self._build_agent_session_tools(
+            integration_row=integration_row,
+            bundle=bundle,
+            collaboration_mode=session_row.collaboration_mode,
+            agent_operating_profile=session_row.agent_operating_profile,
+        )
+        return AgentSessionContextDetail(
+            bundle=bundle,
+            available_tools=tools,
+            restricted_tools=restricted_tools,
+            degraded_tools=degraded_tools,
+            capability_warnings=warnings,
+            access_log=access_log,
+        )
 
     def post_agent_session_message(
         self,
@@ -1777,7 +2249,82 @@ class GovernanceRepository:
                 payload={"message_type": payload.message_type},
             )
             session.commit()
+            self._refresh_agent_session_context(
+                request_id=request_id,
+                session_id=session_id,
+                tenant_id=request_row.tenant_id,
+                actor_id=payload.actor_id,
+                integration_row=integration_row,
+                collaboration_mode=session_row.collaboration_mode,
+                agent_operating_profile=session_row.agent_operating_profile,
+            )
         self._start_agent_session_turn_async(request_id, session_id, tenant_id)
+        return self.get_agent_session(request_id, session_id, tenant_id)
+
+    def update_agent_session_governance(
+        self,
+        request_id: str,
+        session_id: str,
+        payload: UpdateAgentSessionGovernanceRequest,
+        tenant_id: str | None = None,
+    ) -> AgentSessionDetail:
+        with SessionLocal() as session:
+            request_row = session.get(RequestTable, request_id)
+            self._ensure_request_tenant_access(request_row, tenant_id)
+            session_row = session.get(AgentSessionTable, session_id)
+            if session_row is None or session_row.request_id != request_id or session_row.tenant_id != request_row.tenant_id:
+                raise StopIteration(session_id)
+            integration_row = session.get(IntegrationTable, session_row.integration_id)
+            session_row.collaboration_mode = payload.collaboration_mode
+            session_row.agent_operating_profile = payload.agent_operating_profile
+            session_row.updated_at = datetime.now(timezone.utc)
+            self._append_event(
+                session=session,
+                request_id=request_id,
+                actor=payload.actor_id,
+                action="Agent Session Governance Updated",
+                reason_or_evidence=payload.reason,
+            )
+            event_store_service.append(
+                session,
+                tenant_id=request_row.tenant_id,
+                event_type="agent_session.governance_updated",
+                aggregate_type="agent_session",
+                aggregate_id=session_id,
+                request_id=request_id,
+                actor=payload.actor_id,
+                detail=payload.reason,
+                payload={
+                    "collaboration_mode": payload.collaboration_mode,
+                    "agent_operating_profile": payload.agent_operating_profile,
+                },
+            )
+            session.commit()
+            try:
+                current_mode = collaboration_mode_service.get_current_mode(request_id, request_row.tenant_id)
+                if current_mode != payload.collaboration_mode:
+                    from app.models.collaboration import SwitchModeRequest
+
+                    collaboration_mode_service.switch_mode(
+                        request_id=request_id,
+                        payload=SwitchModeRequest(
+                            actor_id=payload.actor_id,
+                            target_mode=payload.collaboration_mode,
+                            reason="Agent session governance updated collaboration mode",
+                        ),
+                        tenant_id=request_row.tenant_id,
+                    )
+            except ValueError:
+                pass
+            self._refresh_agent_session_context(
+                request_id=request_id,
+                session_id=session_id,
+                tenant_id=request_row.tenant_id,
+                actor_id=payload.actor_id,
+                integration_row=integration_row,
+                collaboration_mode=payload.collaboration_mode,
+                agent_operating_profile=payload.agent_operating_profile,
+            )
         return self.get_agent_session(request_id, session_id, tenant_id)
 
     def complete_agent_session(
@@ -1911,6 +2458,83 @@ class GovernanceRepository:
                     raise ValueError("Agent session transcript is incomplete")
 
                 transcript_rows = [row for row in message_rows if row.id != pending_agent_message.id]
+                bundle_row = (
+                    session.query(ContextBundleTable)
+                    .filter(
+                        ContextBundleTable.request_id == request_id,
+                        ContextBundleTable.session_id == session_id,
+                        ContextBundleTable.tenant_id == request_row.tenant_id,
+                    )
+                    .order_by(desc(ContextBundleTable.assembled_at))
+                    .first()
+                )
+                if bundle_row is not None:
+                    context_bundle_service.record_access(
+                        bundle_id=bundle_row.id,
+                        accessor_type="agent",
+                        accessor_id=integration_row.id,
+                        resource="agent_session_turn",
+                        result="granted",
+                        policy_basis=bundle_row.policy_scope or {},
+                    )
+                context_bundle = ContextBundleRecord.model_validate(bundle_row) if bundle_row is not None else None
+                available_tools = []
+                restricted_tools = []
+                degraded_tools = []
+                if context_bundle is not None:
+                    available_tools = [
+                        tool
+                        for tool in ((context_bundle.contents or {}).get("available_tools", []) if isinstance(context_bundle.contents, dict) else [])
+                        if isinstance(tool, dict)
+                    ]
+                    restricted_tools = [
+                        tool
+                        for tool in ((context_bundle.contents or {}).get("restricted_tools", []) if isinstance(context_bundle.contents, dict) else [])
+                        if isinstance(tool, dict)
+                    ]
+                    degraded_tools = [
+                        tool
+                        for tool in ((context_bundle.contents or {}).get("degraded_tools", []) if isinstance(context_bundle.contents, dict) else [])
+                        if isinstance(tool, dict)
+                    ]
+                    for tool in available_tools:
+                        context_bundle_service.record_access(
+                            bundle_id=bundle_row.id,
+                            accessor_type="agent",
+                            accessor_id=integration_row.id,
+                            resource=f"mcp_tool:{tool.get('name', 'unknown')}",
+                            result="granted",
+                            policy_basis={
+                                **(bundle_row.policy_scope or {}),
+                                "availability": "available",
+                            },
+                        )
+                    for tool in degraded_tools:
+                        context_bundle_service.record_access(
+                            bundle_id=bundle_row.id,
+                            accessor_type="agent",
+                            accessor_id=integration_row.id,
+                            resource=f"mcp_tool:{tool.get('name', 'unknown')}",
+                            result="degraded",
+                            policy_basis={
+                                **(bundle_row.policy_scope or {}),
+                                "availability": "degraded",
+                                "reason": tool.get("availability_reason"),
+                            },
+                        )
+                    for tool in restricted_tools:
+                        context_bundle_service.record_access(
+                            bundle_id=bundle_row.id,
+                            accessor_type="agent",
+                            accessor_id=integration_row.id,
+                            resource=f"mcp_tool:{tool.get('name', 'unknown')}",
+                            result="denied",
+                            policy_basis={
+                                **(bundle_row.policy_scope or {}),
+                                "availability": "denied",
+                                "reason": tool.get("availability_reason"),
+                            },
+                        )
                 is_initial_turn = latest_human_message.message_type == "assignment" and session_row.external_session_ref is None
                 if is_initial_turn:
                     provider_stream = agent_provider_service.stream_start_session(
@@ -1918,6 +2542,8 @@ class GovernanceRepository:
                         request_title=request_row.title,
                         initial_prompt=latest_human_message.body,
                         transcript=self._agent_transcript_from_rows(transcript_rows),
+                        context_bundle=context_bundle,
+                        available_tools=available_tools,
                     )
                 else:
                     provider_stream = agent_provider_service.stream_continue_session(
@@ -1926,6 +2552,8 @@ class GovernanceRepository:
                         transcript=self._agent_transcript_from_rows(transcript_rows),
                         latest_human_message=latest_human_message.body,
                         external_session_ref=session_row.external_session_ref,
+                        context_bundle=context_bundle,
+                        available_tools=available_tools,
                     )
 
                 for chunk in provider_stream:
@@ -3277,8 +3905,13 @@ class GovernanceRepository:
         return self._request_from_row(row)
 
     @staticmethod
-    def _request_from_row(row: RequestTable) -> RequestRecord:
+    def _request_from_row(row: RequestTable, projection_rows: list[ProjectionMappingTable] | None = None) -> RequestRecord:
         sla_risk_level, sla_risk_reason = GovernanceRepository._compute_sla_risk(row)
+        projection_records = []
+        for projection_row in projection_rows or []:
+            record = projection_service._record_from_row(projection_row)
+            record.conflicts = projection_service.detect_conflicts(record.id)
+            projection_records.append(record)
         return RequestRecord.model_validate(
             {
                 "id": row.id,
@@ -3307,6 +3940,8 @@ class GovernanceRepository:
                 "is_archived": row.is_archived,
                 "sla_risk_level": sla_risk_level,
                 "sla_risk_reason": sla_risk_reason,
+                "federated_projection_count": len(projection_records),
+                "federated_conflict_count": sum(len(record.conflicts) for record in projection_records),
             }
         )
 
@@ -3357,7 +3992,13 @@ class GovernanceRepository:
         row: RunTable,
         dispatch_rows: list[RuntimeDispatchTable] | None = None,
         signal_rows: list[RuntimeSignalTable] | None = None,
+        projection_rows: list[ProjectionMappingTable] | None = None,
     ) -> RunDetail:
+        projection_records = []
+        for projection in projection_rows or []:
+            record = projection_service._record_from_row(projection)
+            record.conflicts = projection_service.detect_conflicts(record.id)
+            projection_records.append(record)
         return RunDetail.model_validate(
             {
                 "id": row.id,
@@ -3369,6 +4010,8 @@ class GovernanceRepository:
                 "waiting_reason": row.waiting_reason,
                 "updated_at": row.updated_at.isoformat().replace("+00:00", "Z"),
                 "owner_team": row.owner_team,
+                "federated_projection_count": len(projection_records),
+                "federated_conflict_count": sum(len(record.conflicts) for record in projection_records),
                 "workflow_identity": row.workflow_identity,
                 "progress_percent": row.progress_percent,
                 "current_step_input_summary": row.current_step_input_summary,
@@ -3406,6 +4049,7 @@ class GovernanceRepository:
                     }
                     for signal in (signal_rows or [])
                 ],
+                "federated_projections": projection_records,
             }
         )
 
@@ -4285,6 +4929,254 @@ class GovernanceRepository:
             return "anthropic"
         return None
 
+    def _refresh_agent_session_context(
+        self,
+        request_id: str,
+        session_id: str,
+        tenant_id: str,
+        actor_id: str,
+        integration_row: IntegrationTable,
+        collaboration_mode: str = "agent_assisted",
+        agent_operating_profile: str = "general",
+    ) -> ContextBundleRecord:
+        bundle = context_bundle_service.assemble_bundle(
+            request_id=request_id,
+            session_id=session_id,
+            bundle_type="agent_session",
+            assembled_by=actor_id,
+            tenant_id=tenant_id,
+        )
+        tools, restricted_tools, degraded_tools, warnings = self._build_agent_session_tools(
+            integration_row=integration_row,
+            bundle=bundle,
+            collaboration_mode=collaboration_mode,
+            agent_operating_profile=agent_operating_profile,
+        )
+        policy_scope = {
+            "collaboration_mode": collaboration_mode,
+            "agent_operating_profile": agent_operating_profile,
+            "allowed_content_keys": [
+                "request_data",
+                "template_semantics",
+                "workflow_state",
+                "policy_constraints",
+                "prior_decisions",
+                "relationship_graph",
+                "available_tools",
+                "external_bindings",
+            ],
+            "tool_names": [tool.name for tool in tools],
+            "restricted_tool_names": [tool.name for tool in restricted_tools],
+            "degraded_tool_names": [tool.name for tool in degraded_tools],
+            "warnings": warnings,
+        }
+        scoped_bundle = context_bundle_service.scope_bundle(bundle.id, policy_scope)
+        contents = dict(scoped_bundle.contents or {})
+        contents["available_tools"] = [tool.model_dump(mode="json") for tool in tools]
+        contents["restricted_tools"] = [tool.model_dump(mode="json") for tool in restricted_tools]
+        contents["degraded_tools"] = [tool.model_dump(mode="json") for tool in degraded_tools]
+        contents["external_bindings"] = [
+            {
+                "integration_id": integration_row.id,
+                "integration_name": integration_row.name,
+                "provider": self._provider_for_integration(integration_row),
+                "endpoint": integration_security_service.setting(integration_row, "base_url") or integration_row.endpoint,
+            }
+        ]
+        with SessionLocal() as session:
+            row = session.get(ContextBundleTable, scoped_bundle.id)
+            if row is not None:
+                row.contents = contents
+                session.commit()
+                session.refresh(row)
+                scoped_bundle = ContextBundleRecord.model_validate(row)
+        context_bundle_service.record_access(
+            bundle_id=scoped_bundle.id,
+            accessor_type="human",
+            accessor_id=actor_id,
+            resource="context_bundle",
+            result="granted",
+            policy_basis=policy_scope,
+        )
+        return scoped_bundle
+
+    def _build_agent_session_tools(
+        self,
+        integration_row: IntegrationTable,
+        bundle: ContextBundleRecord,
+        collaboration_mode: str = "agent_assisted",
+        agent_operating_profile: str = "general",
+    ) -> tuple[list[AgentSessionToolRecord], list[AgentSessionToolRecord], list[AgentSessionToolRecord], list[str]]:
+        request_payload = (bundle.contents or {}).get("request_data", {}) if isinstance(bundle.contents, dict) else {}
+        base_tools: list[dict] = [
+            {
+                "name": "request.summary",
+                "description": "Read the governed request summary, payload, and lifecycle state.",
+                "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+            {
+                "name": "request.relationships",
+                "description": "Inspect dependency and related-request context from the governed graph.",
+                "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+            {
+                "name": "request.prior_decisions",
+                "description": "Review prior governance and review decisions attached to this request.",
+                "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+            {
+                "name": "request.timeline",
+                "description": "Inspect the governed request and workflow timeline.",
+                "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+                "required_collaboration_mode": "agent_assisted",
+            },
+            {
+                "name": "request.policy_context",
+                "description": "Inspect policy constraints, routing context, and collaboration governance on the request.",
+                "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+                "required_collaboration_mode": "agent_assisted",
+            },
+        ]
+        discovered_tools = mcp_tool_registry.discover_tools(
+            session_context={
+                "tenant_id": bundle.tenant_id,
+                "request_id": bundle.request_id,
+                "session_id": bundle.session_id,
+                "collaboration_mode": collaboration_mode,
+            }
+        )
+        tool_map = {tool["name"]: tool for tool in base_tools}
+        for tool in discovered_tools:
+            tool_map.setdefault(tool["name"], tool)
+        policy_rules = self._derive_agent_session_tool_policy(
+            request_payload,
+            integration_row,
+            collaboration_mode,
+            agent_operating_profile,
+        )
+        allowed_tools = filter_tools_by_policy(
+            tools=list(tool_map.values()),
+            collaboration_mode=collaboration_mode,
+            role="agent",
+            policy_rules=policy_rules,
+        )
+        allowed_tool_names = {tool.get("name", "") for tool in allowed_tools}
+        restricted_tools: list[AgentSessionToolRecord] = []
+        degraded_tools: list[AgentSessionToolRecord] = []
+        available_records: list[AgentSessionToolRecord] = []
+        for tool in tool_map.values():
+            name = tool.get("name", "")
+            restriction_reason = self._tool_restriction_reason(
+                tool=tool,
+                collaboration_mode=collaboration_mode,
+                role="agent",
+                policy_rules=policy_rules,
+            )
+            degraded_reason = self._tool_degradation_reason(tool=tool, bundle=bundle)
+            if name not in allowed_tool_names:
+                restricted_tools.append(
+                    AgentSessionToolRecord(
+                        name=name,
+                        description=tool.get("description", ""),
+                        input_schema=tool.get("input_schema", {}),
+                        required_collaboration_mode=tool.get("required_collaboration_mode"),
+                        allowed_roles=list(tool.get("allowed_roles", [])),
+                        availability="denied",
+                        availability_reason=restriction_reason,
+                    )
+                )
+                continue
+            record = AgentSessionToolRecord(
+                name=name,
+                description=tool.get("description", ""),
+                input_schema=tool.get("input_schema", {}),
+                required_collaboration_mode=tool.get("required_collaboration_mode"),
+                allowed_roles=list(tool.get("allowed_roles", [])),
+                availability="degraded" if degraded_reason else "available",
+                availability_reason=degraded_reason,
+            )
+            if degraded_reason:
+                degraded_tools.append(record)
+            else:
+                available_records.append(record)
+        warnings: list[str] = []
+        if self._provider_for_integration(integration_row) is None:
+            warnings.append("The selected integration does not declare a provider for governed MCP access.")
+        if collaboration_mode == "human_led":
+            warnings.append("Human-led mode sharply limits agent autonomy and MCP capability access.")
+        if agent_operating_profile != "general":
+            warnings.append(f"Agent operating profile '{agent_operating_profile}' is active for this session.")
+        if not allowed_tool_names:
+            warnings.append("No MCP capabilities are currently available for this session.")
+        if degraded_tools:
+            warnings.append("Some MCP capabilities are degraded because governed context is incomplete for this session.")
+        return (available_records, restricted_tools, degraded_tools, warnings)
+
+    @staticmethod
+    def _tool_restriction_reason(
+        tool: dict,
+        collaboration_mode: str,
+        role: str,
+        policy_rules: list[dict],
+    ) -> str:
+        name = tool.get("name", "")
+        for rule in policy_rules:
+            for action in rule.get("actions", []):
+                if action.get("type") != "restrict_tool" or action.get("tool_name") != name:
+                    continue
+                restrict_mode = action.get("collaboration_mode")
+                restrict_role = action.get("role")
+                mode_match = restrict_mode is None or restrict_mode == collaboration_mode
+                role_match = restrict_role is None or restrict_role == role
+                if mode_match and role_match:
+                    return action.get("reason") or "Restricted by session policy."
+        required_mode = tool.get("required_collaboration_mode")
+        if required_mode and not _mode_satisfies(collaboration_mode, required_mode):
+            return f"Requires collaboration mode '{required_mode}' or higher."
+        allowed_roles = tool.get("allowed_roles")
+        if allowed_roles and role not in allowed_roles:
+            return f"Restricted to roles: {', '.join(allowed_roles)}."
+        return "Restricted by governed session policy."
+
+    @staticmethod
+    def _tool_degradation_reason(tool: dict, bundle: ContextBundleRecord) -> str | None:
+        contents = bundle.contents if isinstance(bundle.contents, dict) else {}
+        request_data = contents.get("request_data", {}) if isinstance(contents.get("request_data", {}), dict) else {}
+        tool_name = tool.get("name")
+        if tool_name == "request.summary" and not request_data:
+            return "Governed request summary data is not currently available."
+        if tool_name == "request.relationships" and not contents.get("relationship_graph"):
+            return "No governed request relationships are currently attached."
+        if tool_name == "request.prior_decisions" and not contents.get("prior_decisions"):
+            return "No prior governance decisions are currently attached."
+        if tool_name == "request.timeline" and not contents.get("workflow_state"):
+            return "Workflow timeline state is currently unavailable."
+        if tool_name == "request.policy_context" and not request_data.get("policy_context"):
+            return "No explicit policy context is currently attached to the request."
+        return None
+
+    @staticmethod
+    def _derive_agent_session_tool_policy(
+        request_payload: dict,
+        integration_row: IntegrationTable,
+        collaboration_mode: str,
+        agent_operating_profile: str,
+    ) -> list[dict]:
+        policy_context = request_payload.get("policy_context", {}) if isinstance(request_payload, dict) else {}
+        actions: list[dict] = []
+        if collaboration_mode == "human_led" or policy_context.get("collaboration_mode") == "human_led":
+            actions.append({"type": "restrict_tool", "tool_name": "request.timeline"})
+            actions.append({"type": "restrict_tool", "tool_name": "request.policy_context"})
+        if agent_operating_profile == "editorial":
+            actions.append({"type": "restrict_tool", "tool_name": "request.relationships"})
+        if agent_operating_profile == "execution":
+            actions.append({"type": "restrict_tool", "tool_name": "request.prior_decisions"})
+        if agent_operating_profile == "review":
+            actions.append({"type": "restrict_tool", "tool_name": "request.relationships"})
+        if integration_row.status != "connected":
+            actions.append({"type": "restrict_tool", "tool_name": "request.timeline"})
+        return [{"actions": actions}] if actions else []
+
     def _validate_integration_configuration(self, integration_type: str, endpoint: str, settings_dict: dict | None) -> None:
         provider = None
         if isinstance(settings_dict, dict):
@@ -4353,6 +5245,8 @@ class GovernanceRepository:
             integration_id=row.integration_id,
             integration_name=integration_row.name if integration_row else row.integration_id,
             agent_label=row.agent_label,
+            collaboration_mode=row.collaboration_mode,
+            agent_operating_profile=row.agent_operating_profile,
             provider=self._provider_for_integration(integration_row),
             status=row.status,
             awaiting_human=row.awaiting_human,

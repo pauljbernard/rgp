@@ -50,6 +50,27 @@ class SlaBreachAuditRecord(RgpModel):
     remediation_action: str | None = None
     breached_at: datetime | None = None
 
+
+class RoutingRecommendationRecord(RgpModel):
+    request_id: str
+    recommended_group_id: str | None = None
+    recommended_group_name: str | None = None
+    matched_skills: list[str] = []
+    route_basis: list[str] = []
+    current_load: int | None = None
+    max_capacity: int | None = None
+    sla_status: str = "unknown"
+    escalation_targets: list[str] = []
+
+
+class EscalationExecutionRecord(RgpModel):
+    request_id: str
+    rule_id: str
+    escalation_type: str
+    escalation_target: str
+    outcome: str
+    executed_at: datetime | None = None
+
 class CreateAssignmentGroupRequest(RgpModel):
     name: str
     skill_tags: list[str] = []
@@ -61,3 +82,16 @@ class CreateEscalationRuleRequest(RgpModel):
     escalation_target: str
     escalation_type: str = "reassign"
     delay_minutes: int = 60
+
+
+class CreateSlaDefinitionRequest(RgpModel):
+    name: str
+    scope_type: str
+    scope_id: str | None = None
+    response_target_hours: float | None = None
+    resolution_target_hours: float | None = None
+    review_deadline_hours: float | None = None
+
+
+class RemediateSlaBreachRequest(RgpModel):
+    remediation_action: str

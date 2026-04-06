@@ -9,7 +9,11 @@ from app.db.models import DomainPackTable, DomainPackInstallationTable
 from app.db.session import SessionLocal
 from app.models.domain_pack import (
     CreateDomainPackRequest,
+    DomainPackComparison,
+    DomainPackContributionDelta,
+    DomainPackDetail,
     DomainPackInstallation,
+    DomainPackLineageEntry,
     DomainPackRecord,
 )
 from app.services.event_store_service import event_store_service
@@ -78,6 +82,28 @@ class DomainPackService:
                 .one()
             )
             return DomainPackRecord.model_validate(row)
+
+    def list_installations(self, pack_id: str, tenant_id: str) -> list[DomainPackInstallation]:
+        with SessionLocal() as session:
+            rows = (
+                session.query(DomainPackInstallationTable)
+                .filter(
+                    DomainPackInstallationTable.pack_id == pack_id,
+                    DomainPackInstallationTable.tenant_id == tenant_id,
+                )
+                .order_by(DomainPackInstallationTable.installed_at.desc())
+                .all()
+            )
+            return [DomainPackInstallation.model_validate(r) for r in rows]
+
+    def get_pack_detail(self, pack_id: str, tenant_id: str) -> DomainPackDetail:
+        pack = self.get_pack(pack_id)
+        if pack.tenant_id != tenant_id:
+            raise ValueError("Pack not found")
+        return DomainPackDetail(
+            pack=pack,
+            installations=self.list_installations(pack_id, tenant_id),
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -234,6 +260,99 @@ class DomainPackService:
                     errors.append(f"Duplicate entries found in {field_name}")
 
         return errors
+
+    def compare_pack(self, pack_id: str, tenant_id: str) -> DomainPackComparison:
+        with SessionLocal() as session:
+            row = (
+                session.query(DomainPackTable)
+                .filter(
+                    DomainPackTable.id == pack_id,
+                    DomainPackTable.tenant_id == tenant_id,
+                )
+                .one()
+            )
+            baseline = (
+                session.query(DomainPackTable)
+                .filter(
+                    DomainPackTable.tenant_id == tenant_id,
+                    DomainPackTable.name == row.name,
+                    DomainPackTable.id != row.id,
+                )
+                .order_by(DomainPackTable.created_at.desc())
+                .first()
+            )
+
+            categories = (
+                ("templates", row.contributed_templates or [], baseline.contributed_templates if baseline else []),
+                ("artifact_types", row.contributed_artifact_types or [], baseline.contributed_artifact_types if baseline else []),
+                ("workflows", row.contributed_workflows or [], baseline.contributed_workflows if baseline else []),
+                ("policies", row.contributed_policies or [], baseline.contributed_policies if baseline else []),
+            )
+            deltas: list[DomainPackContributionDelta] = []
+            total_added = 0
+            total_removed = 0
+            for category, current_items, baseline_items in categories:
+                added = sorted(set(current_items) - set(baseline_items))
+                removed = sorted(set(baseline_items) - set(current_items))
+                total_added += len(added)
+                total_removed += len(removed)
+                deltas.append(
+                    DomainPackContributionDelta(
+                        category=category,
+                        added=added,
+                        removed=removed,
+                    )
+                )
+
+            if baseline is None:
+                summary = "No prior version exists for comparison."
+            elif total_added == 0 and total_removed == 0:
+                summary = "This version carries the same declared contributions as the previous version."
+            else:
+                summary = f"Compared with {baseline.version}: {total_added} additions and {total_removed} removals across declared contributions."
+
+            return DomainPackComparison(
+                current_pack_id=row.id,
+                current_version=row.version,
+                baseline_pack_id=baseline.id if baseline else None,
+                baseline_version=baseline.version if baseline else None,
+                deltas=deltas,
+                summary=summary,
+            )
+
+    def list_pack_lineage(self, pack_id: str, tenant_id: str) -> list[DomainPackLineageEntry]:
+        with SessionLocal() as session:
+            row = (
+                session.query(DomainPackTable)
+                .filter(
+                    DomainPackTable.id == pack_id,
+                    DomainPackTable.tenant_id == tenant_id,
+                )
+                .one()
+            )
+            related = (
+                session.query(DomainPackTable)
+                .filter(
+                    DomainPackTable.tenant_id == tenant_id,
+                    DomainPackTable.name == row.name,
+                )
+                .order_by(DomainPackTable.created_at.desc())
+                .all()
+            )
+            return [
+                DomainPackLineageEntry(
+                    pack_id=item.id,
+                    version=item.version,
+                    status=item.status,
+                    created_at=item.created_at,
+                    activated_at=item.activated_at,
+                    contribution_count=len(item.contributed_templates or [])
+                    + len(item.contributed_artifact_types or [])
+                    + len(item.contributed_workflows or [])
+                    + len(item.contributed_policies or []),
+                )
+                for item in related
+            ]
 
 
 domain_pack_service = DomainPackService()

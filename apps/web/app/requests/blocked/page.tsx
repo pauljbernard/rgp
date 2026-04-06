@@ -5,6 +5,7 @@ import { Badge, DataTable, FilterPanel, MetricStack, PageShell, QueueTabs, Secti
 const requestQueueTabs = [
   { key: "all", label: "All Requests", href: "/requests" },
   { key: "blocked", label: "Blocked Requests", href: "/requests/blocked" },
+  { key: "federated-conflicts", label: "Federated Conflicts", href: "/requests/federated-conflicts" },
   { key: "promotion", label: "Promotion Pending", href: "/promotions/pending" },
   { key: "sla-risk", label: "SLA Risk", href: "/requests/sla-risk" }
 ];

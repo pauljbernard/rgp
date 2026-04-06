@@ -64,6 +64,8 @@ export async function assignAgentSessionAction(formData: FormData) {
   const integrationId = String(formData.get("integrationId") ?? "");
   const initialPrompt = String(formData.get("initialPrompt") ?? "");
   const agentLabel = String(formData.get("agentLabel") ?? "");
+  const collaborationMode = String(formData.get("collaborationMode") ?? "agent_assisted");
+  const agentOperatingProfile = String(formData.get("agentOperatingProfile") ?? "general");
   if (!integrationId || !initialPrompt) {
     throw new Error("Missing integration or initial prompt");
   }
@@ -72,6 +74,8 @@ export async function assignAgentSessionAction(formData: FormData) {
       integration_id: integrationId,
       initial_prompt: initialPrompt,
       agent_label: agentLabel || undefined,
+      collaboration_mode: collaborationMode,
+      agent_operating_profile: agentOperatingProfile,
       reason: "Assigned from request detail"
     });
     revalidatePath(`/requests/${requestId}`);
@@ -82,6 +86,12 @@ export async function assignAgentSessionAction(formData: FormData) {
       throw error;
     }
     const message = error instanceof Error ? error.message : "Agent assignment failed";
-    redirect(`/requests/${requestId}?error=${encodeURIComponent(message)}`);
+    const query = new URLSearchParams({
+      error: message,
+      integration: integrationId,
+      collaboration_mode: collaborationMode,
+      agent_operating_profile: agentOperatingProfile,
+    });
+    redirect(`/requests/${requestId}/agents?${query.toString()}`);
   }
 }

@@ -378,6 +378,8 @@ class AgentSessionTable(Base):
     request_id: Mapped[str] = mapped_column(String(64), nullable=False)
     integration_id: Mapped[str] = mapped_column(String(64), nullable=False)
     agent_label: Mapped[str] = mapped_column(String(255), nullable=False)
+    collaboration_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="agent_assisted")
+    agent_operating_profile: Mapped[str] = mapped_column(String(64), nullable=False, default="general")
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     awaiting_human: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     summary: Mapped[str] = mapped_column(Text, nullable=False, default="")

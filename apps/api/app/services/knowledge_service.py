@@ -9,9 +9,11 @@ from sqlalchemy import or_
 
 from app.db.models import KnowledgeArtifactTable, KnowledgeArtifactVersionTable
 from app.db.session import SessionLocal
+from app.models.common import PaginatedResponse
 from app.models.knowledge import (
     CreateKnowledgeArtifactRequest,
     KnowledgeArtifactRecord,
+    KnowledgeVersionRecord,
 )
 from app.services.event_store_service import event_store_service
 
@@ -80,21 +82,68 @@ class KnowledgeService:
             session.refresh(row)
             return KnowledgeArtifactRecord.model_validate(row)
 
-    def get_artifact(self, artifact_id: str) -> KnowledgeArtifactRecord:
+    def list_artifacts(
+        self,
+        tenant_id: str,
+        page: int = 1,
+        page_size: int = 25,
+        query: str | None = None,
+        status: str | None = None,
+    ) -> PaginatedResponse[KnowledgeArtifactRecord]:
+        with SessionLocal() as session:
+            q = session.query(KnowledgeArtifactTable).filter(KnowledgeArtifactTable.tenant_id == tenant_id)
+            if status:
+                q = q.filter(KnowledgeArtifactTable.status == status)
+            if query:
+                like_pattern = f"%{query}%"
+                q = q.filter(
+                    or_(
+                        KnowledgeArtifactTable.name.ilike(like_pattern),
+                        KnowledgeArtifactTable.description.ilike(like_pattern),
+                    )
+                )
+            rows = q.order_by(KnowledgeArtifactTable.updated_at.desc()).all()
+        records = [KnowledgeArtifactRecord.model_validate(r) for r in rows]
+        start = (page - 1) * page_size
+        end = start + page_size
+        return PaginatedResponse.create(items=records[start:end], page=page, page_size=page_size, total_count=len(records))
+
+    def get_artifact(self, artifact_id: str, tenant_id: str) -> KnowledgeArtifactRecord:
         with SessionLocal() as session:
             row = (
                 session.query(KnowledgeArtifactTable)
-                .filter(KnowledgeArtifactTable.id == artifact_id)
+                .filter(
+                    KnowledgeArtifactTable.id == artifact_id,
+                    KnowledgeArtifactTable.tenant_id == tenant_id,
+                )
                 .one()
             )
             return KnowledgeArtifactRecord.model_validate(row)
+
+    def list_versions(self, artifact_id: str, tenant_id: str) -> list[KnowledgeVersionRecord]:
+        with SessionLocal() as session:
+            artifact = (
+                session.query(KnowledgeArtifactTable)
+                .filter(
+                    KnowledgeArtifactTable.id == artifact_id,
+                    KnowledgeArtifactTable.tenant_id == tenant_id,
+                )
+                .one()
+            )
+            rows = (
+                session.query(KnowledgeArtifactVersionTable)
+                .filter(KnowledgeArtifactVersionTable.artifact_id == artifact.id)
+                .order_by(KnowledgeArtifactVersionTable.version.desc())
+                .all()
+            )
+            return [KnowledgeVersionRecord.model_validate(row) for row in rows]
 
     # ------------------------------------------------------------------
     # Publishing
     # ------------------------------------------------------------------
 
     def publish_artifact(
-        self, artifact_id: str, actor_id: str
+        self, artifact_id: str, actor_id: str, tenant_id: str
     ) -> KnowledgeArtifactRecord:
         """Publish the artifact: set status=published and bump the version."""
         now = datetime.now(timezone.utc)
@@ -102,7 +151,10 @@ class KnowledgeService:
         with SessionLocal() as session:
             row = (
                 session.query(KnowledgeArtifactTable)
-                .filter(KnowledgeArtifactTable.id == artifact_id)
+                .filter(
+                    KnowledgeArtifactTable.id == artifact_id,
+                    KnowledgeArtifactTable.tenant_id == tenant_id,
+                )
                 .one()
             )
             row.status = "published"

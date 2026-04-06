@@ -4,6 +4,8 @@ from enum import StrEnum
 from pydantic import Field
 
 from app.models.common import RgpModel
+from app.models.context import ContextAccessLogRecord, ContextBundleRecord
+from app.models.federation import ProjectionMappingRecord
 from app.models.request import RequestPriority, RequestRecord, RequestStatus, seed_request
 from app.models.template import TemplateRecord, TemplateStatus
 
@@ -123,6 +125,8 @@ class RunRecord(RgpModel):
     waiting_reason: str | None = None
     updated_at: str
     owner_team: str
+    federated_projection_count: int = 0
+    federated_conflict_count: int = 0
 
 
 class RunDetail(RunRecord):
@@ -137,6 +141,7 @@ class RunDetail(RunRecord):
     conversation_thread_id: str
     runtime_dispatches: list[RuntimeDispatchRecord] = Field(default_factory=list)
     runtime_signals: list[RuntimeSignalRecord] = Field(default_factory=list)
+    federated_projections: list[ProjectionMappingRecord] = Field(default_factory=list)
 
 
 class ArtifactVersion(RgpModel):
@@ -377,6 +382,9 @@ class AnalyticsWorkflowRow(RgpModel):
     review_delay: str
     cost_per_execution: str
     trend: str
+    federated_projection_count: int = 0
+    federated_conflict_count: int = 0
+    federated_coverage: str = "0%"
 
 
 class AnalyticsAgentRow(RgpModel):
@@ -673,6 +681,13 @@ class AuditEntry(RgpModel):
     object_type: str
     object_id: str
     reason_or_evidence: str
+    event_class: str = "canonical"
+    source_system: str | None = None
+    integration_id: str | None = None
+    projection_id: str | None = None
+    related_entity_type: str | None = None
+    related_entity_id: str | None = None
+    lineage: list[str] = Field(default_factory=list)
 
 
 class RequestRelationship(RgpModel):
@@ -750,6 +765,8 @@ class AgentSessionRecord(RgpModel):
     integration_id: str
     integration_name: str
     agent_label: str
+    collaboration_mode: str = "agent_assisted"
+    agent_operating_profile: str = "general"
     provider: str | None = None
     status: str
     awaiting_human: bool
@@ -767,11 +784,32 @@ class AgentSessionDetail(AgentSessionRecord):
     messages: list[AgentSessionMessageRecord] = Field(default_factory=list)
 
 
+class AgentSessionToolRecord(RgpModel):
+    name: str
+    description: str
+    input_schema: dict = Field(default_factory=dict)
+    required_collaboration_mode: str | None = None
+    allowed_roles: list[str] = Field(default_factory=list)
+    availability: str = "available"
+    availability_reason: str | None = None
+
+
+class AgentSessionContextDetail(RgpModel):
+    bundle: ContextBundleRecord
+    available_tools: list[AgentSessionToolRecord] = Field(default_factory=list)
+    restricted_tools: list[AgentSessionToolRecord] = Field(default_factory=list)
+    degraded_tools: list[AgentSessionToolRecord] = Field(default_factory=list)
+    capability_warnings: list[str] = Field(default_factory=list)
+    access_log: list[ContextAccessLogRecord] = Field(default_factory=list)
+
+
 class AssignAgentSessionRequest(RgpModel):
     actor_id: str = "user_demo"
     integration_id: str
     initial_prompt: str
     agent_label: str | None = None
+    collaboration_mode: str = "agent_assisted"
+    agent_operating_profile: str = "general"
     reason: str = "Request assigned to interactive agent session"
 
 
@@ -780,6 +818,13 @@ class AgentSessionMessageCreateRequest(RgpModel):
     body: str
     message_type: str = "message"
     reason: str = "Human guidance provided to agent session"
+
+
+class UpdateAgentSessionGovernanceRequest(RgpModel):
+    actor_id: str = "user_demo"
+    collaboration_mode: str
+    agent_operating_profile: str
+    reason: str = "Updated session governance"
 
 
 class CompleteAgentSessionRequest(RgpModel):

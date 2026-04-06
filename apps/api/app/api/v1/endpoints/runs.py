@@ -3,7 +3,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from app.core.auth import ensure_roles, get_principal
 from app.models.common import PaginatedResponse
-from app.models.governance import RunCommandRequest, RunDetail, RunRecord
+from app.models.governance import AuditEntry, RunCommandRequest, RunDetail, RunRecord
 from app.models.security import Principal, PrincipalRole
 from app.services.governance_service import governance_service
 from app.services.idempotency_service import idempotency_service
@@ -19,15 +19,26 @@ def list_runs(
     workflow: str | None = Query(default=None),
     owner: str | None = Query(default=None),
     request_id: str | None = Query(default=None),
+    federation: str | None = Query(default=None),
     principal: Annotated[Principal, Depends(get_principal)] = None,
 ) -> PaginatedResponse[RunRecord]:
-    return governance_service.list_runs(page, page_size, status, workflow, owner, request_id, principal.tenant_id)
+    return governance_service.list_runs(page, page_size, status, workflow, owner, request_id, federation, principal.tenant_id)
 
 
 @router.get("/{run_id}", response_model=RunDetail)
 def get_run(run_id: str, principal: Annotated[Principal, Depends(get_principal)]) -> RunDetail:
     try:
         return governance_service.get_run(run_id, principal)
+    except StopIteration:
+        raise HTTPException(status_code=404, detail="Run not found") from None
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@router.get("/{run_id}/history", response_model=list[AuditEntry])
+def get_run_history(run_id: str, principal: Annotated[Principal, Depends(get_principal)]) -> list[AuditEntry]:
+    try:
+        return governance_service.get_run_history(run_id, principal)
     except StopIteration:
         raise HTTPException(status_code=404, detail="Run not found") from None
     except PermissionError as exc:

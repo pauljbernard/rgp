@@ -1,6 +1,15 @@
 "use server";
 
-import { createIntegration, deleteIntegration, updateIntegration } from "@/lib/server-api";
+import {
+  createIntegration,
+  createIntegrationProjection,
+  deleteIntegration,
+  reconcileIntegration,
+  resolveIntegrationProjection,
+  syncIntegrationProjection,
+  updateIntegrationProjectionExternalState,
+  updateIntegration
+} from "@/lib/server-api";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 
@@ -50,4 +59,51 @@ export async function deleteIntegrationAction(formData: FormData) {
   await deleteIntegration(integrationId);
   revalidatePath("/admin/integrations");
   redirect("/admin/integrations");
+}
+
+export async function createIntegrationProjectionAction(formData: FormData) {
+  const integrationId = String(formData.get("integrationId") ?? "");
+  await createIntegrationProjection(integrationId, {
+    entity_type: String(formData.get("entityType") ?? ""),
+    entity_id: String(formData.get("entityId") ?? ""),
+  });
+  revalidatePath(`/admin/integrations/${integrationId}`);
+  redirect(`/admin/integrations/${integrationId}`);
+}
+
+export async function syncIntegrationProjectionAction(formData: FormData) {
+  const integrationId = String(formData.get("integrationId") ?? "");
+  const projectionId = String(formData.get("projectionId") ?? "");
+  await syncIntegrationProjection(projectionId);
+  revalidatePath(`/admin/integrations/${integrationId}`);
+  redirect(`/admin/integrations/${integrationId}`);
+}
+
+export async function reconcileIntegrationAction(formData: FormData) {
+  const integrationId = String(formData.get("integrationId") ?? "");
+  await reconcileIntegration(integrationId);
+  revalidatePath(`/admin/integrations/${integrationId}`);
+  redirect(`/admin/integrations/${integrationId}`);
+}
+
+export async function updateIntegrationProjectionExternalStateAction(formData: FormData) {
+  const integrationId = String(formData.get("integrationId") ?? "");
+  const projectionId = String(formData.get("projectionId") ?? "");
+  await updateIntegrationProjectionExternalState(projectionId, {
+    external_status: String(formData.get("externalStatus") ?? "").trim() || undefined,
+    external_title: String(formData.get("externalTitle") ?? "").trim() || undefined,
+    external_ref: String(formData.get("externalRef") ?? "").trim() || undefined,
+  });
+  revalidatePath(`/admin/integrations/${integrationId}`);
+  redirect(`/admin/integrations/${integrationId}`);
+}
+
+export async function resolveIntegrationProjectionAction(formData: FormData) {
+  const integrationId = String(formData.get("integrationId") ?? "");
+  const projectionId = String(formData.get("projectionId") ?? "");
+  await resolveIntegrationProjection(projectionId, {
+    action: String(formData.get("action") ?? "accept_internal"),
+  });
+  revalidatePath(`/admin/integrations/${integrationId}`);
+  redirect(`/admin/integrations/${integrationId}`);
 }

@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, Query
 
 from app.models.common import PaginatedResponse
 from app.core.auth import get_principal
-from app.models.governance import AnalyticsAgentRow, AnalyticsBottleneckRow, AnalyticsWorkflowRow, DeliveryDoraRow, DeliveryForecastPoint, DeliveryForecastSummary, DeliveryLifecycleRow, DeliveryTrendPoint, PerformanceMetricRecord, PerformanceOperationsSummary, PerformanceOperationsTrendPoint, PerformanceRouteSummary, PerformanceSloSummary, PerformanceTrendPoint
+from app.models.governance import AnalyticsAgentRow, AnalyticsBottleneckRow, AnalyticsWorkflowRow, AuditEntry, DeliveryDoraRow, DeliveryForecastPoint, DeliveryForecastSummary, DeliveryLifecycleRow, DeliveryTrendPoint, PerformanceMetricRecord, PerformanceOperationsSummary, PerformanceOperationsTrendPoint, PerformanceRouteSummary, PerformanceSloSummary, PerformanceTrendPoint
 from app.models.governance import AgentTrendPoint, WorkflowTrendPoint
 from app.models.security import Principal
 from app.services.governance_service import governance_service
@@ -33,6 +33,15 @@ def list_workflow_trends(
     principal: Annotated[Principal, Depends(get_principal)] = None,
 ) -> list[WorkflowTrendPoint]:
     return governance_service.list_workflow_trends(days, principal.tenant_id, team_id, user_id, portfolio_id, workflow)
+
+
+@router.get("/workflows/{workflow}/history", response_model=list[AuditEntry])
+def get_workflow_history(
+    workflow: str,
+    limit: int = Query(default=200, ge=1, le=500),
+    principal: Annotated[Principal, Depends(get_principal)] = None,
+) -> list[AuditEntry]:
+    return governance_service.get_workflow_history(workflow, principal, limit)
 
 
 @router.get("/agents", response_model=list[AnalyticsAgentRow])

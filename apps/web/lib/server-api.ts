@@ -1,11 +1,13 @@
 import type {
   AnalyticsAgentRow,
+  AgentSessionContextDetail,
   AnalyticsBottleneckRow,
   AnalyticsWorkflowRow,
   AddTeamMembershipInput,
   AgentTrendPoint,
   AgentSessionDetail,
   AgentSessionRecord,
+  AssignmentGroupRecord,
   ArtifactDetail,
   ArtifactRecord,
   CapabilityDetail,
@@ -21,16 +23,28 @@ import type {
   DeliveryForecastSummary,
   DeliveryLifecycleRow,
   DeliveryTrendPoint,
+  DomainPackDetail,
+  DomainPackComparison,
+  DomainPackInstallation,
+  DomainPackLineageEntry,
+  DomainPackRecord,
+  EscalationExecutionRecord,
+  EscalationRuleRecord,
   PaginatedResponse,
   PolicyRecord,
   PortfolioRecord,
   PortfolioSummary,
+  ProjectionMappingRecord,
   PerformanceMetricRecord,
   PerformanceOperationsSummary,
   PerformanceOperationsTrendPoint,
   PerformanceRouteSummary,
   PerformanceSloSummary,
   PerformanceTrendPoint,
+  PlanningConstructDetail,
+  PlanningConstructRecord,
+  PlanningMembershipRecord,
+  PlanningRoadmapEntry,
   Principal,
   PromotionAction,
   PromotionDetail,
@@ -41,6 +55,10 @@ import type {
   RequestStatus,
   ReviewDecision,
   ReviewQueueItem,
+  RemediateSlaBreachRequest,
+  RoutingRecommendationRecord,
+  SlaBreachAuditRecord,
+  SlaDefinitionRecord,
   TeamRecord,
   TenantRecord,
   UpdateTeamInput,
@@ -50,7 +68,10 @@ import type {
   RunCommand,
   TemplateRecord,
   TemplateValidationResult,
+  ReconciliationLogRecord,
   IntegrationRecord,
+  KnowledgeArtifactRecord,
+  KnowledgeVersionRecord,
   OrganizationRecord,
   UpdateIntegrationInput,
   UpdateOrganizationInput,
@@ -72,6 +93,7 @@ type RequestListParams = Paging & {
   owner_team_id?: string;
   workflow?: string;
   request_id?: string;
+  federation?: string;
 };
 
 type RunListParams = Paging & {
@@ -79,6 +101,7 @@ type RunListParams = Paging & {
   workflow?: string;
   owner?: string;
   request_id?: string;
+  federation?: string;
 };
 
 type ReviewListParams = Paging & {
@@ -86,6 +109,15 @@ type ReviewListParams = Paging & {
   blocking_only?: boolean;
   stale_only?: boolean;
   request_id?: string;
+};
+
+type KnowledgeListParams = Paging & {
+  query?: string;
+  status?: string;
+};
+
+type PlanningListParams = {
+  type?: string;
 };
 
 type AnalyticsScopeParams = {
@@ -200,7 +232,8 @@ export function listRequests(params: RequestListParams = {}) {
       status: params.status,
       owner_team_id: params.owner_team_id,
       workflow: params.workflow,
-      request_id: params.request_id
+      request_id: params.request_id,
+      federation: params.federation
     })
   );
 }
@@ -228,13 +261,39 @@ export function getRequest(requestId: string) {
   return request<RequestDetail>(`/api/v1/requests/${requestId}`);
 }
 
+export function listRequestProjections(requestId: string) {
+  return request<ProjectionMappingRecord[]>(`/api/v1/requests/${requestId}/projections`);
+}
+
 export function listRequestAgentIntegrations(requestId: string) {
   return request<IntegrationRecord[]>(`/api/v1/requests/${requestId}/agent-integrations`);
 }
 
+export function getRequestAgentAssignmentPreview(
+  requestId: string,
+  integrationId: string,
+  options: { collaboration_mode?: string; agent_operating_profile?: string } = {}
+) {
+  return request<AgentSessionContextDetail>(
+    withQuery(`/api/v1/requests/${requestId}/agent-assignment-preview`, {
+      integration_id: integrationId,
+      collaboration_mode: options.collaboration_mode,
+      agent_operating_profile: options.agent_operating_profile
+    })
+  );
+}
+
 export function assignAgentSession(
   requestId: string,
-  payload: { integration_id: string; initial_prompt: string; agent_label?: string; actor_id?: string; reason?: string }
+  payload: {
+    integration_id: string;
+    initial_prompt: string;
+    agent_label?: string;
+    collaboration_mode?: string;
+    agent_operating_profile?: string;
+    actor_id?: string;
+    reason?: string;
+  }
 ) {
   return requestWithOptions<AgentSessionRecord>(`/api/v1/requests/${requestId}/agent-sessions`, {
     method: "POST",
@@ -246,12 +305,27 @@ export function getAgentSession(requestId: string, sessionId: string) {
   return request<AgentSessionDetail>(`/api/v1/requests/${requestId}/agent-sessions/${sessionId}`);
 }
 
+export function getAgentSessionContext(requestId: string, sessionId: string) {
+  return request<AgentSessionContextDetail>(`/api/v1/requests/${requestId}/agent-sessions/${sessionId}/context`);
+}
+
 export function postAgentSessionMessage(
   requestId: string,
   sessionId: string,
   payload: { body: string; message_type?: string; actor_id?: string; reason?: string }
 ) {
   return requestWithOptions<AgentSessionDetail>(`/api/v1/requests/${requestId}/agent-sessions/${sessionId}/messages`, {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function updateAgentSessionGovernance(
+  requestId: string,
+  sessionId: string,
+  payload: { collaboration_mode: string; agent_operating_profile: string; actor_id?: string; reason?: string }
+) {
+  return requestWithOptions<AgentSessionDetail>(`/api/v1/requests/${requestId}/agent-sessions/${sessionId}/governance`, {
     method: "POST",
     body: JSON.stringify(payload)
   });
@@ -315,13 +389,24 @@ export function listRuns(params: RunListParams = {}) {
       status: params.status,
       workflow: params.workflow,
       owner: params.owner,
-      request_id: params.request_id
+      request_id: params.request_id,
+      federation: params.federation
     })
   );
 }
 
 export function getRun(runId: string) {
   return request<RunDetail>(`/api/v1/runs/${runId}`);
+}
+
+export function getRunHistory(runId: string) {
+  return request<AuditEntry[]>(`/api/v1/runs/${runId}/history`);
+}
+
+export function getWorkflowHistory(workflow: string, limit = 200) {
+  return request<AuditEntry[]>(
+    withQuery(`/api/v1/analytics/workflows/${encodeURIComponent(workflow)}/history`, { limit })
+  );
 }
 
 export function commandRun(runId: string, payload: { command: RunCommand; reason?: string; actor_id?: string }) {
@@ -342,6 +427,244 @@ export function listArtifacts(params: Paging = {}) {
 
 export function getArtifact(artifactId: string) {
   return request<ArtifactDetail>(`/api/v1/artifacts/${artifactId}`);
+}
+
+export function listKnowledge(params: KnowledgeListParams = {}) {
+  return request<PaginatedResponse<KnowledgeArtifactRecord>>(
+    withQuery("/api/v1/knowledge", {
+      page: params.page ?? 1,
+      page_size: params.page_size ?? 25,
+      query: params.query,
+      status: params.status
+    })
+  );
+}
+
+export function getRequestKnowledgeContext(requestId: string, maxItems = 5) {
+  return request<KnowledgeArtifactRecord[]>(withQuery(`/api/v1/knowledge/context/request/${requestId}`, { max_items: maxItems }));
+}
+
+export function createKnowledgeArtifact(payload: {
+  name: string;
+  description?: string;
+  content?: string;
+  content_type?: string;
+  tags?: string[];
+  policy_scope?: Record<string, unknown>;
+}) {
+  return requestWithOptions<KnowledgeArtifactRecord>("/api/v1/knowledge", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function getKnowledgeArtifact(artifactId: string) {
+  return request<KnowledgeArtifactRecord>(`/api/v1/knowledge/${artifactId}`);
+}
+
+export function listKnowledgeVersions(artifactId: string) {
+  return request<KnowledgeVersionRecord[]>(`/api/v1/knowledge/${artifactId}/versions`);
+}
+
+export function publishKnowledgeArtifact(artifactId: string) {
+  return requestWithOptions<KnowledgeArtifactRecord>(`/api/v1/knowledge/${artifactId}/publish`, {
+    method: "POST",
+    body: JSON.stringify({})
+  });
+}
+
+export function listPlanningConstructs(params: PlanningListParams = {}) {
+  return request<PlanningConstructRecord[]>(withQuery("/api/v1/planning", { type: params.type }));
+}
+
+export function getPlanningRoadmap(params: PlanningListParams = {}) {
+  return request<PlanningRoadmapEntry[]>(withQuery("/api/v1/planning/roadmap", { type: params.type }));
+}
+
+export function createPlanningConstruct(payload: {
+  type: string;
+  name: string;
+  description?: string;
+  owner_team_id?: string;
+  priority?: number;
+  target_date?: string;
+  capacity_budget?: number;
+}) {
+  return requestWithOptions<PlanningConstructRecord>("/api/v1/planning", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function getPlanningConstruct(constructId: string) {
+  return request<PlanningConstructDetail>(`/api/v1/planning/${constructId}`);
+}
+
+export function addPlanningMembership(
+  constructId: string,
+  payload: { request_id: string; sequence?: number; priority?: number }
+) {
+  return requestWithOptions<PlanningMembershipRecord>(`/api/v1/planning/${constructId}/memberships`, {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function updatePlanningMembership(
+  constructId: string,
+  requestId: string,
+  payload: { sequence?: number; priority?: number }
+) {
+  return requestWithOptions<PlanningMembershipRecord>(`/api/v1/planning/${constructId}/memberships/${requestId}`, {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export async function removePlanningMembership(constructId: string, requestId: string) {
+  const token = await bearerToken();
+  const response = await fetch(`${apiBaseUrl}/api/v1/planning/${constructId}/memberships/${requestId}`, {
+    method: "DELETE",
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+    cache: "no-store"
+  });
+
+  if (response.status === 401) {
+    redirect("/login");
+  }
+  if (response.status === 403) {
+    const from = encodeURIComponent(`/api/v1/planning/${constructId}/memberships/${requestId}`);
+    redirect(`/forbidden?from=${from}`);
+  }
+  if (!response.ok) {
+    throw new Error(`Request failed: ${response.status}`);
+  }
+}
+
+export function listDomainPacks() {
+  return request<DomainPackRecord[]>("/api/v1/domain-packs");
+}
+
+export function createDomainPack(payload: {
+  name: string;
+  version: string;
+  description?: string;
+  contributed_templates?: string[];
+  contributed_artifact_types?: string[];
+  contributed_workflows?: string[];
+  contributed_policies?: string[];
+}) {
+  return requestWithOptions<DomainPackRecord>("/api/v1/domain-packs", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function getDomainPack(packId: string) {
+  return request<DomainPackDetail>(`/api/v1/domain-packs/${packId}`);
+}
+
+export function activateDomainPack(packId: string) {
+  return requestWithOptions<DomainPackRecord>(`/api/v1/domain-packs/${packId}/activate`, {
+    method: "POST",
+    body: JSON.stringify({})
+  });
+}
+
+export function installDomainPack(packId: string) {
+  return requestWithOptions<DomainPackInstallation>(`/api/v1/domain-packs/${packId}/install`, {
+    method: "POST",
+    body: JSON.stringify({})
+  });
+}
+
+export function validateDomainPack(packId: string) {
+  return request<string[]>(`/api/v1/domain-packs/${packId}/validate`);
+}
+
+export function compareDomainPack(packId: string) {
+  return request<DomainPackComparison>(`/api/v1/domain-packs/${packId}/compare`);
+}
+
+export function listDomainPackLineage(packId: string) {
+  return request<DomainPackLineageEntry[]>(`/api/v1/domain-packs/${packId}/lineage`);
+}
+
+export function listAssignmentGroups() {
+  return request<AssignmentGroupRecord[]>("/api/v1/queue-routing/groups");
+}
+
+export function createAssignmentGroup(payload: {
+  name: string;
+  skill_tags?: string[];
+  max_capacity?: number;
+}) {
+  return requestWithOptions<AssignmentGroupRecord>("/api/v1/queue-routing/groups", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function listSlaDefinitions() {
+  return request<SlaDefinitionRecord[]>("/api/v1/queue-routing/sla-definitions");
+}
+
+export function createSlaDefinition(payload: {
+  name: string;
+  scope_type: string;
+  scope_id?: string;
+  response_target_hours?: number;
+  resolution_target_hours?: number;
+  review_deadline_hours?: number;
+}) {
+  return requestWithOptions<SlaDefinitionRecord>("/api/v1/queue-routing/sla-definitions", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function listEscalationRules() {
+  return request<EscalationRuleRecord[]>("/api/v1/queue-routing/escalation-rules");
+}
+
+export function createEscalationRule(payload: {
+  name: string;
+  condition: Record<string, unknown>;
+  escalation_target: string;
+  escalation_type?: string;
+  delay_minutes?: number;
+}) {
+  return requestWithOptions<EscalationRuleRecord>("/api/v1/queue-routing/escalation-rules", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function listSlaBreaches(requestId?: string) {
+  return request<SlaBreachAuditRecord[]>(withQuery("/api/v1/queue-routing/sla-breaches", { request_id: requestId }));
+}
+
+export function remediateSlaBreach(breachId: string, payload: RemediateSlaBreachRequest) {
+  return requestWithOptions<SlaBreachAuditRecord>(`/api/v1/queue-routing/sla-breaches/${breachId}/remediate`, {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function getRoutingRecommendation(requestId: string) {
+  return request<RoutingRecommendationRecord>(`/api/v1/queue-routing/requests/${requestId}/recommendation`);
+}
+
+export function listRequestEscalations(requestId: string) {
+  return request<EscalationRuleRecord[]>(`/api/v1/queue-routing/requests/${requestId}/escalations`);
+}
+
+export function executeRequestEscalation(requestId: string, ruleId: string) {
+  return requestWithOptions<EscalationExecutionRecord>(`/api/v1/queue-routing/requests/${requestId}/escalations/${ruleId}/execute`, {
+    method: "POST"
+  });
 }
 
 export function listReviewQueue(params: ReviewListParams = {}) {
@@ -714,6 +1037,56 @@ export function updateIntegration(integrationId: string, payload: UpdateIntegrat
 export function deleteIntegration(integrationId: string) {
   return requestWithOptions<void>(`/api/v1/admin/integrations/${integrationId}`, {
     method: "DELETE"
+  });
+}
+
+export function listIntegrationProjections(integrationId: string) {
+  return request<ProjectionMappingRecord[]>(`/api/v1/admin/integrations/${integrationId}/projections`);
+}
+
+export function createIntegrationProjection(
+  integrationId: string,
+  payload: { entity_type: string; entity_id: string }
+) {
+  return requestWithOptions<ProjectionMappingRecord>(`/api/v1/admin/integrations/${integrationId}/projections`, {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function syncIntegrationProjection(projectionId: string) {
+  return requestWithOptions<ProjectionMappingRecord>(`/api/v1/admin/projections/${projectionId}/sync`, {
+    method: "POST"
+  });
+}
+
+export function updateIntegrationProjectionExternalState(
+  projectionId: string,
+  payload: { external_status?: string; external_title?: string; external_ref?: string }
+) {
+  return requestWithOptions<ProjectionMappingRecord>(`/api/v1/admin/projections/${projectionId}/external-state`, {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function listIntegrationReconciliationLogs(integrationId: string) {
+  return request<ReconciliationLogRecord[]>(`/api/v1/admin/integrations/${integrationId}/reconciliation`);
+}
+
+export function reconcileIntegration(integrationId: string) {
+  return requestWithOptions<ReconciliationLogRecord[]>(`/api/v1/admin/integrations/${integrationId}/reconcile`, {
+    method: "POST"
+  });
+}
+
+export function resolveIntegrationProjection(
+  projectionId: string,
+  payload: { action: string; resolved_by?: string }
+) {
+  return requestWithOptions<ReconciliationLogRecord>(`/api/v1/admin/projections/${projectionId}/resolve`, {
+    method: "POST",
+    body: JSON.stringify(payload)
   });
 }
 

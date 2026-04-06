@@ -1,24 +1,35 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import type { AgentSessionDetail } from "@rgp/domain";
+import type { AgentSessionContextDetail, AgentSessionDetail } from "@rgp/domain";
 import { Badge, Button, KeyValueGrid, SectionHeading, Tabs, statusTone } from "../../../../../components/ui-helpers";
-import { completeAgentSessionAction, postAgentSessionMessageAction } from "./actions";
+import { completeAgentSessionAction, postAgentSessionMessageAction, updateAgentSessionGovernanceAction } from "./actions";
+
+function bundleKnowledgeEntries(bundle: { contents?: Record<string, unknown> | null } | null) {
+  const raw = bundle?.contents && typeof bundle.contents === "object"
+    ? (bundle.contents as Record<string, unknown>).knowledge_context
+    : null;
+  return Array.isArray(raw) ? raw.filter((item): item is Record<string, unknown> => !!item && typeof item === "object") : [];
+}
 
 export function AgentSessionLiveView({
   requestId,
   initialSession,
+  initialContext,
 }: {
   requestId: string;
   initialSession: AgentSessionDetail;
+  initialContext: AgentSessionContextDetail;
 }) {
   const [session, setSession] = useState(initialSession);
+  const [sessionContext, setSessionContext] = useState(initialContext);
   const [streamError, setStreamError] = useState("");
 
   useEffect(() => {
     setSession(initialSession);
+    setSessionContext(initialContext);
     setStreamError("");
-  }, [initialSession]);
+  }, [initialContext, initialSession]);
 
   useEffect(() => {
     if (session.status !== "streaming") {
@@ -80,6 +91,7 @@ export function AgentSessionLiveView({
     () => [...session.messages].reverse().find((message) => message.sender_type === "human"),
     [session.messages]
   );
+  const attachedKnowledge = useMemo(() => bundleKnowledgeEntries(sessionContext.bundle), [sessionContext.bundle]);
 
   return (
     <div className="space-y-4">
@@ -124,6 +136,119 @@ export function AgentSessionLiveView({
               </div>
             </>
           ) : null}
+          <SectionHeading title="Governed Context" />
+          <div className="grid gap-3 md:grid-cols-2">
+            <div className="rounded-lg border border-chrome bg-slate-50 p-4 text-sm text-slate-700">
+              <div className="text-xs font-medium uppercase tracking-[0.18em] text-slate-500">Context Bundle</div>
+              <div className="mt-2 font-medium text-slate-900">{sessionContext.bundle.id}</div>
+              <div className="mt-2 text-slate-600">Version {sessionContext.bundle.version} • {sessionContext.bundle.bundle_type}</div>
+              <div className="mt-2 text-slate-600">Assembled by {sessionContext.bundle.assembled_by}</div>
+            </div>
+            <div className="rounded-lg border border-chrome bg-slate-50 p-4 text-sm text-slate-700">
+              <div className="text-xs font-medium uppercase tracking-[0.18em] text-slate-500">Bundle Coverage</div>
+              <div className="mt-2 text-slate-600">
+                {Object.keys((sessionContext.bundle.contents ?? {}) as Record<string, unknown>).join(", ") || "No governed context keys available."}
+              </div>
+            </div>
+          </div>
+          <div className="space-y-2">
+            <SectionHeading title="Reusable Governed Knowledge" />
+            {attachedKnowledge.length ? (
+              attachedKnowledge.map((entry) => (
+                <div key={String(entry.artifact_id ?? entry.name)} className="rounded-lg border border-chrome bg-slate-50 p-4 text-sm text-slate-700">
+                  <div className="font-medium text-slate-900">{String(entry.name ?? entry.artifact_id ?? "Knowledge Artifact")}</div>
+                  {entry.description ? <div className="mt-1 text-slate-600">{String(entry.description)}</div> : null}
+                  <div className="mt-2 text-xs text-slate-500">
+                    v{String(entry.version ?? "—")} · {String(entry.content_type ?? "content")}
+                    {Array.isArray(entry.tags) && entry.tags.length ? ` · ${entry.tags.join(", ")}` : ""}
+                  </div>
+                </div>
+              ))
+            ) : (
+              <div className="rounded-lg border border-chrome bg-slate-50 p-4 text-sm text-slate-600">
+                No published governed knowledge artifacts are attached to this session yet.
+              </div>
+            )}
+          </div>
+          {sessionContext.capability_warnings.length ? (
+            <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+              {sessionContext.capability_warnings.join(" ")}
+            </div>
+          ) : null}
+          <form action={updateAgentSessionGovernanceAction} className="space-y-3 rounded-lg border border-chrome bg-white p-4">
+            <input type="hidden" name="requestId" value={requestId} />
+            <input type="hidden" name="sessionId" value={session.id} />
+            <SectionHeading title="Session Governance" />
+            <div className="grid gap-3 md:grid-cols-2">
+              <label className="block space-y-1 text-sm text-slate-700">
+                <span className="block text-xs font-medium text-slate-500">Collaboration Mode</span>
+                <select
+                  name="collaborationMode"
+                  defaultValue={session.collaboration_mode}
+                  className="w-full rounded-lg border border-chrome bg-slate-50 px-3 py-2 text-sm text-slate-700"
+                >
+                  <option value="human_led">Human-Led</option>
+                  <option value="agent_assisted">Agent-Assisted</option>
+                  <option value="agent_led">Agent-Led</option>
+                </select>
+              </label>
+              <label className="block space-y-1 text-sm text-slate-700">
+                <span className="block text-xs font-medium text-slate-500">Agent Operating Profile</span>
+                <select
+                  name="agentOperatingProfile"
+                  defaultValue={session.agent_operating_profile}
+                  className="w-full rounded-lg border border-chrome bg-slate-50 px-3 py-2 text-sm text-slate-700"
+                >
+                  <option value="general">General</option>
+                  <option value="review">Review</option>
+                  <option value="editorial">Editorial</option>
+                  <option value="execution">Execution</option>
+                </select>
+              </label>
+            </div>
+            <Button label="Apply Governance" tone="secondary" type="submit" />
+          </form>
+          <SectionHeading title="Available MCP Capabilities" />
+          <div className="space-y-3">
+            {sessionContext.available_tools.length ? (
+              sessionContext.available_tools.map((tool) => (
+                <div key={tool.name} className="rounded-lg border border-chrome bg-slate-50 p-4 text-sm text-slate-700">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="font-medium text-slate-900">{tool.name}</div>
+                    <div className="flex items-center gap-2">
+                      <Badge tone="success">available</Badge>
+                      <Badge tone="info">{tool.required_collaboration_mode ?? "agent_assisted"}</Badge>
+                    </div>
+                  </div>
+                  <div className="mt-2 text-slate-600">{tool.description}</div>
+                </div>
+              ))
+            ) : (
+              <div className="rounded-lg border border-chrome bg-slate-50 p-4 text-sm text-slate-600">
+                No MCP capabilities are currently exposed to this agent session.
+              </div>
+            )}
+            {sessionContext.degraded_tools.map((tool) => (
+              <div key={tool.name} className="rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="font-medium">{tool.name}</div>
+                  <Badge tone="warning">degraded</Badge>
+                </div>
+                <div className="mt-2">{tool.description}</div>
+                {tool.availability_reason ? <div className="mt-2 text-xs">{tool.availability_reason}</div> : null}
+              </div>
+            ))}
+            {sessionContext.restricted_tools.map((tool) => (
+              <div key={tool.name} className="rounded-lg border border-rose-200 bg-rose-50 p-4 text-sm text-rose-900">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="font-medium">{tool.name}</div>
+                  <Badge tone="danger">restricted</Badge>
+                </div>
+                <div className="mt-2">{tool.description}</div>
+                {tool.availability_reason ? <div className="mt-2 text-xs">{tool.availability_reason}</div> : null}
+              </div>
+            ))}
+          </div>
           {session.awaiting_human ? (
             <form action={completeAgentSessionAction} className="rounded-lg border border-emerald-200 bg-emerald-50 p-4">
               <input type="hidden" name="requestId" value={requestId} />
@@ -203,10 +328,29 @@ export function AgentSessionLiveView({
             <div className="mt-2 text-slate-600">Messages: {session.message_count}</div>
             <div className="text-slate-600">Awaiting Human: {session.awaiting_human ? "Yes" : "No"}</div>
           </div>
+          <SectionHeading title="Context Access Audit" />
+          <div className="space-y-3">
+            {sessionContext.access_log.length ? (
+              sessionContext.access_log.map((entry) => (
+                <div key={entry.id} className="rounded-lg border border-chrome bg-slate-50 px-4 py-3 text-sm text-slate-700">
+                  <div className="font-medium text-slate-900">{entry.accessor_type}: {entry.accessor_id}</div>
+                  <div className="mt-1 text-slate-600">{entry.accessed_resource} • {entry.access_result}</div>
+                  {entry.policy_basis?.reason ? <div className="mt-1 text-xs text-slate-500">{String(entry.policy_basis.reason)}</div> : null}
+                  <div className="mt-1 text-xs text-slate-500">{entry.accessed_at ? new Date(entry.accessed_at).toLocaleString() : "Timestamp unavailable"}</div>
+                </div>
+              ))
+            ) : (
+              <div className="rounded-lg border border-chrome bg-slate-50 px-4 py-3 text-sm text-slate-600">
+                No context access has been logged for this session yet.
+              </div>
+            )}
+          </div>
           <SectionHeading title="Session Overview" />
           <KeyValueGrid
             items={[
               { label: "Agent", value: session.agent_label },
+              { label: "Mode", value: session.collaboration_mode },
+              { label: "Profile", value: session.agent_operating_profile },
               { label: "Provider", value: session.provider ?? "Unspecified" },
               { label: "Integration", value: session.integration_name },
               { label: "Status", value: <Badge tone={statusTone(session.status)}>{session.status}</Badge> },

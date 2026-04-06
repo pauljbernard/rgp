@@ -11,8 +11,11 @@ from app.db.models import PlanningConstructTable, PlanningMembershipTable, Reque
 from app.db.session import SessionLocal
 from app.models.planning import (
     CreatePlanningConstructRequest,
+    PlanningConstructDetail,
     PlanningConstructRecord,
     PlanningMembershipRecord,
+    PlanningProgressRecord,
+    PlanningRoadmapEntry,
 )
 from app.services.event_store_service import event_store_service
 
@@ -72,6 +75,16 @@ class PlanningService:
                 .one()
             )
             return PlanningConstructRecord.model_validate(row)
+
+    def list_memberships(self, construct_id: str) -> list[PlanningMembershipRecord]:
+        with SessionLocal() as session:
+            rows = (
+                session.query(PlanningMembershipTable)
+                .filter(PlanningMembershipTable.planning_construct_id == construct_id)
+                .order_by(PlanningMembershipTable.sequence.asc(), PlanningMembershipTable.priority.desc())
+                .all()
+            )
+            return [PlanningMembershipRecord.model_validate(r) for r in rows]
 
     def list_constructs(
         self, tenant_id: str, type: str | None = None
@@ -246,9 +259,22 @@ class PlanningService:
     # Roadmap view
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _schedule_state(target_date: datetime | None, completion_pct: float) -> str:
+        if not target_date:
+            return "unscheduled"
+        if completion_pct >= 100.0:
+            return "complete"
+        now = datetime.now(timezone.utc)
+        if target_date < now:
+            return "overdue"
+        if (target_date - now).days <= 14:
+            return "due_soon"
+        return "on_track"
+
     def get_roadmap_view(
         self, tenant_id: str, type: str | None = None
-    ) -> list[dict]:
+    ) -> list[PlanningRoadmapEntry]:
         """Return a timeline projection of constructs with their progress.
 
         Each entry includes the construct metadata plus aggregated
@@ -266,29 +292,49 @@ class PlanningService:
                 PlanningConstructTable.priority.desc(),
             ).all()
 
-            roadmap: list[dict] = []
+            roadmap: list[PlanningRoadmapEntry] = []
             for c in constructs:
                 member_count = (
                     session.query(func.count(PlanningMembershipTable.id))
                     .filter(PlanningMembershipTable.planning_construct_id == c.id)
                     .scalar()
                 )
+                progress = self.aggregate_progress(c.id)
+                completed_count = progress["status_counts"].get("completed", 0) + progress["status_counts"].get("closed", 0)
+                in_progress_count = progress["status_counts"].get("in_progress", 0) + progress["status_counts"].get("awaiting_review", 0)
+                blocked_count = progress["status_counts"].get("blocked", 0)
+                completion_pct = progress["completion_pct"]
 
                 roadmap.append(
-                    {
-                        "id": c.id,
-                        "type": c.type,
-                        "name": c.name,
-                        "status": c.status,
-                        "priority": c.priority,
-                        "target_date": c.target_date.isoformat() if c.target_date else None,
-                        "capacity_budget": c.capacity_budget,
-                        "member_count": member_count,
-                        "owner_team_id": c.owner_team_id,
-                    }
+                    PlanningRoadmapEntry(
+                        id=c.id,
+                        type=c.type,
+                        name=c.name,
+                        status=c.status,
+                        priority=c.priority,
+                        target_date=c.target_date.isoformat() if c.target_date else None,
+                        capacity_budget=c.capacity_budget,
+                        member_count=member_count,
+                        completion_pct=completion_pct,
+                        completed_count=completed_count,
+                        in_progress_count=in_progress_count,
+                        blocked_count=blocked_count,
+                        schedule_state=self._schedule_state(c.target_date, completion_pct),
+                        owner_team_id=c.owner_team_id,
+                    )
                 )
 
             return roadmap
+
+    def get_construct_detail(self, construct_id: str) -> PlanningConstructDetail:
+        construct = self.get_construct(construct_id)
+        memberships = self.list_memberships(construct_id)
+        progress = PlanningProgressRecord(**self.aggregate_progress(construct_id))
+        return PlanningConstructDetail(
+            construct=construct,
+            memberships=memberships,
+            progress=progress,
+        )
 
 
 planning_service = PlanningService()

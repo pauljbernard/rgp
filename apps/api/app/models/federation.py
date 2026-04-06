@@ -20,6 +20,12 @@ class ProjectionMappingRecord(RgpModel):
     projection_status: str = "pending"
     last_projected_at: datetime | None = None
     last_synced_at: datetime | None = None
+    adapter_type: str | None = None
+    adapter_capabilities: list[str] = []
+    sync_source: str | None = None
+    conflicts: list[dict] = []
+    supported_resolution_actions: list[str] = []
+    resolution_guidance: str | None = None
 
 
 class ReconciliationLogRecord(RgpModel):
@@ -29,3 +35,19 @@ class ReconciliationLogRecord(RgpModel):
     detail: str | None = None
     resolved_by: str | None = None
     created_at: datetime | None = None
+
+
+class CreateProjectionRequest(RgpModel):
+    entity_type: str
+    entity_id: str
+
+
+class ResolveProjectionRequest(RgpModel):
+    action: str
+    resolved_by: str | None = None
+
+
+class UpdateProjectionExternalStateRequest(RgpModel):
+    external_status: str | None = None
+    external_title: str | None = None
+    external_ref: str | None = None

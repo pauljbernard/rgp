@@ -1,6 +1,6 @@
 "use server";
 
-import { completeAgentSession, postAgentSessionMessage } from "@/lib/server-api";
+import { completeAgentSession, postAgentSessionMessage, updateAgentSessionGovernance } from "@/lib/server-api";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 
@@ -35,4 +35,20 @@ export async function completeAgentSessionAction(formData: FormData) {
   revalidatePath(`/requests/${requestId}/agents`);
   revalidatePath(`/requests/${requestId}/agents/${sessionId}`);
   redirect(`/requests/${requestId}`);
+}
+
+export async function updateAgentSessionGovernanceAction(formData: FormData) {
+  const requestId = readValue(formData, "requestId");
+  const sessionId = readValue(formData, "sessionId");
+  const collaborationMode = readValue(formData, "collaborationMode");
+  const agentOperatingProfile = readValue(formData, "agentOperatingProfile");
+  await updateAgentSessionGovernance(requestId, sessionId, {
+    collaboration_mode: collaborationMode,
+    agent_operating_profile: agentOperatingProfile,
+    reason: "Updated session governance from agent session page",
+  });
+  revalidatePath(`/requests/${requestId}`);
+  revalidatePath(`/requests/${requestId}/agents`);
+  revalidatePath(`/requests/${requestId}/agents/${sessionId}`);
+  redirect(`/requests/${requestId}/agents/${sessionId}`);
 }

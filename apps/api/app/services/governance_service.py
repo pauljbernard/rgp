@@ -1,9 +1,12 @@
 from app.models.common import PaginatedResponse
+from app.models.federation import CreateProjectionRequest, ProjectionMappingRecord, ReconciliationLogRecord, ResolveProjectionRequest, UpdateProjectionExternalStateRequest
 from app.models.governance import (
     AnalyticsAgentRow,
+    AgentSessionContextDetail,
     AgentSessionDetail,
     AgentSessionRecord,
     AgentSessionMessageCreateRequest,
+    UpdateAgentSessionGovernanceRequest,
     AnalyticsBottleneckRow,
     AnalyticsWorkflowRow,
     AgentTrendPoint,
@@ -75,6 +78,8 @@ from app.repositories.analytics_repository import analytics_repository
 from app.repositories.org_repository import org_repository
 from app.repositories.event_query_repository import event_query_repository
 from app.services.performance_metrics_service import performance_metrics_service
+from app.services.projection_service import projection_service
+from app.services.reconciliation_service import reconciliation_service
 
 
 class GovernanceService:
@@ -90,9 +95,10 @@ class GovernanceService:
         owner_team_id: str | None = None,
         workflow: str | None = None,
         request_id: str | None = None,
+        federation: str | None = None,
         tenant_id: str | None = None,
     ) -> PaginatedResponse[RequestRecord]:
-        return request_lifecycle_repository.list_requests(page, page_size, status, owner_team_id, workflow, request_id, tenant_id)
+        return request_lifecycle_repository.list_requests(page, page_size, status, owner_team_id, workflow, request_id, federation, tenant_id)
 
     def get_request(self, request_id: str, principal: Principal) -> RequestDetail:
         return request_lifecycle_repository.get_request(request_id, principal.tenant_id)
@@ -100,11 +106,30 @@ class GovernanceService:
     def list_agent_integrations_for_request(self, request_id: str, principal: Principal) -> list[IntegrationRecord]:
         return governance_repository.list_agent_integrations_for_request(request_id, principal.tenant_id)
 
+    def preview_agent_assignment_context(
+        self,
+        request_id: str,
+        integration_id: str,
+        collaboration_mode: str,
+        agent_operating_profile: str,
+        principal: Principal,
+    ) -> AgentSessionContextDetail:
+        return governance_repository.preview_agent_assignment_context(
+            request_id,
+            integration_id,
+            collaboration_mode,
+            agent_operating_profile,
+            principal.tenant_id,
+        )
+
     def assign_agent_session(self, request_id: str, payload: AssignAgentSessionRequest, principal: Principal) -> AgentSessionRecord:
         return governance_repository.assign_agent_session(request_id, payload, principal.tenant_id)
 
     def get_agent_session(self, request_id: str, session_id: str, principal: Principal) -> AgentSessionDetail:
         return governance_repository.get_agent_session(request_id, session_id, principal.tenant_id)
+
+    def get_agent_session_context(self, request_id: str, session_id: str, principal: Principal) -> AgentSessionContextDetail:
+        return governance_repository.get_agent_session_context(request_id, session_id, principal.tenant_id)
 
     def post_agent_session_message(
         self,
@@ -114,6 +139,15 @@ class GovernanceService:
         principal: Principal,
     ) -> AgentSessionDetail:
         return governance_repository.post_agent_session_message(request_id, session_id, payload, principal.tenant_id)
+
+    def update_agent_session_governance(
+        self,
+        request_id: str,
+        session_id: str,
+        payload: UpdateAgentSessionGovernanceRequest,
+        principal: Principal,
+    ) -> AgentSessionDetail:
+        return governance_repository.update_agent_session_governance(request_id, session_id, payload, principal.tenant_id)
 
     def stream_agent_session_response(
         self,
@@ -143,12 +177,16 @@ class GovernanceService:
         workflow: str | None = None,
         owner: str | None = None,
         request_id: str | None = None,
+        federation: str | None = None,
         tenant_id: str | None = None,
     ) -> PaginatedResponse[RunRecord]:
-        return governance_repository.list_runs(page, page_size, status, workflow, owner, request_id, tenant_id)
+        return governance_repository.list_runs(page, page_size, status, workflow, owner, request_id, federation, tenant_id)
 
     def get_run(self, run_id: str, principal: Principal) -> RunDetail:
         return governance_repository.get_run(run_id, principal.tenant_id)
+
+    def get_run_history(self, run_id: str, principal: Principal) -> list[AuditEntry]:
+        return governance_repository.list_run_audit_entries(run_id, principal.tenant_id)
 
     def command_run(self, run_id: str, payload: RunCommandRequest, principal: Principal) -> RunDetail:
         return governance_repository.command_run(run_id, payload, principal.tenant_id)
@@ -224,6 +262,9 @@ class GovernanceService:
         workflow: str | None = None,
     ) -> list[WorkflowTrendPoint]:
         return analytics_repository.list_workflow_trends(days, tenant_id, team_id, user_id, portfolio_id, workflow)
+
+    def get_workflow_history(self, workflow: str, principal: Principal, limit: int = 200) -> list[AuditEntry]:
+        return governance_repository.list_workflow_audit_entries(workflow, principal.tenant_id, limit)
 
     def list_agent_analytics(
         self,
@@ -339,6 +380,63 @@ class GovernanceService:
 
     def delete_integration(self, integration_id: str, principal: Principal) -> None:
         org_repository.delete_integration(integration_id, principal.tenant_id)
+
+    def list_integration_projections(self, integration_id: str, principal: Principal) -> list[ProjectionMappingRecord]:
+        return projection_service.list_projections(principal.tenant_id, integration_id)
+
+    def list_request_projections(self, request_id: str, principal: Principal) -> list[ProjectionMappingRecord]:
+        self.get_request(request_id, principal)
+        return projection_service.list_projections(
+            principal.tenant_id,
+            entity_type="request",
+            entity_id=request_id,
+        )
+
+    def create_integration_projection(
+        self,
+        integration_id: str,
+        payload: CreateProjectionRequest,
+        principal: Principal,
+    ) -> ProjectionMappingRecord:
+        return projection_service.project_entity(payload.entity_type, payload.entity_id, integration_id, principal.tenant_id)
+
+    def sync_integration_projection(self, projection_id: str, principal: Principal) -> ProjectionMappingRecord:
+        return projection_service.sync_external_state(projection_id)
+
+    def update_integration_projection_external_state(
+        self,
+        projection_id: str,
+        payload: UpdateProjectionExternalStateRequest,
+        principal: Principal,
+    ) -> ProjectionMappingRecord:
+        return projection_service.update_external_state(
+            projection_id=projection_id,
+            external_status=payload.external_status,
+            external_title=payload.external_title,
+            external_ref=payload.external_ref,
+        )
+
+    def list_integration_reconciliation_logs(
+        self,
+        integration_id: str,
+        principal: Principal,
+    ) -> list[ReconciliationLogRecord]:
+        return reconciliation_service.list_logs(integration_id, principal.tenant_id)
+
+    def reconcile_integration(self, integration_id: str, principal: Principal) -> list[ReconciliationLogRecord]:
+        return reconciliation_service.reconcile_integration(integration_id, principal.tenant_id)
+
+    def resolve_integration_projection(
+        self,
+        projection_id: str,
+        payload: ResolveProjectionRequest,
+        principal: Principal,
+    ) -> ReconciliationLogRecord:
+        return reconciliation_service.apply_resolution(
+            projection_id=projection_id,
+            action=payload.action,
+            resolved_by=payload.resolved_by or principal.user_id,
+        )
 
     def list_users(self, principal: Principal) -> list[UserRecord]:
         return org_repository.list_users(self._admin_scope(principal))

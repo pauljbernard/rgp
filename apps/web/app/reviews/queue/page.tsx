@@ -1,4 +1,4 @@
-import { listReviewQueue } from "@/lib/server-api";
+import { getRequestKnowledgeContext, getRoutingRecommendation, listReviewQueue } from "@/lib/server-api";
 import Link from "next/link";
 import React from "react";
 import { Badge, Button, DataTable, FilterPanel, PageShell, appShellProps } from "../../../components/ui-helpers";
@@ -18,6 +18,8 @@ export default async function ReviewQueuePage({
     stale_only: filters.stale_only === "true",
     request_id: filters.request_id
   });
+  const requestKnowledge = filters.request_id ? await getRequestKnowledgeContext(filters.request_id, 3) : [];
+  const routingRecommendation = filters.request_id ? await getRoutingRecommendation(filters.request_id) : null;
   const sort = filters.sort ?? "priority";
   const order = filters.order === "asc" ? "asc" : "desc";
   const selectedKeys = (filters.selected ?? "").split(",").filter(Boolean);
@@ -120,6 +122,40 @@ export default async function ReviewQueuePage({
             <Link href="/reviews/queue" className="rounded-md border border-chrome bg-white px-4 py-2 text-sm font-medium text-slate-700">Reset</Link>
           </div>
         </form>
+        {filters.request_id ? (
+          <div className="space-y-4 rounded-xl border border-chrome bg-panel px-5 py-4 shadow-panel">
+            <div className="rounded-lg border border-chrome bg-white px-4 py-3 text-sm text-slate-700">
+              <div className="font-medium text-slate-900">Routing Recommendation for {filters.request_id}</div>
+              <div className="mt-1 text-slate-600">{routingRecommendation?.recommended_group_name ?? "No assignment group recommendation"}</div>
+              <div className="mt-1 text-slate-600">SLA status: {routingRecommendation?.sla_status ?? "unknown"}</div>
+              <div className="mt-1 text-slate-600">
+                Basis: {routingRecommendation?.route_basis?.length ? routingRecommendation.route_basis.join(" · ") : "no basis recorded"}
+              </div>
+            </div>
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <h2 className="text-sm font-semibold text-slate-900">Governed Knowledge for {filters.request_id}</h2>
+                <p className="mt-1 text-sm text-slate-600">Published guidance retrieved for the currently filtered request.</p>
+              </div>
+            </div>
+            <div className="mt-3 grid gap-3 lg:grid-cols-3">
+              {requestKnowledge.map((artifact) => (
+                <Link key={artifact.id} href={`/knowledge/${artifact.id}`} className="rounded-lg border border-chrome bg-white px-4 py-3 text-sm text-slate-700">
+                  <div className="font-medium text-slate-900">{artifact.name}</div>
+                  <div className="mt-1 text-slate-600">{artifact.description || "Published governed knowledge artifact."}</div>
+                  <div className="mt-2 text-xs text-slate-500">
+                    v{artifact.version} · {artifact.tags?.length ? artifact.tags.join(", ") : "no tags"}
+                  </div>
+                </Link>
+              ))}
+              {!requestKnowledge.length ? (
+                <div className="rounded-lg border border-dashed border-chrome bg-white px-4 py-3 text-sm text-slate-500">
+                  No governed knowledge suggestions were retrieved for this request.
+                </div>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
         <DataTable
           data={sortedItems}
           emptyMessage="Review queue is empty."

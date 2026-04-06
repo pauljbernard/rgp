@@ -328,6 +328,7 @@ class EndToEndUserStoriesTest(unittest.TestCase):
     def test_story_02_org_and_integration_administration(self) -> None:
         suffix = self._suffix()
         user_id = f"user_e2e_{suffix}"
+        organization_id = f"org_e2e_{suffix}"
         team_id = f"team_e2e_{suffix}"
         portfolio_id = f"port_e2e_{suffix}"
         integration_id = f"int_e2e_{suffix}"
@@ -359,11 +360,20 @@ class EndToEndUserStoriesTest(unittest.TestCase):
         )
         self.assertIn("operator", updated_user["role_summary"])
 
+        created_organization = self._request(
+            "POST",
+            "/api/v1/admin/org/organizations",
+            token=self.token,
+            body={"id": organization_id, "tenant_id": "tenant_demo", "name": f"E2E Organization {suffix}"},
+            expected_statuses={201},
+        )
+        self._assert_equal(created_organization["id"], organization_id)
+
         created_team = self._request(
             "POST",
             "/api/v1/admin/org/teams",
             token=self.token,
-            body={"id": team_id, "name": f"E2E Team {suffix}", "kind": "delivery"},
+            body={"id": team_id, "organization_id": organization_id, "name": f"E2E Team {suffix}", "kind": "delivery"},
             expected_statuses={201},
         )
         self._assert_equal(created_team["id"], team_id)
@@ -372,7 +382,7 @@ class EndToEndUserStoriesTest(unittest.TestCase):
             "PUT",
             f"/api/v1/admin/org/teams/{team_id}",
             token=self.token,
-            body={"name": f"E2E Team {suffix} Updated", "kind": "delivery", "status": "active"},
+            body={"organization_id": organization_id, "name": f"E2E Team {suffix} Updated", "kind": "delivery", "status": "active"},
         )
         self.assertTrue(updated_team["name"].endswith("Updated"))
 
@@ -645,6 +655,333 @@ class EndToEndUserStoriesTest(unittest.TestCase):
         self.assertGreaterEqual(perf_trends["total_count"], 1)
         self.assertIn("queued_checks", perf_ops)
         self.assertGreaterEqual(len(perf_ops_trends), 1)
+
+    def test_story_07_federated_operator_remediation(self) -> None:
+        suffix = self._suffix()
+        request = self._create_request(f"Federation Story {suffix}", f"asm_federation_{suffix}")
+        request_id = request["id"]
+        self._submit_request(request_id)
+
+        projection = self._request(
+            "POST",
+            "/api/v1/admin/integrations/int_agent_codex/projections",
+            token=self.token,
+            body={"entity_type": "request", "entity_id": request_id},
+            expected_statuses={201},
+        )
+        projection_id = projection["id"]
+
+        synced = self._request(
+            "POST",
+            f"/api/v1/admin/projections/{projection_id}/sync",
+            token=self.token,
+            body=None,
+        )
+        self._assert_equal(synced["adapter_type"], "openai_projection")
+        self.assertIn("agent_state", synced["external_state"])
+
+        conflicted = self._request(
+            "POST",
+            f"/api/v1/admin/projections/{projection_id}/external-state",
+            token=self.token,
+            body={"external_status": "external_review", "external_title": f"Externally Revised {suffix}"},
+        )
+        self.assertGreaterEqual(len(conflicted["conflicts"]), 1)
+
+        request_projections_after_conflict = self._request("GET", f"/api/v1/requests/{request_id}/projections", token=self.token)
+        conflicted_projection = next(item for item in request_projections_after_conflict if item["id"] == projection_id)
+        self.assertGreaterEqual(len(conflicted_projection["conflicts"]), 1)
+
+        request_history = self._request("GET", f"/api/v1/requests/{request_id}/history", token=self.token)
+        self.assertTrue(any(entry["object_type"] == "projection" for entry in request_history))
+
+        workflow_name = self._get_request_detail(request_id)["request"]["workflow_binding_id"] or "tmpl_assessment"
+        workflow_history = self._request("GET", f"/api/v1/analytics/workflows/{workflow_name}/history", token=self.token)
+        self.assertTrue(any(entry["related_entity_id"] == workflow_name for entry in workflow_history))
+
+        resolved = self._request(
+            "POST",
+            f"/api/v1/admin/projections/{projection_id}/resolve",
+            token=self.token,
+            body={"action": "resume_session"},
+        )
+        self._assert_equal(resolved["action"], "resume_session")
+
+        projections = self._request("GET", "/api/v1/admin/integrations/int_agent_codex/projections", token=self.token)
+        projection_row = next(item for item in projections if item["id"] == projection_id)
+        self._assert_equal(projection_row["projection_status"], "reconciled")
+        self._assert_equal(projection_row["external_state"]["agent_state"]["session_status"], "resume_requested")
+        self.assertIn("resume_ticket", projection_row["external_state"]["agent_state"])
+
+        resynced = self._request(
+            "POST",
+            f"/api/v1/admin/projections/{projection_id}/sync",
+            token=self.token,
+            body=None,
+        )
+        self._assert_equal(resynced["external_state"]["agent_state"]["session_status"], "resume_requested")
+
+        request_projections = self._request("GET", f"/api/v1/requests/{request_id}/projections", token=self.token)
+        matching = next(item for item in request_projections if item["id"] == projection_id)
+        self._assert_equal(matching["projection_status"], "synced")
+        self.assertIn("resume_ticket", matching["external_state"]["agent_state"])
+
+    def test_story_08_federated_visibility_and_workflow_analytics(self) -> None:
+        suffix = self._suffix()
+        request = self._create_request(f"Federation Visibility {suffix}", f"asm_fed_visibility_{suffix}")
+        request_id = request["id"]
+        self._submit_request(request_id)
+
+        projection = self._request(
+            "POST",
+            "/api/v1/admin/integrations/int_001/projections",
+            token=self.token,
+            body={"entity_type": "request", "entity_id": request_id},
+            expected_statuses={201},
+        )
+        projection_id = projection["id"]
+
+        synced = self._request(
+            "POST",
+            f"/api/v1/admin/projections/{projection_id}/sync",
+            token=self.token,
+            body=None,
+        )
+        self._assert_equal(synced["adapter_type"], "runtime_projection")
+        self.assertIn("runtime_state", synced["external_state"])
+
+        conflicted = self._request(
+            "POST",
+            f"/api/v1/admin/projections/{projection_id}/external-state",
+            token=self.token,
+            body={"external_status": "degraded", "external_title": f"Runtime Drift {suffix}"},
+        )
+        self.assertGreaterEqual(len(conflicted["conflicts"]), 1)
+
+        projected_requests = self._request(
+            "GET",
+            "/api/v1/requests",
+            token=self.token,
+            query={"federation": "with_projection"},
+        )
+        projected_row = next(item for item in projected_requests["items"] if item["id"] == request_id)
+        self.assertGreaterEqual(projected_row["federated_projection_count"], 1)
+
+        conflicted_requests = self._poll(
+            lambda: self._request(
+                "GET",
+                "/api/v1/requests",
+                token=self.token,
+                query={"federation": "with_conflict"},
+            ),
+            lambda payload: any(item["id"] == request_id for item in payload["items"]),
+            timeout=10,
+            interval=1,
+            message="Request conflict queue did not reflect the projection conflict",
+        )
+        conflicted_row = next(item for item in conflicted_requests["items"] if item["id"] == request_id)
+        self.assertGreaterEqual(conflicted_row["federated_conflict_count"], 1)
+
+        workflow_name = self._get_request_detail(request_id)["request"]["workflow_binding_id"] or "tmpl_assessment"
+        workflow_rows = self._poll(
+            lambda: self._request(
+                "GET",
+                "/api/v1/analytics/workflows",
+                token=self.token,
+                query={"days": 30},
+            ),
+            lambda payload: any(
+                item["workflow"] == workflow_name and item["federated_projection_count"] >= 1
+                for item in payload
+            ),
+            timeout=10,
+            interval=1,
+            message="Workflow analytics did not reflect the federated projection",
+        )
+        workflow_row = next(item for item in workflow_rows if item["workflow"] == workflow_name)
+        self.assertGreaterEqual(workflow_row["federated_projection_count"], 1)
+        self.assertGreaterEqual(workflow_row["federated_conflict_count"], 1)
+        self.assertNotEqual(workflow_row["federated_coverage"], "0%")
+
+        workflow_history = self._request("GET", f"/api/v1/analytics/workflows/{workflow_name}/history", token=self.token)
+        self.assertTrue(any(entry["object_type"] == "projection" for entry in workflow_history))
+
+    def test_story_09_knowledge_artifact_lifecycle(self) -> None:
+        suffix = self._suffix()
+        created = self._request(
+            "POST",
+            "/api/v1/knowledge",
+            token=self.token,
+            body={
+                "name": f"Review Playbook {suffix}",
+                "description": "Reusable governed review guidance.",
+                "content": "Use the approved rubric and publish only reviewed changes.",
+                "content_type": "markdown",
+                "tags": ["review", "policy"],
+            },
+            expected_statuses={201},
+        )
+        artifact_id = created["id"]
+        self._assert_equal(created["status"], "draft")
+
+        listed = self._request("GET", "/api/v1/knowledge", token=self.token, query={"query": suffix})
+        self.assertTrue(any(item["id"] == artifact_id for item in listed["items"]))
+
+        published = self._request(
+            "POST",
+            f"/api/v1/knowledge/{artifact_id}/publish",
+            token=self.token,
+            body={},
+        )
+        self._assert_equal(published["status"], "published")
+        self.assertGreaterEqual(int(published["version"]), 2)
+
+        detail = self._request("GET", f"/api/v1/knowledge/{artifact_id}", token=self.token)
+        self._assert_equal(detail["id"], artifact_id)
+
+        versions = self._request("GET", f"/api/v1/knowledge/{artifact_id}/versions", token=self.token)
+        self.assertGreaterEqual(len(versions), 2)
+        self.assertEqual(versions[0]["version"], published["version"])
+
+        context_results = self._request("GET", "/api/v1/knowledge/context/request/req_001", token=self.token)
+        self.assertTrue(any(item["id"] == artifact_id for item in context_results))
+
+    def test_story_10_planning_construct_lifecycle(self) -> None:
+        created = self._request(
+            "POST",
+            "/api/v1/planning",
+            token=self.token,
+            body={
+                "type": "initiative",
+                "name": f"Assessment Planning Initiative {self._suffix()}",
+                "description": "Coordinates related assessment requests",
+                "owner_team_id": "team_assessment_quality",
+                "priority": 5,
+                "capacity_budget": 24,
+            },
+            expected_statuses={201},
+        )
+        self.assertEqual(created["type"], "initiative")
+
+        constructs = self._request("GET", "/api/v1/planning", token=self.token)
+        self.assertTrue(any(item["id"] == created["id"] for item in constructs))
+
+        roadmap = self._request("GET", "/api/v1/planning/roadmap", token=self.token)
+        roadmap_entry = next(item for item in roadmap if item["id"] == created["id"])
+        self.assertEqual(roadmap_entry["completion_pct"], 0.0)
+        self.assertEqual(roadmap_entry["member_count"], 0)
+        self.assertEqual(roadmap_entry["schedule_state"], "unscheduled")
+
+        membership = self._request(
+            "POST",
+            f"/api/v1/planning/{created['id']}/memberships",
+            token=self.token,
+            body={"request_id": "req_001", "sequence": 1, "priority": 5},
+            expected_statuses={201},
+        )
+        self.assertEqual(membership["request_id"], "req_001")
+
+        detail = self._request("GET", f"/api/v1/planning/{created['id']}", token=self.token)
+        self.assertEqual(detail["construct"]["id"], created["id"])
+        self.assertEqual(len(detail["memberships"]), 1)
+        self.assertEqual(detail["memberships"][0]["request_id"], "req_001")
+
+        roadmap_after_attach = self._request("GET", "/api/v1/planning/roadmap", token=self.token)
+        attached_entry = next(item for item in roadmap_after_attach if item["id"] == created["id"])
+        self.assertEqual(attached_entry["member_count"], 1)
+        self.assertGreaterEqual(attached_entry["in_progress_count"], 0)
+
+        updated = self._request(
+            "POST",
+            f"/api/v1/planning/{created['id']}/memberships/req_001",
+            token=self.token,
+            body={"sequence": 3, "priority": 9},
+        )
+        self.assertEqual(updated["sequence"], 3)
+        self.assertEqual(updated["priority"], 9)
+
+        self._request(
+            "DELETE",
+            f"/api/v1/planning/{created['id']}/memberships/req_001",
+            token=self.token,
+            expected_statuses={204},
+        )
+        detail = self._request("GET", f"/api/v1/planning/{created['id']}", token=self.token)
+        self.assertEqual(len(detail["memberships"]), 0)
+
+    def test_story_11_domain_pack_lifecycle(self) -> None:
+        pack_name = f"Editorial Pack {self._suffix()}"
+        baseline = self._request(
+            "POST",
+            "/api/v1/domain-packs",
+            token=self.token,
+            body={
+                "name": pack_name,
+                "version": "0.9.0",
+                "description": "Baseline editorial pack.",
+                "contributed_templates": ["tmpl_editorial_legacy"],
+                "contributed_artifact_types": ["document"],
+                "contributed_workflows": ["wf_legacy"],
+                "contributed_policies": ["pol_editorial_review"],
+            },
+            expected_statuses={201},
+        )
+        created = self._request(
+            "POST",
+            "/api/v1/domain-packs",
+            token=self.token,
+            body={
+                "name": pack_name,
+                "version": "1.0.0",
+                "description": "Adds editorial templates and policy assets.",
+                "contributed_templates": ["tmpl_editorial"],
+                "contributed_artifact_types": ["document"],
+                "contributed_workflows": ["wf_editorial_publish"],
+                "contributed_policies": ["pol_editorial_review"],
+            },
+            expected_statuses={201},
+        )
+        self.assertEqual(created["status"], "draft")
+
+        listed = self._request("GET", "/api/v1/domain-packs", token=self.token)
+        self.assertTrue(any(item["id"] == created["id"] for item in listed))
+
+        activated = self._request(
+            "POST",
+            f"/api/v1/domain-packs/{created['id']}/activate",
+            token=self.token,
+            body={},
+        )
+        self.assertEqual(activated["status"], "active")
+
+        installation = self._request(
+            "POST",
+            f"/api/v1/domain-packs/{created['id']}/install",
+            token=self.token,
+            body={},
+            expected_statuses={201},
+        )
+        self.assertEqual(installation["pack_id"], created["id"])
+
+        detail = self._request("GET", f"/api/v1/domain-packs/{created['id']}", token=self.token)
+        self.assertEqual(detail["pack"]["id"], created["id"])
+        self.assertEqual(detail["pack"]["status"], "active")
+        self.assertGreaterEqual(len(detail["installations"]), 1)
+
+        validation = self._request("GET", f"/api/v1/domain-packs/{created['id']}/validate", token=self.token)
+        self.assertEqual(validation, [])
+
+        comparison = self._request("GET", f"/api/v1/domain-packs/{created['id']}/compare", token=self.token)
+        self.assertEqual(comparison["baseline_pack_id"], baseline["id"])
+        self.assertEqual(comparison["baseline_version"], "0.9.0")
+        templates = next(delta for delta in comparison["deltas"] if delta["category"] == "templates")
+        self.assertIn("tmpl_editorial", templates["added"])
+        self.assertIn("tmpl_editorial_legacy", templates["removed"])
+
+        lineage = self._request("GET", f"/api/v1/domain-packs/{created['id']}/lineage", token=self.token)
+        self.assertGreaterEqual(len(lineage), 2)
+        self.assertEqual(lineage[0]["pack_id"], created["id"])
+        self.assertTrue(any(entry["pack_id"] == baseline["id"] for entry in lineage))
 
 
 if __name__ == "__main__":

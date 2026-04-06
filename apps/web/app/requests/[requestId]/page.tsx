@@ -1,4 +1,4 @@
-import { getRequest, listRequestAgentIntegrations } from "@/lib/server-api";
+import { getRequest, getRequestKnowledgeContext, getRoutingRecommendation, listRequestAgentIntegrations, listRequestProjections } from "@/lib/server-api";
 import type { RequestStatus } from "@rgp/domain";
 import { Badge, Button, EntityHeader, KeyValueGrid, PageShell, SectionHeading, Tabs, appShellProps, statusTone } from "../../../components/ui-helpers";
 import { RefreshOnCheckRunEvents } from "../../../components/refresh-on-check-run-events";
@@ -14,7 +14,13 @@ export default async function RequestDetailPage({
   const { requestId } = await params;
   const resolvedSearchParams = await searchParams;
   const errorMessage = typeof resolvedSearchParams.error === "string" && resolvedSearchParams.error ? resolvedSearchParams.error : "";
-  const [data, integrations] = await Promise.all([getRequest(requestId), listRequestAgentIntegrations(requestId)]);
+  const [data, integrations, projections, knowledge, routingRecommendation] = await Promise.all([
+    getRequest(requestId),
+    listRequestAgentIntegrations(requestId),
+    listRequestProjections(requestId),
+    getRequestKnowledgeContext(requestId, 4),
+    getRoutingRecommendation(requestId)
+  ]);
   const request = data.request;
   const agentIntegrations = integrations.filter((item) => item.supports_direct_assignment && item.supports_interactive_sessions);
   const canSubmit = ["draft", "changes_requested", "validation_failed", "awaiting_input"].includes(request.status);
@@ -190,6 +196,81 @@ export default async function RequestDetailPage({
                 </a>
               ))}
               {!data.agent_sessions.length ? <div className="text-sm text-slate-500">No interactive agent sessions assigned yet.</div> : null}
+            </div>
+            <SectionHeading title="Governed Knowledge" />
+            <div className="space-y-2">
+              {knowledge.map((artifact) => (
+                <a
+                  key={artifact.id}
+                  href={`/knowledge/${artifact.id}`}
+                  className="block rounded-lg border border-chrome bg-slate-50 px-4 py-3 text-sm text-slate-700"
+                >
+                  <div className="font-medium">{artifact.name}</div>
+                  <div className="mt-1 text-slate-600">{artifact.description || "Published governed knowledge artifact."}</div>
+                  <div className="mt-2 text-xs text-slate-500">
+                    v{artifact.version} · {artifact.tags?.length ? artifact.tags.join(", ") : "no tags"}
+                  </div>
+                </a>
+              ))}
+              {!knowledge.length ? <div className="text-sm text-slate-500">No governed knowledge suggestions were retrieved for this request.</div> : null}
+            </div>
+            <SectionHeading title="Routing Recommendation" />
+            <div className="rounded-lg border border-chrome bg-slate-50 px-4 py-3 text-sm text-slate-700">
+              <div className="font-medium text-slate-900">
+                {routingRecommendation.recommended_group_name ?? "No assignment group recommendation"}
+              </div>
+              <div className="mt-1 text-slate-600">SLA status: {routingRecommendation.sla_status}</div>
+              <div className="mt-1 text-slate-600">
+                Matched skills: {routingRecommendation.matched_skills.length ? routingRecommendation.matched_skills.join(", ") : "none"}
+              </div>
+              <div className="mt-1 text-slate-600">
+                Basis: {routingRecommendation.route_basis.length ? routingRecommendation.route_basis.join(" · ") : "no basis recorded"}
+              </div>
+              {routingRecommendation.escalation_targets.length ? (
+                <div className="mt-2 text-xs text-amber-700">
+                  Escalations: {routingRecommendation.escalation_targets.join(", ")}
+                </div>
+              ) : null}
+            </div>
+            <SectionHeading title="Federated Projections" />
+            <div className="space-y-2">
+              {projections.map((projection) => (
+                <div key={projection.id} className="rounded-lg border border-chrome bg-slate-50 px-4 py-3 text-sm text-slate-700">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="font-medium">{projection.external_system}</div>
+                    <Badge tone={projection.conflicts.length ? "warning" : statusTone("completed")}>
+                      {projection.conflicts.length ? `${projection.conflicts.length} conflict${projection.conflicts.length === 1 ? "" : "s"}` : projection.projection_status}
+                    </Badge>
+                  </div>
+                  <div className="mt-1 text-slate-600">
+                    {projection.external_ref ?? "No external reference recorded"}
+                  </div>
+                  <div className="mt-2 text-xs text-slate-500">
+                    Adapter {projection.adapter_type ?? "unknown"} via {projection.sync_source ?? "unspecified source"}
+                  </div>
+                  <div className="mt-1 text-xs text-slate-500">
+                    Capabilities {(projection.adapter_capabilities.length ? projection.adapter_capabilities.join(", ") : "none declared")}
+                  </div>
+                  <div className="mt-2 text-xs text-slate-500">
+                    Last sync {projection.last_synced_at ? new Date(projection.last_synced_at).toLocaleString() : "not yet synced"}
+                  </div>
+                  <div className="mt-2">
+                    <a href={`/requests/${request.id}/projections/${projection.id}`} className="text-xs font-medium text-accent">
+                      Open projection drilldown
+                    </a>
+                  </div>
+                  {projection.conflicts.length ? (
+                    <div className="mt-2 space-y-1 text-xs text-amber-700">
+                      {projection.conflicts.map((conflict) => (
+                        <div key={`${projection.id}-${String(conflict.field)}`}>
+                          {String(conflict.field)}: canonical {String(conflict.internal)} / external {String(conflict.external)}
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              ))}
+              {!projections.length ? <div className="text-sm text-slate-500">No federated projections are currently bound to this request.</div> : null}
             </div>
             <SectionHeading title="Assign to Agent" />
             <form action={assignAgentSessionAction} className="space-y-3 rounded-lg border border-chrome bg-slate-50 p-4">

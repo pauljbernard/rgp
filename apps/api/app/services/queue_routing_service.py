@@ -181,6 +181,19 @@ class QueueRoutingService:
             session.refresh(row)
             return _escalation_record(row)
 
+    def list_escalation_rules(self, tenant_id: str) -> list[dict]:
+        with SessionLocal() as session:
+            rows = (
+                session.query(EscalationRuleTable)
+                .filter(
+                    EscalationRuleTable.tenant_id == tenant_id,
+                    EscalationRuleTable.status == "active",
+                )
+                .order_by(EscalationRuleTable.created_at.asc())
+                .all()
+            )
+            return [_escalation_record(r) for r in rows]
+
     def evaluate_escalations(
         self, request_id: str, tenant_id: str
     ) -> list[dict]:
@@ -233,6 +246,85 @@ class QueueRoutingService:
 
             return triggered
 
+    def execute_escalation(
+        self,
+        request_id: str,
+        rule_id: str,
+        tenant_id: str,
+        actor: str,
+    ) -> dict:
+        now = datetime.now(timezone.utc)
+
+        with SessionLocal() as session:
+            request_row = (
+                session.query(RequestTable)
+                .filter(
+                    RequestTable.id == request_id,
+                    RequestTable.tenant_id == tenant_id,
+                )
+                .first()
+            )
+            rule_row = (
+                session.query(EscalationRuleTable)
+                .filter(
+                    EscalationRuleTable.id == rule_id,
+                    EscalationRuleTable.tenant_id == tenant_id,
+                    EscalationRuleTable.status == "active",
+                )
+                .first()
+            )
+            if not request_row or not rule_row:
+                raise ValueError("Unknown request or escalation rule")
+
+            outcome = f"escalated:{rule_row.escalation_type}"
+            if rule_row.escalation_type == "reassign":
+                request_row.owner_team_id = rule_row.escalation_target
+                request_row.updated_at = now
+                request_row.updated_by = actor
+                outcome = f"reassigned:{rule_row.escalation_target}"
+            else:
+                policy_context = dict(request_row.policy_context or {})
+                policy_context["last_escalation"] = {
+                    "rule_id": rule_row.id,
+                    "type": rule_row.escalation_type,
+                    "target": rule_row.escalation_target,
+                    "executed_at": now.isoformat(),
+                    "executed_by": actor,
+                }
+                request_row.policy_context = policy_context
+                request_row.updated_at = now
+                request_row.updated_by = actor
+                outcome = f"{rule_row.escalation_type}:{rule_row.escalation_target}"
+
+            session.flush()
+
+            event_store_service.append(
+                session,
+                tenant_id=tenant_id,
+                event_type="queue_routing.escalation_executed",
+                aggregate_type="request",
+                aggregate_id=request_id,
+                actor=actor,
+                detail=f"Escalation rule '{rule_row.name}' executed for request {request_id}",
+                request_id=request_id,
+                payload={
+                    "rule_id": rule_row.id,
+                    "escalation_type": rule_row.escalation_type,
+                    "escalation_target": rule_row.escalation_target,
+                    "outcome": outcome,
+                },
+            )
+            session.commit()
+
+            return {
+                "request_id": request_id,
+                "rule_id": rule_row.id,
+                "escalation_type": rule_row.escalation_type,
+                "escalation_target": rule_row.escalation_target,
+                "outcome": outcome,
+                "executed_at": now.isoformat(),
+            }
+
     # ------------------------------------------------------------------
     # Load management
     # ------------------------------------------------------------------
@@ -258,6 +350,66 @@ class QueueRoutingService:
             )
             row.current_load = max(0, row.current_load - 1)
             session.commit()
+
+    # ------------------------------------------------------------------
+    # Recommendation
+    # ------------------------------------------------------------------
+
+    def recommend_assignment(
+        self,
+        request_id: str,
+        tenant_id: str,
+    ) -> dict:
+        with SessionLocal() as session:
+            request_row = (
+                session.query(RequestTable)
+                .filter(
+                    RequestTable.id == request_id,
+                    RequestTable.tenant_id == tenant_id,
+                )
+                .first()
+            )
+            if not request_row:
+                return {
+                    "request_id": request_id,
+                    "recommended_group_id": None,
+                    "recommended_group_name": None,
+                    "matched_skills": [],
+                    "route_basis": [],
+                    "current_load": None,
+                    "max_capacity": None,
+                }
+
+            required_skills = sorted(
+                {
+                    *(request_row.tags or []),
+                    request_row.request_type,
+                    str(request_row.priority),
+                }
+            )
+            recommended = self.route_by_skill(required_skills, tenant_id) or self.route_by_capacity(tenant_id)
+            route_basis: list[str] = []
+            matched_skills: list[str] = []
+            if recommended:
+                matched_skills = sorted(set(recommended.get("skill_tags", [])) & set(required_skills))
+                if matched_skills:
+                    route_basis.append(f"skill overlap: {', '.join(matched_skills)}")
+                if recommended.get("max_capacity") is not None:
+                    route_basis.append(f"capacity: {recommended['current_load']}/{recommended['max_capacity']}")
+                else:
+                    route_basis.append("capacity: unbounded")
+            else:
+                route_basis.append("no eligible assignment group found")
+
+            return {
+                "request_id": request_id,
+                "recommended_group_id": recommended.get("id") if recommended else None,
+                "recommended_group_name": recommended.get("name") if recommended else None,
+                "matched_skills": matched_skills,
+                "route_basis": route_basis,
+                "current_load": recommended.get("current_load") if recommended else None,
+                "max_capacity": recommended.get("max_capacity") if recommended else None,
+            }
 
 
 queue_routing_service = QueueRoutingService()

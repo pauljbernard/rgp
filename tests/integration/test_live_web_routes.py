@@ -13,6 +13,17 @@ class LiveWebRoutesTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.admin_token = cls._issue_dev_token(["admin", "operator", "reviewer", "submitter"])
         cls.reviewer_token = cls._issue_dev_token(["reviewer", "submitter"])
+        cls._api_post(
+            "/api/v1/admin/integrations/int_agent_codex/projections",
+            {"entity_type": "request", "entity_id": "req_022"},
+        )
+        projections = cls._api_get("/api/v1/admin/integrations/int_agent_codex/projections")
+        projection = next((row for row in projections if row["entity_id"] == "req_022"), None)
+        if projection is not None:
+            cls._api_post(f"/api/v1/admin/projections/{projection['id']}/external-state", {
+                "external_status": "external_review",
+                "external_title": "Externally Revised Request",
+            })
 
     @classmethod
     def _issue_dev_token(cls, roles: list[str]) -> str:
@@ -47,6 +58,33 @@ class LiveWebRoutesTest(unittest.TestCase):
         with urllib.request.urlopen(request, timeout=60) as response:
             return response.read().decode("utf-8")
 
+    @classmethod
+    def _api_get(cls, path: str):
+        request = urllib.request.Request(
+            f"{API_BASE}{path}",
+            headers={"Authorization": f"Bearer {cls.admin_token}"},
+            method="GET",
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    @classmethod
+    def _api_post(cls, path: str, payload: dict | None):
+        request = urllib.request.Request(
+            f"{API_BASE}{path}",
+            data=(json.dumps(payload).encode("utf-8") if payload is not None else b""),
+            headers={
+                "Authorization": f"Bearer {cls.admin_token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            body = response.read().decode("utf-8")
+            if not body:
+                return None
+            return json.loads(body)
+
     def test_admin_templates_live_route(self) -> None:
         html = self._get_web_html("/admin/templates")
         self.assertIn("Admin Templates", html)
@@ -67,6 +105,26 @@ class LiveWebRoutesTest(unittest.TestCase):
         self.assertIn("Template ID", html)
         self.assertIn("Assessment Revision", html)
         self.assertNotIn("Use this template", html)
+
+    def test_workflow_history_live_route(self) -> None:
+        html = self._get_web_html("/analytics/workflows/tmpl_assessment/history")
+        self.assertIn("tmpl_assessment History", html)
+        self.assertIn("Open Federation View", html)
+        self.assertIn("Canonical Only", html)
+        self.assertIn("Resolutions", html)
+
+    def test_workflow_federation_live_route(self) -> None:
+        html = self._get_web_html("/analytics/workflows/tmpl_assessment/federation?federation=with_conflict")
+        self.assertIn("tmpl_assessment Federation", html)
+        self.assertIn("Affected Requests", html)
+        self.assertIn("Open Workflow History", html)
+        self.assertTrue("Open request" in html or "No requests matched this workflow federation view." in html)
+
+    def test_request_federated_conflicts_live_route(self) -> None:
+        html = self._get_web_html("/requests/federated-conflicts")
+        self.assertIn("Federated Conflicts", html)
+        self.assertTrue("Open request" in html or "No requests currently have federated conflicts." in html)
+        self.assertTrue("Open history" in html or "No requests currently have federated conflicts." in html)
 
     def test_admin_templates_non_admin_redirects_to_forbidden(self) -> None:
         html = self._get_web_html_with_token("/admin/templates", self.reviewer_token)

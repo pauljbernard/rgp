@@ -187,18 +187,42 @@ export default async function WorkflowAnalyticsPage({
             {
               key: "workflow",
               header: "Workflow",
-              render: (row) => <Link href={`/runs?workflow=${encodeURIComponent(row.workflow)}`} className="text-accent">{row.workflow}</Link>
+              render: (row) => (
+                <div className="space-y-1">
+                  <div><Link href={`/runs?workflow=${encodeURIComponent(row.workflow)}`} className="text-accent">{row.workflow}</Link></div>
+                  <div><Link href={`/analytics/workflows/${encodeURIComponent(row.workflow)}/federation`} className="text-xs text-slate-600 hover:text-accent">Open federation view</Link></div>
+                  <div><Link href={`/analytics/workflows/${encodeURIComponent(row.workflow)}/history`} className="text-xs text-slate-600 hover:text-accent">Open workflow history</Link></div>
+                </div>
+              )
             },
             { key: "avg", header: "Avg Cycle Time", render: (row) => row.avg_cycle_time },
             { key: "p95", header: "P95 Duration", render: (row) => row.p95_duration },
             { key: "failure", header: "Failure Rate", render: (row) => row.failure_rate },
             { key: "review", header: "Review Delay", render: (row) => row.review_delay },
+            {
+              key: "federation",
+              header: "Federation",
+              render: (row) => (
+                <div className="space-y-1">
+                  <div>{row.federated_projection_count} projection{row.federated_projection_count === 1 ? "" : "s"}</div>
+                  <div>{row.federated_coverage} coverage</div>
+                  <div>{row.federated_conflict_count} conflict{row.federated_conflict_count === 1 ? "" : "s"}</div>
+                </div>
+              )
+            },
             { key: "cost", header: "Cost per Execution", render: (row) => row.cost_per_execution },
             { key: "trend", header: "Trend", render: (row) => row.trend },
             {
               key: "drilldown",
               header: "Drill Down",
-              render: (row) => <Link href={`/requests?workflow=${encodeURIComponent(row.workflow)}`} className="text-accent">View requests</Link>
+              render: (row) => (
+                <div className="space-y-1">
+                  <div><Link href={`/requests?workflow=${encodeURIComponent(row.workflow)}`} className="text-accent">View requests</Link></div>
+                  <div><Link href={`/runs?workflow=${encodeURIComponent(row.workflow)}&federation=with_conflict`} className="text-accent">View federated conflicts</Link></div>
+                  <div><Link href={`/analytics/workflows/${encodeURIComponent(row.workflow)}/federation?federation=with_conflict`} className="text-accent">Open federation control</Link></div>
+                  <div><Link href={`/analytics/workflows/${encodeURIComponent(row.workflow)}/history`} className="text-accent">Open workflow history</Link></div>
+                </div>
+              )
             }
           ]}
         />

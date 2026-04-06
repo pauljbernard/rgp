@@ -27,6 +27,35 @@ class DomainPackInstallation(RgpModel):
     installed_by: str = ""
     installed_at: datetime | None = None
 
+
+class DomainPackDetail(RgpModel):
+    pack: DomainPackRecord
+    installations: list[DomainPackInstallation]
+
+
+class DomainPackContributionDelta(RgpModel):
+    category: str
+    added: list[str] = []
+    removed: list[str] = []
+
+
+class DomainPackComparison(RgpModel):
+    current_pack_id: str
+    current_version: str
+    baseline_pack_id: str | None = None
+    baseline_version: str | None = None
+    deltas: list[DomainPackContributionDelta] = []
+    summary: str
+
+
+class DomainPackLineageEntry(RgpModel):
+    pack_id: str
+    version: str
+    status: str
+    created_at: datetime | None = None
+    activated_at: datetime | None = None
+    contribution_count: int = 0
+
 class CreateDomainPackRequest(RgpModel):
     name: str
     version: str

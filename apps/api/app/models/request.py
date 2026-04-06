@@ -64,6 +64,8 @@ class RequestRecord(RgpModel):
     is_archived: bool = False
     sla_risk_level: str | None = None
     sla_risk_reason: str | None = None
+    federated_projection_count: int = 0
+    federated_conflict_count: int = 0
 
 
 class CreateRequestDraft(RgpModel):

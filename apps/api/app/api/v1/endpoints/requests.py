@@ -7,7 +7,8 @@ from fastapi.responses import StreamingResponse
 
 from app.core.auth import ensure_roles, get_principal
 from app.models.common import PaginatedResponse
-from app.models.governance import AgentSessionDetail, AgentSessionMessageCreateRequest, AgentSessionRecord, AssignAgentSessionRequest, AuditEntry, CompleteAgentSessionRequest, IntegrationRecord, RequestDetail
+from app.models.governance import AgentSessionContextDetail, AgentSessionDetail, AgentSessionMessageCreateRequest, AgentSessionRecord, AssignAgentSessionRequest, AuditEntry, CompleteAgentSessionRequest, IntegrationRecord, RequestDetail, UpdateAgentSessionGovernanceRequest
+from app.models.federation import ProjectionMappingRecord
 from app.models.request import AmendRequest, CancelRequest, CloneRequest, CreateRequestDraft, RequestCheckRun, RequestRecord, SubmitRequest, SupersedeRequest, TransitionRequest
 from app.models.security import Principal, PrincipalRole
 from app.services.idempotency_service import idempotency_service
@@ -26,6 +27,7 @@ def list_requests(
     owner_team_id: str | None = Query(default=None),
     workflow: str | None = Query(default=None),
     request_id: str | None = Query(default=None),
+    federation: str | None = Query(default=None),
     principal: Annotated[Principal, Depends(get_principal)] = None,
 ) -> PaginatedResponse[RequestRecord]:
     return governance_service.list_requests(
@@ -35,6 +37,7 @@ def list_requests(
         owner_team_id=owner_team_id,
         workflow=workflow,
         request_id=request_id,
+        federation=federation,
         tenant_id=principal.tenant_id,
     )
 
@@ -265,6 +268,16 @@ def get_request_history(request_id: str, principal: Annotated[Principal, Depends
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
 
 
+@router.get("/{request_id}/projections", response_model=list[ProjectionMappingRecord])
+def list_request_projections(request_id: str, principal: Annotated[Principal, Depends(get_principal)]) -> list[ProjectionMappingRecord]:
+    try:
+        return governance_service.list_request_projections(request_id, principal)
+    except StopIteration:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Request not found") from None
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+
+
 @router.get("/{request_id}/agent-integrations", response_model=list[IntegrationRecord])
 def list_request_agent_integrations(
     request_id: str,
@@ -275,6 +288,29 @@ def list_request_agent_integrations(
         return governance_service.list_agent_integrations_for_request(request_id, principal)
     except StopIteration:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Request not found") from None
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+
+
+@router.get("/{request_id}/agent-assignment-preview", response_model=AgentSessionContextDetail)
+def get_request_agent_assignment_preview(
+    request_id: str,
+    integration_id: str = Query(...),
+    collaboration_mode: str = Query(default="agent_assisted"),
+    agent_operating_profile: str = Query(default="general"),
+    principal: Annotated[Principal, Depends(get_principal)] = None,
+) -> AgentSessionContextDetail:
+    try:
+        ensure_roles(principal, PrincipalRole.SUBMITTER, PrincipalRole.OPERATOR, PrincipalRole.ADMIN)
+        return governance_service.preview_agent_assignment_context(
+            request_id,
+            integration_id,
+            collaboration_mode,
+            agent_operating_profile,
+            principal,
+        )
+    except StopIteration as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Not found: {exc.args[0]}") from None
     except PermissionError as exc:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
 
@@ -311,6 +347,20 @@ def get_agent_session(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
 
 
+@router.get("/{request_id}/agent-sessions/{session_id}/context", response_model=AgentSessionContextDetail)
+def get_agent_session_context(
+    request_id: str,
+    session_id: str,
+    principal: Annotated[Principal, Depends(get_principal)],
+) -> AgentSessionContextDetail:
+    try:
+        return governance_service.get_agent_session_context(request_id, session_id, principal)
+    except StopIteration:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent session not found") from None
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+
+
 @router.post("/{request_id}/agent-sessions/{session_id}/complete", response_model=AgentSessionDetail)
 def complete_agent_session(
     request_id: str,
@@ -341,6 +391,25 @@ def post_agent_session_message(
         ensure_roles(principal, PrincipalRole.SUBMITTER, PrincipalRole.OPERATOR, PrincipalRole.ADMIN)
         payload = payload.model_copy(update={"actor_id": principal.user_id})
         return governance_service.post_agent_session_message(request_id, session_id, payload, principal)
+    except StopIteration:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent session not found") from None
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+
+@router.post("/{request_id}/agent-sessions/{session_id}/governance", response_model=AgentSessionDetail)
+def update_agent_session_governance(
+    request_id: str,
+    session_id: str,
+    payload: UpdateAgentSessionGovernanceRequest,
+    principal: Annotated[Principal, Depends(get_principal)],
+) -> AgentSessionDetail:
+    try:
+        ensure_roles(principal, PrincipalRole.SUBMITTER, PrincipalRole.OPERATOR, PrincipalRole.ADMIN)
+        payload = payload.model_copy(update={"actor_id": principal.user_id})
+        return governance_service.update_agent_session_governance(request_id, session_id, payload, principal)
     except StopIteration:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent session not found") from None
     except PermissionError as exc:

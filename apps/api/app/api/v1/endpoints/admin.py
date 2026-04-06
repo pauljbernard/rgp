@@ -3,6 +3,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.core.auth import ensure_roles, get_principal
+from app.models.federation import CreateProjectionRequest, ProjectionMappingRecord, ReconciliationLogRecord, ResolveProjectionRequest, UpdateProjectionExternalStateRequest
 from app.models.governance import AddTeamMembershipRequest, CreateIntegrationRequest, CreateOrganizationRequest, CreatePortfolioRequest, CreateTeamRequest, CreateTenantRequest, CreateUserRequest, IntegrationRecord, OrganizationRecord, PolicyRecord, PolicyRuleUpdateRequest, PortfolioRecord, TeamRecord, TenantRecord, UpdateIntegrationRequest, UpdateOrganizationRequest, UpdateTeamRequest, UpdateTenantRequest, UpdateUserRequest, UserRecord
 from app.models.security import Principal, PrincipalRole
 from app.models.template import CreateTemplateVersionRequest, TemplateRecord, TemplateStatusActionRequest, TemplateValidationResult, UpdateTemplateDefinitionRequest
@@ -178,6 +179,75 @@ def delete_integration(
         governance_service.delete_integration(integration_id, principal)
     except StopIteration:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Integration not found") from None
+
+
+@router.get("/integrations/{integration_id}/projections", response_model=list[ProjectionMappingRecord])
+def list_integration_projections(
+    integration_id: str,
+    principal: Annotated[Principal, Depends(get_principal)],
+) -> list[ProjectionMappingRecord]:
+    ensure_admin_principal(principal)
+    return governance_service.list_integration_projections(integration_id, principal)
+
+
+@router.post("/integrations/{integration_id}/projections", response_model=ProjectionMappingRecord, status_code=status.HTTP_201_CREATED)
+def create_integration_projection(
+    integration_id: str,
+    payload: CreateProjectionRequest,
+    principal: Annotated[Principal, Depends(get_principal)],
+) -> ProjectionMappingRecord:
+    ensure_admin_principal(principal)
+    return governance_service.create_integration_projection(integration_id, payload, principal)
+
+
+@router.post("/projections/{projection_id}/sync", response_model=ProjectionMappingRecord, status_code=status.HTTP_200_OK)
+def sync_projection(
+    projection_id: str,
+    principal: Annotated[Principal, Depends(get_principal)],
+) -> ProjectionMappingRecord:
+    ensure_admin_principal(principal)
+    return governance_service.sync_integration_projection(projection_id, principal)
+
+
+@router.post("/projections/{projection_id}/external-state", response_model=ProjectionMappingRecord, status_code=status.HTTP_200_OK)
+def update_projection_external_state(
+    projection_id: str,
+    payload: UpdateProjectionExternalStateRequest,
+    principal: Annotated[Principal, Depends(get_principal)],
+) -> ProjectionMappingRecord:
+    ensure_admin_principal(principal)
+    return governance_service.update_integration_projection_external_state(projection_id, payload, principal)
+
+
+@router.get("/integrations/{integration_id}/reconciliation", response_model=list[ReconciliationLogRecord])
+def list_integration_reconciliation(
+    integration_id: str,
+    principal: Annotated[Principal, Depends(get_principal)],
+) -> list[ReconciliationLogRecord]:
+    ensure_admin_principal(principal)
+    return governance_service.list_integration_reconciliation_logs(integration_id, principal)
+
+
+@router.post("/integrations/{integration_id}/reconcile", response_model=list[ReconciliationLogRecord], status_code=status.HTTP_200_OK)
+def reconcile_integration(
+    integration_id: str,
+    principal: Annotated[Principal, Depends(get_principal)],
+) -> list[ReconciliationLogRecord]:
+    ensure_admin_principal(principal)
+    return governance_service.reconcile_integration(integration_id, principal)
+
+
+@router.post("/projections/{projection_id}/resolve", response_model=ReconciliationLogRecord, status_code=status.HTTP_200_OK)
+def resolve_projection(
+    projection_id: str,
+    payload: ResolveProjectionRequest,
+    principal: Annotated[Principal, Depends(get_principal)],
+) -> ReconciliationLogRecord:
+    ensure_admin_principal(principal)
+    try:
+        return governance_service.resolve_integration_projection(projection_id, payload, principal)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
 
 @router.get("/org/tenants", response_model=list[TenantRecord])

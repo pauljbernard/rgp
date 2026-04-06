@@ -9,9 +9,13 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
+from sqlalchemy import desc
+
 from app.db.models import ProjectionMappingTable, ReconciliationLogTable
 from app.db.session import SessionLocal
 from app.models.federation import ReconciliationLogRecord
+from app.services.projection_adapter_service import projection_adapter_service
+from app.services.projection_service import projection_service
 
 
 class ReconciliationService:
@@ -49,7 +53,11 @@ class ReconciliationService:
             )
 
             for proj in projections:
-                action = self._determine_action(proj)
+                action = self._determine_action(proj.id, proj)
+                if action == "conflict":
+                    proj.projection_status = "conflict"
+                elif action == "synced":
+                    proj.projection_status = "synced"
                 log_id = f"rl_{uuid.uuid4().hex[:12]}"
                 log_row = ReconciliationLogTable(
                     id=log_id,
@@ -65,6 +73,28 @@ class ReconciliationService:
             session.commit()
 
         return results
+
+    def list_logs(
+        self,
+        integration_id: str,
+        tenant_id: str,
+    ) -> list[ReconciliationLogRecord]:
+        with SessionLocal() as session:
+            rows = (
+                session.query(ReconciliationLogTable)
+                .join(
+                    ProjectionMappingTable,
+                    ProjectionMappingTable.id == ReconciliationLogTable.projection_id,
+                )
+                .filter(
+                    ProjectionMappingTable.integration_id == integration_id,
+                    ProjectionMappingTable.tenant_id == tenant_id,
+                )
+                .order_by(desc(ReconciliationLogTable.created_at))
+                .limit(50)
+                .all()
+            )
+            return [ReconciliationLogRecord.model_validate(row) for row in rows]
 
     # ------------------------------------------------------------------
     # Resolution
@@ -94,14 +124,23 @@ class ReconciliationService:
                 .filter(ProjectionMappingTable.id == projection_id)
                 .one()
             )
+            canonical_state = projection_service._canonical_snapshot(session, proj)
+            adapter_type = (proj.external_state or {}).get("adapter_type")
+            supported_actions = self._supported_actions(adapter_type)
+            if action not in supported_actions:
+                raise ValueError(f"Action {action} is not supported for adapter {adapter_type or 'unknown'}")
+            adapter = projection_adapter_service.resolve_adapter_by_type(adapter_type)
             proj.projection_status = "reconciled"
             proj.last_synced_at = now
+            proj.external_state = adapter.apply_resolution(action, proj.external_state or {}, canonical_state)
+            if action == "retry_sync":
+                proj.projection_status = "pending"
 
             log_row = ReconciliationLogTable(
                 id=log_id,
                 projection_id=projection_id,
                 action=action,
-                detail=f"Resolved by {resolved_by}: {action}",
+                detail=self._resolution_detail(action, resolved_by, adapter_type),
                 resolved_by=resolved_by,
                 created_at=now,
             )
@@ -115,27 +154,42 @@ class ReconciliationService:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _determine_action(proj: ProjectionMappingTable) -> str:
+    def _determine_action(projection_id: str, proj: ProjectionMappingTable) -> str:
         """Determine the reconciliation action for a projection."""
         if proj.external_state is None:
-            return "created"
-        ext_status = (proj.external_state or {}).get("status")
-        if ext_status and ext_status != proj.projection_status:
+            return "missing_external_state"
+        if projection_service.detect_conflicts(projection_id):
             return "conflict"
-        return "updated"
+        return "synced"
 
     @staticmethod
     def _describe_action(proj: ProjectionMappingTable, action: str) -> str:
         """Build a human-readable description of the reconciliation action."""
-        if action == "created":
+        if action == "missing_external_state":
             return f"Projection {proj.id} has no external state yet"
         if action == "conflict":
             ext_status = (proj.external_state or {}).get("status", "unknown")
+            with SessionLocal() as session:
+                internal_status = projection_service._canonical_snapshot(session, proj).get("status", "unknown")
             return (
-                f"Projection {proj.id} conflict: internal='{proj.projection_status}' "
+                f"Projection {proj.id} conflict: internal='{internal_status}' "
                 f"vs external='{ext_status}'"
             )
         return f"Projection {proj.id} is in sync"
+
+    @staticmethod
+    def _supported_actions(adapter_type: str | None) -> list[str]:
+        return projection_service._supported_resolution_actions(adapter_type)
+
+    @staticmethod
+    def _resolution_detail(action: str, resolved_by: str, adapter_type: str | None) -> str:
+        if action == "retry_sync":
+            return f"Resolved by {resolved_by}: retry substrate synchronization for {adapter_type or 'projection'}"
+        if action == "reprovision":
+            return f"Resolved by {resolved_by}: reprovision governed identity state into {adapter_type or 'projection'}"
+        if action == "resume_session":
+            return f"Resolved by {resolved_by}: resume governed agent session on {adapter_type or 'projection'}"
+        return f"Resolved by {resolved_by}: {action}"
 
 
 reconciliation_service = ReconciliationService()

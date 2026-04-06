@@ -34,9 +34,10 @@ class RequestLifecycleRepository:
         owner_team_id: str | None = None,
         workflow: str | None = None,
         request_id: str | None = None,
+        federation: str | None = None,
         tenant_id: str | None = None,
     ) -> PaginatedResponse[RequestRecord]:
-        return governance_repository.list_requests(page, page_size, status, owner_team_id, workflow, request_id, tenant_id)
+        return governance_repository.list_requests(page, page_size, status, owner_team_id, workflow, request_id, federation, tenant_id)
 
     def get_request(self, request_id: str, tenant_id: str | None = None) -> RequestDetail:
         return governance_repository.get_request(request_id, tenant_id)

@@ -191,6 +191,135 @@ class SpecComplianceTest(unittest.TestCase):
         self.assertIn("Create Account Request", html)
         self.assertIn("Registration requests are routed as governed work.", html)
 
+    def test_live_system_exposes_governed_agent_context_and_mcp_surface(self) -> None:
+        preview = self._api_get(
+            "/api/v1/requests/req_022/agent-assignment-preview?integration_id=int_agent_codex&collaboration_mode=human_led&agent_operating_profile=review"
+        )
+        self.assertIn("bundle", preview)
+        self.assertIn("available_tools", preview)
+        self.assertIn("restricted_tools", preview)
+        self.assertIn("degraded_tools", preview)
+        self.assertIn("capability_warnings", preview)
+        self.assertEqual(preview["bundle"]["bundle_type"], "assignment_preview")
+        self.assertEqual(preview["bundle"]["policy_scope"]["collaboration_mode"], "human_led")
+        self.assertEqual(preview["bundle"]["policy_scope"]["agent_operating_profile"], "review")
+
+        context = self._api_get("/api/v1/requests/req_022/agent-sessions/ags_req_022_1775175850/context")
+        self.assertIn("bundle", context)
+        self.assertIn("available_tools", context)
+        self.assertIn("restricted_tools", context)
+        self.assertIn("degraded_tools", context)
+        self.assertIn("access_log", context)
+        self.assertTrue(any(entry["accessed_resource"] == "context_bundle" for entry in context["access_log"]))
+
+    def test_live_system_exposes_federated_projection_and_reconciliation_surfaces(self) -> None:
+        created = self._api_post(
+            "/api/v1/admin/integrations/int_agent_codex/projections",
+            {"entity_type": "request", "entity_id": "req_022"},
+        )
+        self.assertEqual(created["integration_id"], "int_agent_codex")
+        self.assertEqual(created["entity_type"], "request")
+
+        projections = self._api_get("/api/v1/admin/integrations/int_agent_codex/projections")
+        self.assertTrue(any(projection["id"] == created["id"] for projection in projections))
+
+        synced = self._api_post(f"/api/v1/admin/projections/{created['id']}/sync", None)
+        self.assertEqual(synced["projection_status"], "synced")
+        self.assertEqual(synced["adapter_type"], "openai_projection")
+        self.assertIn("query_external_state", synced["adapter_capabilities"])
+        self.assertEqual(synced["sync_source"], "adapter:openai_projection")
+        self.assertIn("resume_session", synced["supported_resolution_actions"])
+        self.assertIn("resume_session", synced["resolution_guidance"])
+
+        conflicted = self._api_post(
+            f"/api/v1/admin/projections/{created['id']}/external-state",
+            {"external_status": "external_review", "external_title": "Externally Revised Request"},
+        )
+        self.assertTrue(conflicted["conflicts"])
+
+        reconciliation = self._api_post("/api/v1/admin/integrations/int_agent_codex/reconcile", None)
+        self.assertTrue(reconciliation)
+
+        resolved = self._api_post(
+            f"/api/v1/admin/projections/{created['id']}/resolve",
+            {"action": "accept_internal"},
+        )
+        self.assertEqual(resolved["action"], "accept_internal")
+
+        logs = self._api_get("/api/v1/admin/integrations/int_agent_codex/reconciliation")
+        self.assertTrue(any(log["projection_id"] == created["id"] for log in logs))
+
+        request_projections = self._api_get("/api/v1/requests/req_022/projections")
+        matching = [projection for projection in request_projections if projection["id"] == created["id"]]
+        self.assertTrue(matching)
+        self.assertTrue(matching[0]["adapter_type"].endswith("_projection"))
+
+        history = self._api_get("/api/v1/requests/req_022/history")
+        self.assertTrue(any(entry["object_type"] == "projection" for entry in history))
+
+        workflow_history = self._api_get("/api/v1/analytics/workflows/tmpl_assessment/history")
+        self.assertTrue(any(entry["related_entity_type"] == "workflow" for entry in workflow_history))
+        self.assertTrue(any(entry["object_type"] == "projection" for entry in workflow_history))
+        self.assertTrue(any(entry["lineage"][0] == "workflow:tmpl_assessment" for entry in workflow_history if entry["lineage"]))
+
+    def test_live_system_exposes_substrate_specific_projection_shapes(self) -> None:
+        cases = [
+            ("int_002", "repository_projection", "repository_state", "change_set"),
+            ("int_001", "runtime_projection", "runtime_state", "execution_binding"),
+            ("int_003", "identity_projection", "identity_state", "identity_binding"),
+            ("int_agent_codex", "openai_projection", "agent_state", "agent_session"),
+        ]
+
+        for integration_id, adapter_type, state_key, projection_form in cases:
+            created = self._api_post(
+                f"/api/v1/admin/integrations/{integration_id}/projections",
+                {"entity_type": "request", "entity_id": "req_022"},
+            )
+            synced = self._api_post(f"/api/v1/admin/projections/{created['id']}/sync", None)
+            self.assertEqual(synced["adapter_type"], adapter_type)
+            self.assertEqual(synced["external_state"]["projection_form"], projection_form)
+            self.assertIn(state_key, synced["external_state"])
+
+    def test_substrate_specific_resolution_effects_are_materialized(self) -> None:
+        cases = [
+            ("int_002", "merge", "repository_state", "review_state", "merged", "merge_ticket"),
+            ("int_001", "retry_sync", "runtime_state", "execution_status", "retry_requested", "recovery_ticket"),
+            ("int_003", "reprovision", "identity_state", "provisioning_state", "reprovision_requested", "reprovision_ticket"),
+            ("int_agent_codex", "resume_session", "agent_state", "session_status", "resume_requested", "resume_ticket"),
+        ]
+
+        for integration_id, action, state_key, field_name, expected, evidence_field in cases:
+            created = self._api_post(
+                f"/api/v1/admin/integrations/{integration_id}/projections",
+                {"entity_type": "request", "entity_id": "req_022"},
+            )
+            synced = self._api_post(f"/api/v1/admin/projections/{created['id']}/sync", None)
+            self.assertIn(state_key, synced["external_state"])
+            resolved = self._api_post(
+                f"/api/v1/admin/projections/{created['id']}/resolve",
+                {"action": action},
+            )
+            self.assertEqual(resolved["action"], action)
+            projections = self._api_get(f"/api/v1/admin/integrations/{integration_id}/projections")
+            matching = next(projection for projection in projections if projection["id"] == created["id"])
+            self.assertEqual(matching["projection_status"], "pending" if action == "retry_sync" else "reconciled")
+            self.assertEqual(matching["external_state"][state_key][field_name], expected)
+            self.assertIn(evidence_field, matching["external_state"][state_key])
+            self.assertTrue(matching["external_state"][state_key][evidence_field])
+            shadow = matching["external_state"].get("_adapter_shadow") or {}
+            self.assertTrue(any(entry["event"].startswith("resolution:") for entry in shadow.get("activity_log", [])))
+
+            resynced = self._api_post(f"/api/v1/admin/projections/{created['id']}/sync", None)
+            self.assertIn(state_key, resynced["external_state"])
+            if action == "merge":
+                self.assertEqual(resynced["external_state"][state_key]["remote_merge_state"], "confirmed")
+            if action == "retry_sync":
+                self.assertEqual(resynced["external_state"][state_key]["execution_status"], "resync_in_progress")
+            if action == "reprovision":
+                self.assertEqual(resynced["external_state"][state_key]["provisioning_state"], "reprovision_requested")
+            if action == "resume_session":
+                self.assertEqual(resynced["external_state"][state_key]["session_status"], "resume_requested")
+
     def test_compliance_surfaces_are_checked_by_code(self) -> None:
         self.assertTrue((REPO_ROOT / "apps/web/app/forbidden/page.tsx").exists())
         self.assertTrue((REPO_ROOT / "tests/integration/test_live_web_routes.py").exists())
@@ -200,3 +329,20 @@ class SpecComplianceTest(unittest.TestCase):
         tenants = self._api_get("/api/v1/admin/org/tenants")
         self.assertTrue(any(tenant["id"] == "tenant_demo" for tenant in tenants))
         self.assertTrue(any(tenant["id"] == "tenant_other" for tenant in tenants))
+
+    @classmethod
+    def _api_post(cls, path: str, payload: dict | None):
+        request = urllib.request.Request(
+            f"{API_BASE}{path}",
+            data=(json.dumps(payload).encode("utf-8") if payload is not None else b""),
+            headers={
+                "Authorization": f"Bearer {cls.admin_token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            body = response.read().decode("utf-8")
+            if not body:
+                return None
+            return json.loads(body)

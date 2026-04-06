@@ -7,6 +7,7 @@ import certifi
 
 from app.core.config import settings
 from app.db.models import IntegrationTable
+from app.models.context import ContextBundleRecord
 from app.services.integration_security_service import integration_security_service
 
 
@@ -34,19 +35,21 @@ class AgentProviderService:
         request_title: str,
         initial_prompt: str,
         transcript: list[dict[str, str]],
+        context_bundle: ContextBundleRecord | None = None,
+        available_tools: list[dict] | None = None,
     ) -> AgentProviderTurn:
         provider = self._provider(integration)
         try:
             if provider == "openai":
-                return self._openai_turn(integration, transcript)
+                return self._openai_turn(integration, transcript, external_session_ref=None, context_bundle=context_bundle, available_tools=available_tools)
             if provider == "anthropic":
-                return self._anthropic_turn(integration, transcript)
+                return self._anthropic_turn(integration, transcript, external_session_ref=None, context_bundle=context_bundle, available_tools=available_tools)
             if provider == "microsoft":
-                return self._microsoft_start_turn(integration, request_title, initial_prompt)
-            return self._fallback_turn(integration.name, request_title, initial_prompt)
+                return self._microsoft_start_turn(integration, request_title, initial_prompt, context_bundle=context_bundle, available_tools=available_tools)
+            return self._fallback_turn(integration.name, request_title, initial_prompt, context_bundle=context_bundle, available_tools=available_tools)
         except ValueError:
             if settings.agent_provider_fallback_mode == "simulate":
-                return self._fallback_turn(integration.name, request_title, initial_prompt)
+                return self._fallback_turn(integration.name, request_title, initial_prompt, context_bundle=context_bundle, available_tools=available_tools)
             raise
 
     def continue_session(
@@ -56,19 +59,51 @@ class AgentProviderService:
         transcript: list[dict[str, str]],
         latest_human_message: str,
         external_session_ref: str | None = None,
+        context_bundle: ContextBundleRecord | None = None,
+        available_tools: list[dict] | None = None,
     ) -> AgentProviderTurn:
         provider = self._provider(integration)
         try:
             if provider == "openai":
-                return self._openai_turn(integration, transcript, external_session_ref)
+                return self._openai_turn(
+                    integration,
+                    transcript,
+                    external_session_ref,
+                    context_bundle=context_bundle,
+                    available_tools=available_tools,
+                )
             if provider == "anthropic":
-                return self._anthropic_turn(integration, transcript, external_session_ref)
+                return self._anthropic_turn(
+                    integration,
+                    transcript,
+                    external_session_ref,
+                    context_bundle=context_bundle,
+                    available_tools=available_tools,
+                )
             if provider == "microsoft":
-                return self._microsoft_continue_turn(integration, latest_human_message, external_session_ref)
-            return self._fallback_continue_turn(agent_label, latest_human_message, external_session_ref)
+                return self._microsoft_continue_turn(
+                    integration,
+                    latest_human_message,
+                    external_session_ref,
+                    context_bundle=context_bundle,
+                    available_tools=available_tools,
+                )
+            return self._fallback_continue_turn(
+                agent_label,
+                latest_human_message,
+                external_session_ref,
+                context_bundle=context_bundle,
+                available_tools=available_tools,
+            )
         except ValueError:
             if settings.agent_provider_fallback_mode == "simulate":
-                return self._fallback_continue_turn(agent_label, latest_human_message, external_session_ref)
+                return self._fallback_continue_turn(
+                    agent_label,
+                    latest_human_message,
+                    external_session_ref,
+                    context_bundle=context_bundle,
+                    available_tools=available_tools,
+                )
             raise
 
     def stream_start_session(
@@ -77,22 +112,24 @@ class AgentProviderService:
         request_title: str,
         initial_prompt: str,
         transcript: list[dict[str, str]],
+        context_bundle: ContextBundleRecord | None = None,
+        available_tools: list[dict] | None = None,
     ):
         provider = self._provider(integration)
         try:
             if provider == "openai":
-                yield from self._openai_stream_turn(integration, transcript)
+                yield from self._openai_stream_turn(integration, transcript, external_session_ref=None, context_bundle=context_bundle, available_tools=available_tools)
                 return
             if provider == "anthropic":
-                yield from self._anthropic_stream_turn(integration, transcript)
+                yield from self._anthropic_stream_turn(integration, transcript, external_session_ref=None, context_bundle=context_bundle, available_tools=available_tools)
                 return
             if provider == "microsoft":
-                yield from self._microsoft_stream_start_turn(integration, request_title, initial_prompt)
+                yield from self._microsoft_stream_start_turn(integration, request_title, initial_prompt, context_bundle=context_bundle, available_tools=available_tools)
                 return
-            yield from self._fallback_stream_turn(integration.name, request_title, initial_prompt)
+            yield from self._fallback_stream_turn(integration.name, request_title, initial_prompt, context_bundle=context_bundle, available_tools=available_tools)
         except ValueError:
             if settings.agent_provider_fallback_mode == "simulate":
-                yield from self._fallback_stream_turn(integration.name, request_title, initial_prompt)
+                yield from self._fallback_stream_turn(integration.name, request_title, initial_prompt, context_bundle=context_bundle, available_tools=available_tools)
                 return
             raise
 
@@ -103,26 +140,65 @@ class AgentProviderService:
         transcript: list[dict[str, str]],
         latest_human_message: str,
         external_session_ref: str | None = None,
+        context_bundle: ContextBundleRecord | None = None,
+        available_tools: list[dict] | None = None,
     ):
         provider = self._provider(integration)
         try:
             if provider == "openai":
-                yield from self._openai_stream_turn(integration, transcript, external_session_ref)
+                yield from self._openai_stream_turn(
+                    integration,
+                    transcript,
+                    external_session_ref,
+                    context_bundle=context_bundle,
+                    available_tools=available_tools,
+                )
                 return
             if provider == "anthropic":
-                yield from self._anthropic_stream_turn(integration, transcript, external_session_ref)
+                yield from self._anthropic_stream_turn(
+                    integration,
+                    transcript,
+                    external_session_ref,
+                    context_bundle=context_bundle,
+                    available_tools=available_tools,
+                )
                 return
             if provider == "microsoft":
-                yield from self._microsoft_stream_continue_turn(integration, latest_human_message, external_session_ref)
+                yield from self._microsoft_stream_continue_turn(
+                    integration,
+                    latest_human_message,
+                    external_session_ref,
+                    context_bundle=context_bundle,
+                    available_tools=available_tools,
+                )
                 return
-            yield from self._fallback_stream_continue_turn(agent_label, latest_human_message, external_session_ref)
+            yield from self._fallback_stream_continue_turn(
+                agent_label,
+                latest_human_message,
+                external_session_ref,
+                context_bundle=context_bundle,
+                available_tools=available_tools,
+            )
         except ValueError:
             if settings.agent_provider_fallback_mode == "simulate":
-                yield from self._fallback_stream_continue_turn(agent_label, latest_human_message, external_session_ref)
+                yield from self._fallback_stream_continue_turn(
+                    agent_label,
+                    latest_human_message,
+                    external_session_ref,
+                    context_bundle=context_bundle,
+                    available_tools=available_tools,
+                )
                 return
             raise
 
-    def _openai_turn(self, integration: IntegrationTable, transcript: list[dict[str, str]], external_session_ref: str | None = None) -> AgentProviderTurn:
+    def _openai_turn(
+        self,
+        integration: IntegrationTable,
+        transcript: list[dict[str, str]],
+        external_session_ref: str | None = None,
+        context_bundle: ContextBundleRecord | None = None,
+        available_tools: list[dict] | None = None,
+    ) -> AgentProviderTurn:
         api_key = integration_security_service.setting(integration, "api_key") or settings.agent_openai_api_key
         base_url = self._validated_provider_base_url(integration, settings.agent_openai_base_url, settings.integration_openai_allowed_hosts)
         model = self._setting(integration, "model") or settings.agent_openai_model
@@ -130,7 +206,7 @@ class AgentProviderService:
             return self._fallback_or_raise("OpenAI Codex")
         payload = {
             "model": model,
-            "messages": transcript,
+            "messages": self._contextualize_transcript(transcript, context_bundle, available_tools),
         }
         response = self._json_request(
             f"{base_url.rstrip('/')}/chat/completions",
@@ -154,7 +230,14 @@ class AgentProviderService:
             raise ValueError("OpenAI adapter returned no assistant content")
         return AgentProviderTurn(assistant_text=content, external_session_ref=external_session_ref)
 
-    def _openai_stream_turn(self, integration: IntegrationTable, transcript: list[dict[str, str]], external_session_ref: str | None = None):
+    def _openai_stream_turn(
+        self,
+        integration: IntegrationTable,
+        transcript: list[dict[str, str]],
+        external_session_ref: str | None = None,
+        context_bundle: ContextBundleRecord | None = None,
+        available_tools: list[dict] | None = None,
+    ):
         api_key = integration_security_service.setting(integration, "api_key") or settings.agent_openai_api_key
         base_url = self._validated_provider_base_url(integration, settings.agent_openai_base_url, settings.integration_openai_allowed_hosts)
         model = self._setting(integration, "model") or settings.agent_openai_model
@@ -163,7 +246,7 @@ class AgentProviderService:
             return
         payload = {
             "model": model,
-            "messages": transcript,
+            "messages": self._contextualize_transcript(transcript, context_bundle, available_tools),
             "stream": True,
         }
         body = json.dumps(payload).encode("utf-8")
@@ -213,7 +296,14 @@ class AgentProviderService:
             done=True,
         )
 
-    def _anthropic_turn(self, integration: IntegrationTable, transcript: list[dict[str, str]], external_session_ref: str | None = None) -> AgentProviderTurn:
+    def _anthropic_turn(
+        self,
+        integration: IntegrationTable,
+        transcript: list[dict[str, str]],
+        external_session_ref: str | None = None,
+        context_bundle: ContextBundleRecord | None = None,
+        available_tools: list[dict] | None = None,
+    ) -> AgentProviderTurn:
         api_key = integration_security_service.setting(integration, "api_key") or settings.agent_anthropic_api_key
         base_url = self._validated_provider_base_url(integration, settings.agent_anthropic_base_url, settings.integration_anthropic_allowed_hosts)
         model = self._setting(integration, "model") or settings.agent_anthropic_model
@@ -222,7 +312,7 @@ class AgentProviderService:
         payload = {
             "model": model,
             "max_tokens": settings.agent_anthropic_max_tokens,
-            "messages": transcript,
+            "messages": self._contextualize_transcript(transcript, context_bundle, available_tools),
         }
         response = self._json_request(
             f"{base_url.rstrip('/')}/messages",
@@ -240,7 +330,14 @@ class AgentProviderService:
             raise ValueError("Anthropic adapter returned no assistant content")
         return AgentProviderTurn(assistant_text=content, external_session_ref=external_session_ref)
 
-    def _anthropic_stream_turn(self, integration: IntegrationTable, transcript: list[dict[str, str]], external_session_ref: str | None = None):
+    def _anthropic_stream_turn(
+        self,
+        integration: IntegrationTable,
+        transcript: list[dict[str, str]],
+        external_session_ref: str | None = None,
+        context_bundle: ContextBundleRecord | None = None,
+        available_tools: list[dict] | None = None,
+    ):
         api_key = integration_security_service.setting(integration, "api_key") or settings.agent_anthropic_api_key
         base_url = self._validated_provider_base_url(integration, settings.agent_anthropic_base_url, settings.integration_anthropic_allowed_hosts)
         model = self._setting(integration, "model") or settings.agent_anthropic_model
@@ -250,7 +347,7 @@ class AgentProviderService:
         payload = {
             "model": model,
             "max_tokens": settings.agent_anthropic_max_tokens,
-            "messages": transcript,
+            "messages": self._contextualize_transcript(transcript, context_bundle, available_tools),
             "stream": True,
         }
         body = json.dumps(payload).encode("utf-8")
@@ -300,7 +397,14 @@ class AgentProviderService:
             done=True,
         )
 
-    def _microsoft_start_turn(self, integration: IntegrationTable, request_title: str, initial_prompt: str) -> AgentProviderTurn:
+    def _microsoft_start_turn(
+        self,
+        integration: IntegrationTable,
+        request_title: str,
+        initial_prompt: str,
+        context_bundle: ContextBundleRecord | None = None,
+        available_tools: list[dict] | None = None,
+    ) -> AgentProviderTurn:
         token = integration_security_service.setting(integration, "access_token") or settings.agent_microsoft_copilot_token
         base_url = self._validated_provider_base_url(integration, settings.agent_microsoft_copilot_base_url, settings.integration_microsoft_allowed_hosts)
         if not token:
@@ -323,13 +427,32 @@ class AgentProviderService:
             raise ValueError("Microsoft Copilot adapter did not return a conversation id")
         first_turn = self._microsoft_continue_turn(
             integration=integration,
-            latest_human_message=f"Request: {request_title}. {initial_prompt}",
+            latest_human_message=self._contextualize_message(
+                f"Request: {request_title}. {initial_prompt}",
+                context_bundle,
+                available_tools,
+            ),
             external_session_ref=conversation_id,
+            context_bundle=context_bundle,
+            available_tools=available_tools,
         )
         return AgentProviderTurn(assistant_text=first_turn.assistant_text, external_session_ref=conversation_id)
 
-    def _microsoft_stream_start_turn(self, integration: IntegrationTable, request_title: str, initial_prompt: str):
-        first_turn = self._microsoft_start_turn(integration, request_title, initial_prompt)
+    def _microsoft_stream_start_turn(
+        self,
+        integration: IntegrationTable,
+        request_title: str,
+        initial_prompt: str,
+        context_bundle: ContextBundleRecord | None = None,
+        available_tools: list[dict] | None = None,
+    ):
+        first_turn = self._microsoft_start_turn(
+            integration,
+            request_title,
+            initial_prompt,
+            context_bundle=context_bundle,
+            available_tools=available_tools,
+        )
         yield from self._chunk_text(first_turn.assistant_text, first_turn.external_session_ref)
 
     def _microsoft_continue_turn(
@@ -337,6 +460,8 @@ class AgentProviderService:
         integration: IntegrationTable,
         latest_human_message: str,
         external_session_ref: str | None,
+        context_bundle: ContextBundleRecord | None = None,
+        available_tools: list[dict] | None = None,
     ) -> AgentProviderTurn:
         token = integration_security_service.setting(integration, "access_token") or settings.agent_microsoft_copilot_token
         base_url = self._validated_provider_base_url(integration, settings.agent_microsoft_copilot_base_url, settings.integration_microsoft_allowed_hosts)
@@ -353,7 +478,7 @@ class AgentProviderService:
             payload={
                 "message": {
                     "role": "user",
-                    "content": latest_human_message,
+                    "content": self._contextualize_message(latest_human_message, context_bundle, available_tools),
                 }
             },
         )
@@ -367,34 +492,86 @@ class AgentProviderService:
         integration: IntegrationTable,
         latest_human_message: str,
         external_session_ref: str | None,
+        context_bundle: ContextBundleRecord | None = None,
+        available_tools: list[dict] | None = None,
     ):
-        turn = self._microsoft_continue_turn(integration, latest_human_message, external_session_ref)
+        turn = self._microsoft_continue_turn(
+            integration,
+            latest_human_message,
+            external_session_ref,
+            context_bundle=context_bundle,
+            available_tools=available_tools,
+        )
         yield from self._chunk_text(turn.assistant_text, turn.external_session_ref)
 
-    def _fallback_turn(self, integration_name: str, request_title: str, initial_prompt: str) -> AgentProviderTurn:
+    def _fallback_turn(
+        self,
+        integration_name: str,
+        request_title: str,
+        initial_prompt: str,
+        context_bundle: ContextBundleRecord | None = None,
+        available_tools: list[dict] | None = None,
+    ) -> AgentProviderTurn:
+        context_note = self._fallback_context_note(context_bundle, available_tools)
         return AgentProviderTurn(
             assistant_text=(
                 f"{integration_name} session started for '{request_title}'. "
                 f"I've received the initial assignment: {initial_prompt}. "
                 "Before I proceed, confirm the desired output format, constraints, and any source-of-truth references I must follow."
+                f"{context_note}"
             )
         )
 
-    def _fallback_continue_turn(self, agent_label: str, latest_human_message: str, external_session_ref: str | None) -> AgentProviderTurn:
+    def _fallback_continue_turn(
+        self,
+        agent_label: str,
+        latest_human_message: str,
+        external_session_ref: str | None,
+        context_bundle: ContextBundleRecord | None = None,
+        available_tools: list[dict] | None = None,
+    ) -> AgentProviderTurn:
+        context_note = self._fallback_context_note(context_bundle, available_tools)
         return AgentProviderTurn(
             assistant_text=(
                 f"{agent_label} received your guidance: {latest_human_message}. "
                 "I can continue, but I may need another iterative response if constraints change or missing context is discovered."
+                f"{context_note}"
             ),
             external_session_ref=external_session_ref,
         )
 
-    def _fallback_stream_turn(self, integration_name: str, request_title: str, initial_prompt: str):
-        turn = self._fallback_turn(integration_name, request_title, initial_prompt)
+    def _fallback_stream_turn(
+        self,
+        integration_name: str,
+        request_title: str,
+        initial_prompt: str,
+        context_bundle: ContextBundleRecord | None = None,
+        available_tools: list[dict] | None = None,
+    ):
+        turn = self._fallback_turn(
+            integration_name,
+            request_title,
+            initial_prompt,
+            context_bundle=context_bundle,
+            available_tools=available_tools,
+        )
         yield from self._chunk_text(turn.assistant_text, turn.external_session_ref)
 
-    def _fallback_stream_continue_turn(self, agent_label: str, latest_human_message: str, external_session_ref: str | None):
-        turn = self._fallback_continue_turn(agent_label, latest_human_message, external_session_ref)
+    def _fallback_stream_continue_turn(
+        self,
+        agent_label: str,
+        latest_human_message: str,
+        external_session_ref: str | None,
+        context_bundle: ContextBundleRecord | None = None,
+        available_tools: list[dict] | None = None,
+    ):
+        turn = self._fallback_continue_turn(
+            agent_label,
+            latest_human_message,
+            external_session_ref,
+            context_bundle=context_bundle,
+            available_tools=available_tools,
+        )
         yield from self._chunk_text(turn.assistant_text, turn.external_session_ref)
 
     def _fallback_or_raise(self, integration_name: str) -> AgentProviderTurn:
@@ -480,6 +657,82 @@ class AgentProviderService:
             raise ValueError(f"Provider request failed with {exc.code}: {detail}") from exc
         except error.URLError as exc:
             raise ValueError(f"Provider request failed: {exc.reason}") from exc
+
+    def _contextualize_transcript(
+        self,
+        transcript: list[dict[str, str]],
+        context_bundle: ContextBundleRecord | None,
+        available_tools: list[dict] | None,
+    ) -> list[dict[str, str]]:
+        if context_bundle is None and not available_tools:
+            return transcript
+        return [{"role": "system", "content": self._build_context_instructions(context_bundle, available_tools)}, *transcript]
+
+    def _contextualize_message(
+        self,
+        message: str,
+        context_bundle: ContextBundleRecord | None,
+        available_tools: list[dict] | None,
+    ) -> str:
+        instructions = self._build_context_instructions(context_bundle, available_tools)
+        if not instructions:
+            return message
+        return f"{instructions}\n\nHuman guidance:\n{message}"
+
+    def _build_context_instructions(
+        self,
+        context_bundle: ContextBundleRecord | None,
+        available_tools: list[dict] | None,
+    ) -> str:
+        sections: list[str] = [
+            "You are operating inside a governed agent session. Use only the authorized context and MCP capabilities below.",
+            "Do not invent missing facts. If the governed context is insufficient, ask for clarification explicitly.",
+        ]
+        if context_bundle is not None:
+            request_data = (context_bundle.contents or {}).get("request_data", {}) if isinstance(context_bundle.contents, dict) else {}
+            workflow_state = (context_bundle.contents or {}).get("workflow_state", {}) if isinstance(context_bundle.contents, dict) else {}
+            prior_decisions = (context_bundle.contents or {}).get("prior_decisions", []) if isinstance(context_bundle.contents, dict) else []
+            relationship_graph = (context_bundle.contents or {}).get("relationship_graph", []) if isinstance(context_bundle.contents, dict) else []
+            external_bindings = (context_bundle.contents or {}).get("external_bindings", []) if isinstance(context_bundle.contents, dict) else []
+            sections.append(f"Context bundle id: {context_bundle.id} (version {context_bundle.version}, type {context_bundle.bundle_type}).")
+            sections.append(
+                "Governed request context: "
+                + json.dumps(
+                    {
+                        "request_id": request_data.get("id"),
+                        "title": request_data.get("title"),
+                        "status": request_data.get("status"),
+                        "priority": request_data.get("priority"),
+                        "input_payload": request_data.get("input_payload", {}),
+                        "workflow_state": workflow_state,
+                        "prior_decision_count": len(prior_decisions),
+                        "relationship_count": len(relationship_graph),
+                        "external_bindings": external_bindings,
+                    },
+                    ensure_ascii=True,
+                )
+            )
+            if context_bundle.policy_scope:
+                sections.append(f"Policy scope: {json.dumps(context_bundle.policy_scope, ensure_ascii=True)}")
+        if available_tools:
+            tool_summary = [
+                {
+                    "name": tool.get("name"),
+                    "description": tool.get("description"),
+                    "required_collaboration_mode": tool.get("required_collaboration_mode"),
+                }
+                for tool in available_tools
+            ]
+            sections.append(f"Authorized MCP capabilities: {json.dumps(tool_summary, ensure_ascii=True)}")
+        return "\n".join(section for section in sections if section)
+
+    def _fallback_context_note(self, context_bundle: ContextBundleRecord | None, available_tools: list[dict] | None) -> str:
+        parts: list[str] = []
+        if context_bundle is not None:
+            parts.append(f" Governed context bundle {context_bundle.id} is attached.")
+        if available_tools:
+            parts.append(f" Authorized MCP capabilities: {', '.join(str(tool.get('name')) for tool in available_tools if tool.get('name'))}.")
+        return "".join(parts)
 
 
 agent_provider_service = AgentProviderService()
