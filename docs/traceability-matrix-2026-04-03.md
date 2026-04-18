@@ -1,3 +1,11 @@
+---
+title: Traceability Matrix
+permalink: /reports/traceability-matrix/
+section: Reports
+summary: Traceability view mapping constitutional and requirements areas to live implementation status across code, API, UI, and tests.
+source_path: docs/traceability-matrix-2026-04-03.md
+---
+
 # RGP Traceability Matrix: Constitution & Requirements v8.0 vs Current Build
 
 **Date:** 2026-04-03  

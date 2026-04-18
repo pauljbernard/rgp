@@ -1,3 +1,11 @@
+---
+title: Architecture and Design
+permalink: /wiki/architecture/
+section: Wiki
+summary: Runtime model, component map, domain shape, and key architecture decisions for the Request Governance Platform.
+source_path: docs/wiki/Architecture-and-Design.md
+---
+
 # Architecture and Design
 
 ## Architectural Model

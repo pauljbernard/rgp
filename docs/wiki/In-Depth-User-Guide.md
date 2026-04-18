@@ -1,3 +1,11 @@
+---
+title: In-Depth User Guide
+permalink: /wiki/in-depth-user-guide/
+section: Wiki
+summary: Detailed guide to requests, agent sessions, reviews, approvals, promotions, and deeper product behavior.
+source_path: docs/wiki/In-Depth-User-Guide.md
+---
+
 # In-Depth User Guide
 
 ## 1. Working with Requests

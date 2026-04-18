@@ -1,9 +1,9 @@
 # RGP Wiki
 
-- [Home](Home)
-- [Constitution and Requirements Rationale](Constitution-and-Requirements-Rationale)
-- [Architecture and Design](Architecture-and-Design)
-- [Coding and Testing Standards](Coding-and-Testing-Standards)
-- [Developer Guide](Developer-Guide)
-- [Quick Start User Guide](Quick-Start-User-Guide)
-- [In-Depth User Guide](In-Depth-User-Guide)
+- [Home](/wiki/)
+- [Constitution and Requirements Rationale](/wiki/constitution-requirements-rationale/)
+- [Architecture and Design](/wiki/architecture/)
+- [Coding and Testing Standards](/wiki/coding-testing-standards/)
+- [Developer Guide](/wiki/developer-guide/)
+- [Quick Start User Guide](/wiki/quick-start/)
+- [In-Depth User Guide](/wiki/in-depth-user-guide/)

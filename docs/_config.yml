@@ -1,0 +1,15 @@
+title: Request Governance Platform
+description: Governance-first product, implementation, and API documentation for the Request Governance Platform.
+repository_url: https://github.com/pauljbernard/rgp
+markdown: kramdown
+highlighter: rouge
+permalink: pretty
+theme: null
+exclude:
+  - .DS_Store
+  - wiki/_Sidebar.md
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: default

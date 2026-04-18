@@ -1,3 +1,11 @@
+---
+title: Quick Start User Guide
+permalink: /wiki/quick-start/
+section: Wiki
+summary: Fast path for first-time users who need to get productive in RGP without reading the full manual first.
+source_path: docs/wiki/Quick-Start-User-Guide.md
+---
+
 # Quick Start User Guide
 
 ## Who This Guide Is For
@@ -103,4 +111,4 @@ If you are new, start here:
 
 ## Next Step
 
-After this guide, continue to the [In-Depth User Guide](In-Depth-User-Guide).
+After this guide, continue to the [In-Depth User Guide]({{ '/wiki/in-depth-user-guide/' | relative_url }}).

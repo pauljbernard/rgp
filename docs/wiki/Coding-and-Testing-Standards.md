@@ -1,3 +1,11 @@
+---
+title: Coding and Testing Standards
+permalink: /wiki/coding-testing-standards/
+section: Wiki
+summary: Engineering standards for specification-driven implementation, layer discipline, and the required testing strands.
+source_path: docs/wiki/Coding-and-Testing-Standards.md
+---
+
 # Coding and Testing Standards
 
 ## Coding Standards

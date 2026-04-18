@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% if page.title %}{{ page.title }} | {{ site.title }}{% else %}{{ site.title }}{% endif %}</title>
+    <meta name="description" content="{{ page.summary | default: site.description | escape }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ '/assets/css/site.css' | relative_url }}">
+  </head>
+  <body>
+    <div class="site-frame">
+      <aside class="site-sidebar">
+        <a class="brand" href="{{ '/' | relative_url }}">
+          <span class="brand-mark">RGP</span>
+          <span class="brand-copy">
+            <strong>{{ site.title }}</strong>
+            <span>Formal documentation site</span>
+          </span>
+        </a>
+
+        <p class="sidebar-intro">
+          Governance-first product, architecture, implementation, and operating documentation for the Request Governance Platform.
+        </p>
+
+        <nav class="site-nav" aria-label="Documentation navigation">
+          {% for group in site.data.navigation %}
+            <section class="nav-group">
+              <h2>{{ group.title }}</h2>
+              <ul>
+                {% for item in group.items %}
+                  <li>
+                    <a href="{{ item.url | relative_url }}" class="{% if page.url == item.url %}active{% endif %}">
+                      {{ item.title }}
+                    </a>
+                  </li>
+                {% endfor %}
+              </ul>
+            </section>
+          {% endfor %}
+        </nav>
+
+        <div class="sidebar-meta">
+          <div class="meta-label">Publishing Source</div>
+          <div class="meta-value">GitHub Pages from <code>/docs</code></div>
+        </div>
+      </aside>
+
+      <div class="site-main">
+        <header class="masthead">
+          <div>
+            <div class="eyebrow">{{ page.section | default: "Documentation" }}</div>
+            <h1>{{ page.title | default: site.title }}</h1>
+            {% if page.summary %}
+              <p class="page-summary">{{ page.summary }}</p>
+            {% endif %}
+          </div>
+
+          <div class="masthead-actions">
+            <a class="ghost-button" href="{{ site.repository_url }}">Repository</a>
+            {% if page.source_path %}
+              <a class="ghost-button" href="{{ site.repository_url }}/blob/main/{{ page.source_path }}">View Source</a>
+            {% endif %}
+          </div>
+        </header>
+
+        <main class="page-shell">
+          {% if page.url == '/' %}
+            {{ content }}
+          {% else %}
+            <article class="page-card">
+              {{ content }}
+            </article>
+          {% endif %}
+        </main>
+
+        <footer class="site-footer">
+          <div>{{ site.title }} documentation</div>
+          <div>Published from the repository <code>/docs</code> directory on GitHub Pages.</div>
+        </footer>
+      </div>
+    </div>
+  </body>
+</html>

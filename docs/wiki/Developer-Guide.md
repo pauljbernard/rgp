@@ -1,3 +1,11 @@
+---
+title: Developer Guide
+permalink: /wiki/developer-guide/
+section: Wiki
+summary: Repository setup, runtime workflow, and local environment guidance for contributors and maintainers.
+source_path: docs/wiki/Developer-Guide.md
+---
+
 # Developer Guide
 
 ## Prerequisites

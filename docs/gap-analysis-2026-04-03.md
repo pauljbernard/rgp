@@ -1,3 +1,11 @@
+---
+title: Gap Analysis
+permalink: /reports/gap-analysis/
+section: Reports
+summary: Full codebase review against the constitution and requirements, documenting implemented, partial, and missing capability areas.
+source_path: docs/gap-analysis-2026-04-03.md
+---
+
 # RGP Gap Analysis: Constitution & Requirements v8.0 vs. Implementation
 
 **Date:** 2026-04-03 (updated 2026-04-03)

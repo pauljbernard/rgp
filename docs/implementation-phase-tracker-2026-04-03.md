@@ -1,3 +1,11 @@
+---
+title: Implementation Phase Tracker
+permalink: /reports/implementation-phase-tracker/
+section: Reports
+summary: Formal delivery tracker for implementation phases, current completion state, and next-phase sequencing.
+source_path: docs/implementation-phase-tracker-2026-04-03.md
+---
+
 # RGP Implementation Phase Tracker
 
 **Date:** 2026-04-03  

@@ -1,3 +1,11 @@
+---
+title: Constitution and Requirements Rationale
+permalink: /wiki/constitution-requirements-rationale/
+section: Wiki
+summary: Why RGP exists, how the constitution shapes the product, and what makes the governance model different from adjacent tools.
+source_path: docs/wiki/Constitution-and-Requirements-Rationale.md
+---
+
 # Constitution and Requirements Rationale
 
 ## Why RGP Exists

@@ -1,3 +1,11 @@
+---
+title: Wiki Home
+permalink: /wiki/
+section: Wiki
+summary: Entry page for the first-version RGP documentation set, including rationale, architecture, engineering guidance, and user documentation.
+source_path: docs/wiki/Home.md
+---
+
 # Request Governance Platform Wiki
 
 Welcome to the first-version documentation for the Request Governance Platform (RGP).
@@ -6,12 +14,12 @@ RGP is a governance-first control plane for work. It treats a **request** as the
 
 This wiki is organized around the major documentation strands for the first release:
 
-- [Constitution and Requirements Rationale](Constitution-and-Requirements-Rationale)
-- [Architecture and Design](Architecture-and-Design)
-- [Coding and Testing Standards](Coding-and-Testing-Standards)
-- [Developer Guide](Developer-Guide)
-- [Quick Start User Guide](Quick-Start-User-Guide)
-- [In-Depth User Guide](In-Depth-User-Guide)
+- [Constitution and Requirements Rationale]({{ '/wiki/constitution-requirements-rationale/' | relative_url }})
+- [Architecture and Design]({{ '/wiki/architecture/' | relative_url }})
+- [Coding and Testing Standards]({{ '/wiki/coding-testing-standards/' | relative_url }})
+- [Developer Guide]({{ '/wiki/developer-guide/' | relative_url }})
+- [Quick Start User Guide]({{ '/wiki/quick-start/' | relative_url }})
+- [In-Depth User Guide]({{ '/wiki/in-depth-user-guide/' | relative_url }})
 
 ## Core Sources
 
@@ -39,9 +47,9 @@ The current release includes:
 
 If you are new to the platform, read in this order:
 
-1. [Constitution and Requirements Rationale](Constitution-and-Requirements-Rationale)
-2. [Architecture and Design](Architecture-and-Design)
-3. [Quick Start User Guide](Quick-Start-User-Guide)
-4. [In-Depth User Guide](In-Depth-User-Guide)
-5. [Developer Guide](Developer-Guide)
-6. [Coding and Testing Standards](Coding-and-Testing-Standards)
+1. [Constitution and Requirements Rationale]({{ '/wiki/constitution-requirements-rationale/' | relative_url }})
+2. [Architecture and Design]({{ '/wiki/architecture/' | relative_url }})
+3. [Quick Start User Guide]({{ '/wiki/quick-start/' | relative_url }})
+4. [In-Depth User Guide]({{ '/wiki/in-depth-user-guide/' | relative_url }})
+5. [Developer Guide]({{ '/wiki/developer-guide/' | relative_url }})
+6. [Coding and Testing Standards]({{ '/wiki/coding-testing-standards/' | relative_url }})

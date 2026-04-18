@@ -1,3 +1,11 @@
+---
+title: FlightOS Instructional Governance Contract
+permalink: /api/flightos-instructional-governance/
+section: API Contract
+summary: Shared API contract for stage-aware instructional governance between FlightOS and RGP.
+source_path: docs/api/flightos-instructional-governance-contract.md
+---
+
 # FlightOS Instructional Governance Contract
 
 ## Purpose
