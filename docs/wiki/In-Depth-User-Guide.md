@@ -61,6 +61,17 @@ RGP supports assigning a request directly to an integrated agent.
 - the request can pause in `awaiting_input`
 - accepting the result resumes workflow
 
+For governed external runtime sessions such as `sbcl-agent`, the session page also becomes a runtime-control surface.
+
+Operators can now:
+
+- inspect governed runtime environment, thread, and turn references
+- see pending approval checkpoints exposed by the external runtime
+- approve or resume specific runtime work-items
+- import runtime-produced artifacts into RGP as first-class governed artifacts with lineage
+
+That means an `sbcl-agent` session is not only a conversation transcript. It is a governed view over a durable external runtime.
+
 This is intentionally different from a normal chatbot. The session is part of the governed work record.
 
 ## 3. Reviews and Approvals
@@ -179,6 +190,8 @@ Check:
 - session state
 - whether the latest turn completed
 - whether the request is waiting on human input
+- whether a governed runtime approval checkpoint is blocking execution
+- whether the runtime artifact or approval action you expect has already been reconciled into the session page
 
 ### Analytics Look Incomplete
 

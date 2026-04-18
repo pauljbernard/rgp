@@ -4,6 +4,7 @@ import type {
   AnalyticsBottleneckRow,
   AnalyticsWorkflowRow,
   AddTeamMembershipInput,
+  ApproveAgentSessionCheckpointInput,
   AgentTrendPoint,
   AgentSessionDetail,
   AgentSessionRecord,
@@ -69,7 +70,9 @@ import type {
   TemplateRecord,
   TemplateValidationResult,
   ReconciliationLogRecord,
+  ResumeAgentSessionRuntimeInput,
   IntegrationRecord,
+  ImportAgentSessionArtifactInput,
   KnowledgeArtifactRecord,
   KnowledgeVersionRecord,
   OrganizationRecord,
@@ -337,6 +340,39 @@ export function completeAgentSession(
   payload: { reason?: string; target_status?: string; actor_id?: string } = {}
 ) {
   return requestWithOptions<AgentSessionDetail>(`/api/v1/requests/${requestId}/agent-sessions/${sessionId}/complete`, {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function resumeAgentSessionRuntime(
+  requestId: string,
+  sessionId: string,
+  payload: ResumeAgentSessionRuntimeInput
+) {
+  return requestWithOptions<AgentSessionDetail>(`/api/v1/requests/${requestId}/agent-sessions/${sessionId}/runtime/resume`, {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function approveAgentSessionCheckpoint(
+  requestId: string,
+  sessionId: string,
+  payload: ApproveAgentSessionCheckpointInput
+) {
+  return requestWithOptions<AgentSessionDetail>(`/api/v1/requests/${requestId}/agent-sessions/${sessionId}/runtime/approvals/approve`, {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function importAgentSessionArtifact(
+  requestId: string,
+  sessionId: string,
+  payload: ImportAgentSessionArtifactInput
+) {
+  return requestWithOptions<ArtifactDetail>(`/api/v1/requests/${requestId}/agent-sessions/${sessionId}/artifacts/import`, {
     method: "POST",
     body: JSON.stringify(payload)
   });

@@ -49,7 +49,9 @@ from app.models.governance import (
     PromotionActionRequest,
     PromotionApprovalOverrideRequest,
     PromotionDetail,
+    ApproveAgentSessionCheckpointRequest,
     RequestDetail,
+    ResumeAgentSessionRuntimeRequest,
     ReviewAssignmentOverrideRequest,
     ReviewDecisionRequest,
     ReviewQueueItem,
@@ -481,6 +483,24 @@ class SqlAlchemyGovernanceRuntimeAdapter(GovernanceRuntimePort):
         tenant_id: str,
     ) -> AgentSessionDetail:
         return self._repository.complete_agent_session(request_id, session_id, payload, tenant_id)
+
+    def resume_agent_session_runtime(
+        self,
+        request_id: str,
+        session_id: str,
+        payload: ResumeAgentSessionRuntimeRequest,
+        tenant_id: str,
+    ) -> AgentSessionDetail:
+        return self._repository.resume_agent_session_runtime(request_id, session_id, payload, tenant_id)
+
+    def approve_agent_session_checkpoint(
+        self,
+        request_id: str,
+        session_id: str,
+        payload: ApproveAgentSessionCheckpointRequest,
+        tenant_id: str,
+    ) -> AgentSessionDetail:
+        return self._repository.approve_agent_session_checkpoint(request_id, session_id, payload, tenant_id)
 
     def import_agent_session_artifact(
         self,

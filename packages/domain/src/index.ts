@@ -1108,6 +1108,22 @@ export type CompleteAgentSessionInput = {
   completion_action?: string;
 };
 
+export type ResumeAgentSessionRuntimeInput = {
+  actor_id?: string;
+  work_item_id: string;
+  note?: string | null;
+  target_status?: string | null;
+  reason?: string;
+};
+
+export type ApproveAgentSessionCheckpointInput = {
+  actor_id?: string;
+  work_item_id: string;
+  policy?: string;
+  target_status?: string | null;
+  reason?: string;
+};
+
 export type CreateIntegrationInput = {
   id: string;
   name: string;

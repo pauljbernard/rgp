@@ -98,6 +98,21 @@ Important design point:
 
 This design exists because real agent work is iterative and requires human follow-up and acceptance.
 
+RGP also supports governed external runtime sessions for integrations whose execution model is stateful rather than merely conversational.
+
+For `sbcl-agent`, that means:
+
+- the request still remains the canonical governed root object
+- the external runtime owns environment, thread, turn, operation, approval, and artifact state
+- RGP binds that runtime through a dedicated substrate adapter instead of routing everything through a generic provider stream
+- session detail and session context now expose governed runtime summaries, pending approvals, and importable runtime artifacts
+- operators can explicitly resume runtime work, approve runtime checkpoints, and import runtime-produced artifacts with lineage preserved into canonical RGP artifacts
+
+This creates a meaningful distinction between:
+
+- interactive agent sessions oriented around transcript flow
+- governed runtime sessions oriented around durable external execution state plus central governance reconciliation
+
 ## Observability and Analytics Design
 
 The platform records:

@@ -28,6 +28,7 @@ from app.models.governance import (
     AnalyticsWorkflowRow,
     AgentTrendPoint,
     AssignAgentSessionRequest,
+    ApproveAgentSessionCheckpointRequest,
     GovernedRuntimeSummary,
     ImportAgentSessionArtifactRequest,
     ArtifactDetail,
@@ -78,6 +79,7 @@ from app.models.governance import (
     PromotionApprovalOverrideRequest,
     RequestDetail,
     RequestRelationship,
+    ResumeAgentSessionRuntimeRequest,
     ReviewAssignmentOverrideRequest,
     ReviewDecisionRequest,
     ReviewQueueItem,
@@ -2693,6 +2695,77 @@ class GovernanceRepository:
             access_log=access_log,
         )
 
+    @staticmethod
+    def _resolve_agent_session_target_status(
+        request,
+        session_row: AgentSessionTable,
+        explicit_target_status: str | None,
+    ) -> str:
+        target_status = explicit_target_status or session_row.resume_request_status
+        if not target_status or target_status == RequestStatus.AWAITING_INPUT.value:
+            target_status = RequestStatus.IN_EXECUTION.value if request.current_run_id else RequestStatus.PLANNED.value
+        return target_status
+
+    def _queue_agent_session_turn(
+        self,
+        session,
+        *,
+        request_id: str,
+        tenant_id: str,
+        session_row: AgentSessionTable,
+        actor_id: str,
+        message_type: str,
+        body: str,
+        streaming_summary: str,
+    ) -> datetime:
+        existing_count = session.scalar(
+            select(func.count()).select_from(AgentSessionMessageTable).where(AgentSessionMessageTable.session_id == session_row.id)
+        ) or 0
+        now = datetime.now(timezone.utc)
+        human_message = AgentSessionMessageTable(
+            id=f"{session_row.id}_m{existing_count + 1:03d}",
+            tenant_id=tenant_id,
+            session_id=session_row.id,
+            request_id=request_id,
+            sender_type="human",
+            sender_id=actor_id,
+            message_type=message_type,
+            body=body,
+            created_at=now,
+        )
+        session.add(human_message)
+        agent_message = AgentSessionMessageTable(
+            id=f"{session_row.id}_m{existing_count + 2:03d}",
+            tenant_id=tenant_id,
+            session_id=session_row.id,
+            request_id=request_id,
+            sender_type="agent",
+            sender_id=session_row.integration_id,
+            message_type="response",
+            body="",
+            created_at=now + timedelta(seconds=1),
+        )
+        session.add(agent_message)
+        session_row.status = "streaming"
+        session_row.awaiting_human = False
+        session_row.summary = streaming_summary
+        session_row.updated_at = now + timedelta(seconds=1)
+        return now
+
+    def _infer_sbcl_agent_work_item_id(
+        self,
+        session_row: AgentSessionTable,
+        integration_row: IntegrationTable | None,
+    ) -> str:
+        live_state = self._sbcl_agent_bundle_state(session_row, integration_row)
+        approvals = [item for item in (live_state.get("approvals") or []) if isinstance(item, dict)]
+        if len(approvals) != 1:
+            raise ValueError("Runtime checkpoint action requires an explicit work_item_id when the governed runtime has zero or multiple pending approvals")
+        work_item_id = approvals[0].get("id")
+        if not isinstance(work_item_id, str) or not work_item_id.strip():
+            raise ValueError("Unable to resolve governed runtime work item id from pending approvals")
+        return work_item_id
+
     def post_agent_session_message(
         self,
         request_id: str,
@@ -2877,11 +2950,11 @@ class GovernanceRepository:
             )
         return self.get_agent_session(request_id, session_id, tenant_id)
 
-    def complete_agent_session(
+    def resume_agent_session_runtime(
         self,
         request_id: str,
         session_id: str,
-        payload: CompleteAgentSessionRequest,
+        payload: ResumeAgentSessionRuntimeRequest,
         tenant_id: str | None = None,
     ) -> AgentSessionDetail:
         if tenant_id is None:
@@ -2895,30 +2968,267 @@ class GovernanceRepository:
             if session_row is None or session_row.request_id != request_id or session_row.tenant_id != request.tenant_id:
                 raise StopIteration(session_id)
             if session_row.status == "streaming":
+                raise ValueError("Cannot resume the runtime while the agent response is still streaming")
+            integration_row = session.get(IntegrationTable, session_row.integration_id)
+            if self._runtime_subtype_for_integration(integration_row) != "sbcl_agent":
+                raise ValueError("Runtime resume is only supported for sbcl-agent governed runtime sessions")
+
+            environment_ref = self._ensure_sbcl_agent_environment_ref(session_row, integration_row)
+            if not environment_ref:
+                raise ValueError("sbcl-agent environment binding is unavailable for this governed runtime session")
+            runtime_result = runtime_dispatch_service.resume_sbcl_agent_session(
+                environment_ref,
+                payload.work_item_id,
+                note=payload.note,
+            )
+            target_status = self._resolve_agent_session_target_status(request, session_row, payload.target_status)
+            control_body = f"Resume governed runtime work item {payload.work_item_id}."
+            if payload.note:
+                control_body = f"{control_body} Note: {payload.note}"
+            now = self._queue_agent_session_turn(
+                session,
+                request_id=request_id,
+                tenant_id=request.tenant_id,
+                session_row=session_row,
+                actor_id=payload.actor_id,
+                message_type="runtime_resume",
+                body=control_body,
+                streaming_summary="Governed sbcl-agent runtime continuation is streaming",
+            )
+            if request_row is not None:
+                self._ensure_request_tenant_access(request_row, tenant_id)
+                request_row.status = target_status
+                request_row.updated_at = now
+                request_row.updated_by = payload.actor_id
+                request_row.version += 1
+                self._append_event(
+                    session=session,
+                    request_id=request_id,
+                    actor=payload.actor_id,
+                    action="Agent Runtime Resumed",
+                    reason_or_evidence=payload.reason,
+                )
+            event_store_service.append(
+                session,
+                tenant_id=request.tenant_id,
+                event_type="agent_session.runtime_resumed",
+                aggregate_type="agent_session",
+                aggregate_id=session_id,
+                request_id=request_id,
+                actor=payload.actor_id,
+                detail=payload.reason,
+                payload={
+                    "work_item_id": payload.work_item_id,
+                    "target_status": target_status,
+                    "note": payload.note,
+                    "runtime_subtype": "sbcl_agent",
+                    "runtime_result": runtime_result,
+                },
+            )
+            session.commit()
+            if request_row is None:
+                update_request_state(
+                    request_id,
+                    request.tenant_id,
+                    payload.actor_id,
+                    status=RequestStatus(target_status),
+                    updated_at=now,
+                    updated_by=payload.actor_id,
+                )
+                record_request_event(
+                    request_id,
+                    request.tenant_id,
+                    payload.actor_id,
+                    "Agent Runtime Resumed",
+                    payload.reason,
+                    status=target_status,
+                )
+            self._refresh_agent_session_context(
+                request_id=request_id,
+                session_id=session_id,
+                tenant_id=request.tenant_id,
+                actor_id=payload.actor_id,
+                integration_row=integration_row,
+                collaboration_mode=session_row.collaboration_mode,
+                agent_operating_profile=session_row.agent_operating_profile,
+                session_row=session_row,
+            )
+        self._start_agent_session_turn_async(request_id, session_id, tenant_id)
+        return self.get_agent_session(request_id, session_id, tenant_id)
+
+    def approve_agent_session_checkpoint(
+        self,
+        request_id: str,
+        session_id: str,
+        payload: ApproveAgentSessionCheckpointRequest,
+        tenant_id: str | None = None,
+    ) -> AgentSessionDetail:
+        if tenant_id is None:
+            raise ValueError("tenant_id is required")
+        request = get_request_state(request_id, tenant_id)
+        if request is None:
+            raise StopIteration(request_id)
+        with SessionLocal() as session:
+            request_row = session.get(RequestTable, request_id)
+            session_row = session.get(AgentSessionTable, session_id)
+            if session_row is None or session_row.request_id != request_id or session_row.tenant_id != request.tenant_id:
+                raise StopIteration(session_id)
+            if session_row.status == "streaming":
+                raise ValueError("Cannot approve the runtime checkpoint while the agent response is still streaming")
+            integration_row = session.get(IntegrationTable, session_row.integration_id)
+            if self._runtime_subtype_for_integration(integration_row) != "sbcl_agent":
+                raise ValueError("Runtime checkpoint approval is only supported for sbcl-agent governed runtime sessions")
+
+            environment_ref = self._ensure_sbcl_agent_environment_ref(session_row, integration_row)
+            if not environment_ref:
+                raise ValueError("sbcl-agent environment binding is unavailable for this governed runtime session")
+            runtime_result = runtime_dispatch_service.approve_sbcl_agent_checkpoint(
+                environment_ref,
+                payload.work_item_id,
+                policy=payload.policy,
+                reason=payload.reason,
+            )
+            target_status = self._resolve_agent_session_target_status(request, session_row, payload.target_status)
+            control_body = (
+                f"Approve governed runtime checkpoint {payload.work_item_id} "
+                f"under policy {payload.policy}."
+            )
+            now = self._queue_agent_session_turn(
+                session,
+                request_id=request_id,
+                tenant_id=request.tenant_id,
+                session_row=session_row,
+                actor_id=payload.actor_id,
+                message_type="runtime_approval",
+                body=control_body,
+                streaming_summary="Governed sbcl-agent checkpoint approval is being reconciled",
+            )
+            if request_row is not None:
+                self._ensure_request_tenant_access(request_row, tenant_id)
+                request_row.status = target_status
+                request_row.updated_at = now
+                request_row.updated_by = payload.actor_id
+                request_row.version += 1
+                self._append_event(
+                    session=session,
+                    request_id=request_id,
+                    actor=payload.actor_id,
+                    action="Agent Runtime Checkpoint Approved",
+                    reason_or_evidence=payload.reason,
+                )
+            event_store_service.append(
+                session,
+                tenant_id=request.tenant_id,
+                event_type="agent_session.runtime_checkpoint_approved",
+                aggregate_type="agent_session",
+                aggregate_id=session_id,
+                request_id=request_id,
+                actor=payload.actor_id,
+                detail=payload.reason,
+                payload={
+                    "work_item_id": payload.work_item_id,
+                    "policy": payload.policy,
+                    "target_status": target_status,
+                    "runtime_subtype": "sbcl_agent",
+                    "runtime_result": runtime_result,
+                },
+            )
+            session.commit()
+            if request_row is None:
+                update_request_state(
+                    request_id,
+                    request.tenant_id,
+                    payload.actor_id,
+                    status=RequestStatus(target_status),
+                    updated_at=now,
+                    updated_by=payload.actor_id,
+                )
+                record_request_event(
+                    request_id,
+                    request.tenant_id,
+                    payload.actor_id,
+                    "Agent Runtime Checkpoint Approved",
+                    payload.reason,
+                    status=target_status,
+                )
+            self._refresh_agent_session_context(
+                request_id=request_id,
+                session_id=session_id,
+                tenant_id=request.tenant_id,
+                actor_id=payload.actor_id,
+                integration_row=integration_row,
+                collaboration_mode=session_row.collaboration_mode,
+                agent_operating_profile=session_row.agent_operating_profile,
+                session_row=session_row,
+            )
+        self._start_agent_session_turn_async(request_id, session_id, tenant_id)
+        return self.get_agent_session(request_id, session_id, tenant_id)
+
+    def complete_agent_session(
+        self,
+        request_id: str,
+        session_id: str,
+        payload: CompleteAgentSessionRequest,
+        tenant_id: str | None = None,
+    ) -> AgentSessionDetail:
+        if tenant_id is None:
+            raise ValueError("tenant_id is required")
+        request = get_request_state(request_id, tenant_id)
+        if request is None:
+            raise StopIteration(request_id)
+        completion_action = (payload.completion_action or "accept_response").strip().lower()
+        if completion_action == "resume_runtime":
+            with SessionLocal() as session:
+                session_row = session.get(AgentSessionTable, session_id)
+                if session_row is None or session_row.request_id != request_id or session_row.tenant_id != request.tenant_id:
+                    raise StopIteration(session_id)
+                integration_row = session.get(IntegrationTable, session_row.integration_id)
+                work_item_id = self._infer_sbcl_agent_work_item_id(session_row, integration_row)
+            return self.resume_agent_session_runtime(
+                request_id,
+                session_id,
+                ResumeAgentSessionRuntimeRequest(
+                    actor_id=payload.actor_id,
+                    work_item_id=work_item_id,
+                    target_status=payload.target_status,
+                    reason=payload.reason,
+                ),
+                tenant_id,
+            )
+        if completion_action == "approve_runtime_checkpoint":
+            with SessionLocal() as session:
+                session_row = session.get(AgentSessionTable, session_id)
+                if session_row is None or session_row.request_id != request_id or session_row.tenant_id != request.tenant_id:
+                    raise StopIteration(session_id)
+                integration_row = session.get(IntegrationTable, session_row.integration_id)
+                work_item_id = self._infer_sbcl_agent_work_item_id(session_row, integration_row)
+            return self.approve_agent_session_checkpoint(
+                request_id,
+                session_id,
+                ApproveAgentSessionCheckpointRequest(
+                    actor_id=payload.actor_id,
+                    work_item_id=work_item_id,
+                    target_status=payload.target_status,
+                    reason=payload.reason,
+                ),
+                tenant_id,
+            )
+        with SessionLocal() as session:
+            request_row = session.get(RequestTable, request_id)
+            session_row = session.get(AgentSessionTable, session_id)
+            if session_row is None or session_row.request_id != request_id or session_row.tenant_id != request.tenant_id:
+                raise StopIteration(session_id)
+            if session_row.status == "streaming":
                 raise ValueError("Cannot accept the session while the agent response is still streaming")
             integration_row = session.get(IntegrationTable, session_row.integration_id)
             runtime_subtype = self._runtime_subtype_for_integration(integration_row)
-            completion_action = (payload.completion_action or "accept_response").strip().lower()
-            if completion_action in {"resume_runtime", "approve_runtime_checkpoint"} and runtime_subtype != "sbcl_agent":
-                raise ValueError("Specialized runtime completion actions require an sbcl-agent governed runtime session")
-            target_status = payload.target_status or session_row.resume_request_status
-            if not target_status or target_status == RequestStatus.AWAITING_INPUT.value:
-                target_status = RequestStatus.IN_EXECUTION.value if request.current_run_id else RequestStatus.PLANNED.value
+            target_status = self._resolve_agent_session_target_status(request, session_row, payload.target_status)
 
             session_row.status = "completed"
             session_row.awaiting_human = False
-            if completion_action == "resume_runtime":
-                session_row.summary = f"Approved runtime continuation and resumed {target_status.replace('_', ' ')}"
-                event_type = "agent_session.runtime_resumed"
-                action_label = "Agent Runtime Resumed"
-            elif completion_action == "approve_runtime_checkpoint":
-                session_row.summary = "Approved governed sbcl-agent runtime checkpoint"
-                event_type = "agent_session.runtime_checkpoint_approved"
-                action_label = "Agent Runtime Checkpoint Approved"
-            else:
-                session_row.summary = f"Accepted response and resumed {target_status.replace('_', ' ')}"
-                event_type = "agent_session.completed"
-                action_label = "Agent Session Completed"
+            session_row.summary = f"Accepted response and resumed {target_status.replace('_', ' ')}"
+            event_type = "agent_session.completed"
+            action_label = "Agent Session Completed"
             session_row.updated_at = datetime.now(timezone.utc)
 
             if request_row is not None:
@@ -3125,6 +3435,47 @@ class GovernanceRepository:
                                 "reason": tool.get("availability_reason"),
                             },
                         )
+                runtime_subtype = self._runtime_subtype_for_integration(integration_row)
+                if runtime_subtype == "sbcl_agent":
+                    context_bundle = self._refresh_agent_session_context(
+                        request_id=request_id,
+                        session_id=session_id,
+                        tenant_id=request.tenant_id,
+                        actor_id=session_row.assigned_by,
+                        integration_row=integration_row,
+                        collaboration_mode=session_row.collaboration_mode,
+                        agent_operating_profile=session_row.agent_operating_profile,
+                        session_row=session_row,
+                    )
+                    pending_agent_message.body = self._sbcl_agent_response_text(
+                        session_row,
+                        latest_human_message,
+                        context_bundle,
+                    )
+                    session_row.external_session_ref = self._ensure_sbcl_agent_environment_ref(session_row, integration_row)
+                    session_row.updated_at = datetime.now(timezone.utc)
+                    session.flush()
+                    session.commit()
+
+                    transitioned_at = datetime.now(timezone.utc)
+                    transition_result = session.execute(
+                        update(AgentSessionTable)
+                        .where(
+                            AgentSessionTable.id == session_id,
+                            AgentSessionTable.status == "streaming",
+                        )
+                        .values(
+                            status="waiting_on_human",
+                            awaiting_human=True,
+                            summary=self._sbcl_agent_turn_summary(session_row, context_bundle),
+                            updated_at=transitioned_at,
+                        )
+                    )
+                    if transition_result.rowcount == 0:
+                        session.rollback()
+                        return
+                    session.commit()
+                    return
                 is_initial_turn = latest_human_message.message_type == "assignment" and session_row.external_session_ref is None
                 if is_initial_turn:
                     provider_stream = agent_provider_service.stream_start_session(
@@ -6400,6 +6751,69 @@ class GovernanceRepository:
             role = "assistant" if row.sender_type == "agent" else "user"
             transcript.append({"role": role, "content": row.body})
         return transcript
+
+    @staticmethod
+    def _sbcl_agent_response_text(
+        session_row: AgentSessionTable,
+        latest_human_message: AgentSessionMessageTable,
+        bundle: ContextBundleRecord | None,
+    ) -> str:
+        contents = bundle.contents if bundle and isinstance(bundle.contents, dict) else {}
+        binding = contents.get("sbcl_agent_binding", {}) if isinstance(contents.get("sbcl_agent_binding", {}), dict) else {}
+        runtime = contents.get("sbcl_agent_runtime", {}) if isinstance(contents.get("sbcl_agent_runtime", {}), dict) else {}
+        approvals = list(contents.get("sbcl_agent_approvals", [])) if isinstance(contents.get("sbcl_agent_approvals", []), list) else []
+        artifacts = list(contents.get("sbcl_agent_artifacts", [])) if isinstance(contents.get("sbcl_agent_artifacts", []), list) else []
+        environment_ref = binding.get("environment_ref") or session_row.external_session_ref or "<unbound>"
+        thread_ref = runtime.get("thread_ref") or runtime.get("active_thread_id") or "unknown"
+        turn_ref = runtime.get("turn_ref") or "latest"
+        lines = [
+            f"{session_row.agent_label} is operating as a governed sbcl-agent runtime.",
+            f"Environment ref: {environment_ref}",
+            f"Thread ref: {thread_ref}",
+            f"Turn ref: {turn_ref}",
+        ]
+        if latest_human_message.message_type != "assignment":
+            lines.append(f"Latest guidance: {latest_human_message.body}")
+        lines.append(
+            "Runtime state: "
+            f"approvals={len(approvals)} artifacts={len(artifacts)} "
+            f"threads={runtime.get('thread_count', 0)} work_items={runtime.get('work_item_count', 0)} "
+            f"incidents={runtime.get('incident_count', 0)}"
+        )
+        if approvals:
+            preview = ", ".join(
+                f"{item.get('id', 'work-item')}:{item.get('wait_reason', item.get('status', 'pending'))}"
+                for item in approvals[:3]
+                if isinstance(item, dict)
+            )
+            lines.append(f"Pending approvals: {preview}")
+        else:
+            lines.append("Pending approvals: none")
+        if artifacts:
+            preview = ", ".join(
+                item.get("title") or item.get("path") or item.get("id", "artifact")
+                for item in artifacts[:3]
+                if isinstance(item, dict)
+            )
+            lines.append(f"Importable artifacts: {preview}")
+        else:
+            lines.append("Importable artifacts: none")
+        lines.append("Use runtime.environment, runtime.approvals, and runtime.artifacts to inspect governed state before resuming or importing.")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _sbcl_agent_turn_summary(
+        session_row: AgentSessionTable,
+        bundle: ContextBundleRecord | None,
+    ) -> str:
+        contents = bundle.contents if bundle and isinstance(bundle.contents, dict) else {}
+        approvals = list(contents.get("sbcl_agent_approvals", [])) if isinstance(contents.get("sbcl_agent_approvals", []), list) else []
+        artifacts = list(contents.get("sbcl_agent_artifacts", [])) if isinstance(contents.get("sbcl_agent_artifacts", []), list) else []
+        if approvals:
+            return f"{session_row.agent_label} is waiting on governed runtime approval"
+        if artifacts:
+            return f"{session_row.agent_label} surfaced governed runtime artifacts for review"
+        return f"{session_row.agent_label} refreshed governed runtime state"
 
     def _artifact_detail_from_row(
         self,

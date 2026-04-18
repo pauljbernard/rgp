@@ -44,6 +44,7 @@ from app.models.governance import (
     CheckOverrideRequest,
     CheckRunRecord,
     CompleteAgentSessionRequest,
+    ApproveAgentSessionCheckpointRequest,
     CreateIntegrationRequest,
     CreateOrganizationRequest,
     CreatePortfolioRequest,
@@ -68,6 +69,7 @@ from app.models.governance import (
     UserRecord,
     WorkflowTrendPoint,
     RequestDetail,
+    ResumeAgentSessionRuntimeRequest,
     ReviewAssignmentOverrideRequest,
     ReviewDecisionRequest,
     ReviewQueueItem,
@@ -284,6 +286,26 @@ class GovernanceService:
     ) -> AgentSessionDetail:
         tenant_id = self._request_scope_tenant(request_id, principal)
         return self._governance_runtime.complete_agent_session(request_id, session_id, payload, tenant_id)
+
+    def resume_agent_session_runtime(
+        self,
+        request_id: str,
+        session_id: str,
+        payload: ResumeAgentSessionRuntimeRequest,
+        principal: Principal,
+    ) -> AgentSessionDetail:
+        tenant_id = self._request_scope_tenant(request_id, principal)
+        return self._governance_runtime.resume_agent_session_runtime(request_id, session_id, payload, tenant_id)
+
+    def approve_agent_session_checkpoint(
+        self,
+        request_id: str,
+        session_id: str,
+        payload: ApproveAgentSessionCheckpointRequest,
+        principal: Principal,
+    ) -> AgentSessionDetail:
+        tenant_id = self._request_scope_tenant(request_id, principal)
+        return self._governance_runtime.approve_agent_session_checkpoint(request_id, session_id, payload, tenant_id)
 
     def import_agent_session_artifact(
         self,

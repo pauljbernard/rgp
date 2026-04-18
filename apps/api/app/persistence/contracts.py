@@ -49,7 +49,9 @@ from app.models.governance import (
     PromotionActionRequest,
     PromotionApprovalOverrideRequest,
     PromotionDetail,
+    ApproveAgentSessionCheckpointRequest,
     RequestDetail,
+    ResumeAgentSessionRuntimeRequest,
     ReviewAssignmentOverrideRequest,
     ReviewDecisionRequest,
     ReviewQueueItem,
@@ -496,6 +498,24 @@ class GovernanceRuntimePort(Protocol):
         request_id: str,
         session_id: str,
         payload: CompleteAgentSessionRequest,
+        tenant_id: str,
+    ) -> AgentSessionDetail:
+        ...
+
+    def resume_agent_session_runtime(
+        self,
+        request_id: str,
+        session_id: str,
+        payload: ResumeAgentSessionRuntimeRequest,
+        tenant_id: str,
+    ) -> AgentSessionDetail:
+        ...
+
+    def approve_agent_session_checkpoint(
+        self,
+        request_id: str,
+        session_id: str,
+        payload: ApproveAgentSessionCheckpointRequest,
         tenant_id: str,
     ) -> AgentSessionDetail:
         ...

@@ -7,7 +7,7 @@ from fastapi.responses import StreamingResponse
 
 from app.core.auth import ensure_roles, get_principal
 from app.models.common import PaginatedResponse
-from app.models.governance import AgentSessionContextDetail, AgentSessionDetail, AgentSessionMessageCreateRequest, AgentSessionRecord, AssignAgentSessionRequest, AuditEntry, ArtifactDetail, CompleteAgentSessionRequest, ImportAgentSessionArtifactRequest, InstructionalWorkflowDecisionRequest, InstructionalWorkflowProjectionRecord, IntegrationRecord, RequestDetail, UpdateAgentSessionGovernanceRequest
+from app.models.governance import AgentSessionContextDetail, AgentSessionDetail, AgentSessionMessageCreateRequest, AgentSessionRecord, ApproveAgentSessionCheckpointRequest, AssignAgentSessionRequest, AuditEntry, ArtifactDetail, CompleteAgentSessionRequest, ImportAgentSessionArtifactRequest, InstructionalWorkflowDecisionRequest, InstructionalWorkflowProjectionRecord, IntegrationRecord, RequestDetail, ResumeAgentSessionRuntimeRequest, UpdateAgentSessionGovernanceRequest
 from app.models.federation import ProjectionMappingRecord
 from app.models.request import AmendRequest, CancelRequest, CloneRequest, CreateRequestDraft, RequestCheckRun, RequestRecord, SubmitRequest, SupersedeRequest, TransitionRequest
 from app.models.security import Principal, PrincipalRole
@@ -435,6 +435,44 @@ def complete_agent_session(
         ensure_roles(principal, PrincipalRole.SUBMITTER, PrincipalRole.OPERATOR, PrincipalRole.ADMIN)
         resolved_payload = (payload or CompleteAgentSessionRequest()).model_copy(update={"actor_id": principal.user_id})
         return governance_service.complete_agent_session(request_id, session_id, resolved_payload, principal)
+    except StopIteration:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent session not found") from None
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+
+@router.post("/{request_id}/agent-sessions/{session_id}/runtime/resume", response_model=AgentSessionDetail)
+def resume_agent_session_runtime(
+    request_id: str,
+    session_id: str,
+    payload: ResumeAgentSessionRuntimeRequest,
+    principal: Annotated[Principal, Depends(get_principal)],
+) -> AgentSessionDetail:
+    try:
+        ensure_roles(principal, PrincipalRole.SUBMITTER, PrincipalRole.OPERATOR, PrincipalRole.ADMIN)
+        payload = payload.model_copy(update={"actor_id": principal.user_id})
+        return governance_service.resume_agent_session_runtime(request_id, session_id, payload, principal)
+    except StopIteration:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent session not found") from None
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+
+@router.post("/{request_id}/agent-sessions/{session_id}/runtime/approvals/approve", response_model=AgentSessionDetail)
+def approve_agent_session_checkpoint(
+    request_id: str,
+    session_id: str,
+    payload: ApproveAgentSessionCheckpointRequest,
+    principal: Annotated[Principal, Depends(get_principal)],
+) -> AgentSessionDetail:
+    try:
+        ensure_roles(principal, PrincipalRole.SUBMITTER, PrincipalRole.OPERATOR, PrincipalRole.ADMIN)
+        payload = payload.model_copy(update={"actor_id": principal.user_id})
+        return governance_service.approve_agent_session_checkpoint(request_id, session_id, payload, principal)
     except StopIteration:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent session not found") from None
     except PermissionError as exc:

@@ -922,6 +922,22 @@ class CompleteAgentSessionRequest(RgpModel):
     completion_action: str = "accept_response"
 
 
+class ResumeAgentSessionRuntimeRequest(RgpModel):
+    actor_id: str = "user_demo"
+    work_item_id: str
+    note: str | None = None
+    target_status: str | None = None
+    reason: str = "Resumed governed sbcl-agent runtime work"
+
+
+class ApproveAgentSessionCheckpointRequest(RgpModel):
+    actor_id: str = "user_demo"
+    work_item_id: str
+    policy: str = "process-run"
+    target_status: str | None = None
+    reason: str = "Approved governed sbcl-agent runtime checkpoint"
+
+
 class ImportAgentSessionArtifactRequest(RgpModel):
     actor_id: str = "user_demo"
     artifact_key: str

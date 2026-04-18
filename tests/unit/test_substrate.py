@@ -1,5 +1,8 @@
 """Unit tests for the substrate abstraction layer."""
 
+import importlib
+import os
+import sys
 import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -291,6 +294,42 @@ class RuntimeDispatchServiceSbclAgentTest(unittest.TestCase):
         self.assertEqual(command[0], "bind")
         self.assertIn("--environment", command)
         self.assertIn("--agent-session-id", command)
+
+
+class SbclAgentTurnRenderingTest(unittest.TestCase):
+    def test_response_text_and_summary_reflect_governed_runtime_state(self) -> None:
+        with patch.dict(os.environ, {"RGP_DATABASE_URL": "sqlite+pysqlite:///:memory:"}, clear=False):
+            sys.modules.pop("app.core.config", None)
+            sys.modules.pop("app.db.session", None)
+            sys.modules.pop("app.repositories.governance_repository", None)
+            GovernanceRepository = importlib.import_module("app.repositories.governance_repository").GovernanceRepository
+
+        session_row = SimpleNamespace(agent_label="Runtime Agent", external_session_ref="env:req_1:as_1")
+        latest_human_message = SimpleNamespace(message_type="guidance", body="Resume after finance approval.")
+        bundle = SimpleNamespace(
+            contents={
+                "sbcl_agent_binding": {"environment_ref": "env:req_1:as_1"},
+                "sbcl_agent_runtime": {
+                    "thread_ref": "thread:as_1",
+                    "turn_ref": "turn:as_1:latest",
+                    "thread_count": 1,
+                    "work_item_count": 2,
+                    "incident_count": 0,
+                },
+                "sbcl_agent_approvals": [{"id": "wi_1", "wait_reason": "finance_approval"}],
+                "sbcl_agent_artifacts": [{"id": "art_1", "title": "Execution log"}],
+            }
+        )
+
+        response_text = GovernanceRepository._sbcl_agent_response_text(session_row, latest_human_message, bundle)
+        summary = GovernanceRepository._sbcl_agent_turn_summary(session_row, bundle)
+
+        self.assertIn("governed sbcl-agent runtime", response_text)
+        self.assertIn("Environment ref: env:req_1:as_1", response_text)
+        self.assertIn("Latest guidance: Resume after finance approval.", response_text)
+        self.assertIn("Pending approvals: wi_1:finance_approval", response_text)
+        self.assertIn("Importable artifacts: Execution log", response_text)
+        self.assertEqual(summary, "Runtime Agent is waiting on governed runtime approval")
 
 
 if __name__ == "__main__":
