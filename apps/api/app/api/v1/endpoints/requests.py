@@ -7,7 +7,7 @@ from fastapi.responses import StreamingResponse
 
 from app.core.auth import ensure_roles, get_principal
 from app.models.common import PaginatedResponse
-from app.models.governance import AgentSessionContextDetail, AgentSessionDetail, AgentSessionMessageCreateRequest, AgentSessionRecord, AssignAgentSessionRequest, AuditEntry, CompleteAgentSessionRequest, IntegrationRecord, RequestDetail, UpdateAgentSessionGovernanceRequest
+from app.models.governance import AgentSessionContextDetail, AgentSessionDetail, AgentSessionMessageCreateRequest, AgentSessionRecord, AssignAgentSessionRequest, AuditEntry, ArtifactDetail, CompleteAgentSessionRequest, ImportAgentSessionArtifactRequest, InstructionalWorkflowDecisionRequest, InstructionalWorkflowProjectionRecord, IntegrationRecord, RequestDetail, UpdateAgentSessionGovernanceRequest
 from app.models.federation import ProjectionMappingRecord
 from app.models.request import AmendRequest, CancelRequest, CloneRequest, CreateRequestDraft, RequestCheckRun, RequestRecord, SubmitRequest, SupersedeRequest, TransitionRequest
 from app.models.security import Principal, PrincipalRole
@@ -30,16 +30,19 @@ def list_requests(
     federation: str | None = Query(default=None),
     principal: Annotated[Principal, Depends(get_principal)] = None,
 ) -> PaginatedResponse[RequestRecord]:
-    return governance_service.list_requests(
-        page=page,
-        page_size=page_size,
-        status=status,
-        owner_team_id=owner_team_id,
-        workflow=workflow,
-        request_id=request_id,
-        federation=federation,
-        tenant_id=principal.tenant_id,
-    )
+    try:
+        return governance_service.list_requests(
+            page=page,
+            page_size=page_size,
+            status=status,
+            owner_team_id=owner_team_id,
+            workflow=workflow,
+            request_id=request_id,
+            federation=federation,
+            tenant_id=principal.tenant_id,
+        )
+    except StopIteration:
+        raise HTTPException(status_code=404, detail="Request not found") from None
 
 
 @router.post("", response_model=RequestRecord, status_code=status.HTTP_201_CREATED)
@@ -248,6 +251,25 @@ def supersede_request(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
 
+@router.get("/instructional-workflows", response_model=PaginatedResponse[InstructionalWorkflowProjectionRecord])
+def list_instructional_workflows(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=1, le=100),
+    flightos_content_entry_id: str | None = Query(default=None),
+    template_id: str | None = Query(default=None),
+    workflow_status: str | None = Query(default=None),
+    principal: Annotated[Principal, Depends(get_principal)] = None,
+) -> PaginatedResponse[InstructionalWorkflowProjectionRecord]:
+    return governance_service.list_instructional_workflow_projections(
+        page=page,
+        page_size=page_size,
+        principal=principal,
+        flightos_content_entry_id=flightos_content_entry_id,
+        template_id=template_id,
+        workflow_status=workflow_status,
+    )
+
+
 @router.get("/{request_id}", response_model=RequestDetail)
 def get_request(request_id: str, principal: Annotated[Principal, Depends(get_principal)]) -> RequestDetail:
     try:
@@ -256,6 +278,47 @@ def get_request(request_id: str, principal: Annotated[Principal, Depends(get_pri
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Request not found") from None
     except PermissionError as exc:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+
+
+@router.get("/{request_id}/instructional-workflow", response_model=InstructionalWorkflowProjectionRecord)
+def get_instructional_workflow(
+    request_id: str,
+    principal: Annotated[Principal, Depends(get_principal)],
+) -> InstructionalWorkflowProjectionRecord:
+    try:
+        return governance_service.get_instructional_workflow_projection(request_id, principal)
+    except StopIteration:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Request not found") from None
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+
+@router.post("/{request_id}/instructional-workflow/decisions", response_model=InstructionalWorkflowProjectionRecord)
+def decide_instructional_workflow_stage(
+    request_id: str,
+    payload: InstructionalWorkflowDecisionRequest,
+    principal: Annotated[Principal, Depends(get_principal)],
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> InstructionalWorkflowProjectionRecord:
+    try:
+        ensure_roles(principal, PrincipalRole.REVIEWER, PrincipalRole.OPERATOR, PrincipalRole.ADMIN)
+        payload = payload.model_copy(update={"actor_id": principal.user_id})
+        return idempotency_service.replay_or_execute(
+            idempotency_key=idempotency_key,
+            scope=f"requests:{request_id}:instructional-workflow:decision",
+            principal=principal,
+            payload=payload.model_dump(mode="json"),
+            response_model=InstructionalWorkflowProjectionRecord,
+            operation=lambda: governance_service.decide_instructional_workflow_stage(request_id, payload, principal),
+        )
+    except StopIteration:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Request not found") from None
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
 
 @router.get("/{request_id}/history", response_model=list[AuditEntry])
@@ -410,6 +473,25 @@ def update_agent_session_governance(
         ensure_roles(principal, PrincipalRole.SUBMITTER, PrincipalRole.OPERATOR, PrincipalRole.ADMIN)
         payload = payload.model_copy(update={"actor_id": principal.user_id})
         return governance_service.update_agent_session_governance(request_id, session_id, payload, principal)
+    except StopIteration:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent session not found") from None
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+
+@router.post("/{request_id}/agent-sessions/{session_id}/artifacts/import", response_model=ArtifactDetail, status_code=status.HTTP_201_CREATED)
+def import_agent_session_artifact(
+    request_id: str,
+    session_id: str,
+    payload: ImportAgentSessionArtifactRequest,
+    principal: Annotated[Principal, Depends(get_principal)],
+) -> ArtifactDetail:
+    try:
+        ensure_roles(principal, PrincipalRole.SUBMITTER, PrincipalRole.OPERATOR, PrincipalRole.ADMIN)
+        payload = payload.model_copy(update={"actor_id": principal.user_id})
+        return governance_service.import_agent_session_artifact(request_id, session_id, payload, principal)
     except StopIteration:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent session not found") from None
     except PermissionError as exc:

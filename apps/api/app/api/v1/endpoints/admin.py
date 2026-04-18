@@ -1,6 +1,7 @@
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm.exc import NoResultFound
 
 from app.core.auth import ensure_roles, get_principal
 from app.models.federation import CreateProjectionRequest, ProjectionMappingRecord, ReconciliationLogRecord, ResolveProjectionRequest, UpdateProjectionExternalStateRequest
@@ -187,7 +188,10 @@ def list_integration_projections(
     principal: Annotated[Principal, Depends(get_principal)],
 ) -> list[ProjectionMappingRecord]:
     ensure_admin_principal(principal)
-    return governance_service.list_integration_projections(integration_id, principal)
+    try:
+        return governance_service.list_integration_projections(integration_id, principal)
+    except StopIteration:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Integration not found") from None
 
 
 @router.post("/integrations/{integration_id}/projections", response_model=ProjectionMappingRecord, status_code=status.HTTP_201_CREATED)
@@ -197,7 +201,12 @@ def create_integration_projection(
     principal: Annotated[Principal, Depends(get_principal)],
 ) -> ProjectionMappingRecord:
     ensure_admin_principal(principal)
-    return governance_service.create_integration_projection(integration_id, payload, principal)
+    try:
+        return governance_service.create_integration_projection(integration_id, payload, principal)
+    except StopIteration:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Projection target not found") from None
+    except NoResultFound:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Integration not found") from None
 
 
 @router.post("/projections/{projection_id}/sync", response_model=ProjectionMappingRecord, status_code=status.HTTP_200_OK)
@@ -206,7 +215,10 @@ def sync_projection(
     principal: Annotated[Principal, Depends(get_principal)],
 ) -> ProjectionMappingRecord:
     ensure_admin_principal(principal)
-    return governance_service.sync_integration_projection(projection_id, principal)
+    try:
+        return governance_service.sync_integration_projection(projection_id, principal)
+    except StopIteration:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Projection not found") from None
 
 
 @router.post("/projections/{projection_id}/external-state", response_model=ProjectionMappingRecord, status_code=status.HTTP_200_OK)
@@ -216,7 +228,10 @@ def update_projection_external_state(
     principal: Annotated[Principal, Depends(get_principal)],
 ) -> ProjectionMappingRecord:
     ensure_admin_principal(principal)
-    return governance_service.update_integration_projection_external_state(projection_id, payload, principal)
+    try:
+        return governance_service.update_integration_projection_external_state(projection_id, payload, principal)
+    except StopIteration:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Projection not found") from None
 
 
 @router.get("/integrations/{integration_id}/reconciliation", response_model=list[ReconciliationLogRecord])
@@ -225,7 +240,10 @@ def list_integration_reconciliation(
     principal: Annotated[Principal, Depends(get_principal)],
 ) -> list[ReconciliationLogRecord]:
     ensure_admin_principal(principal)
-    return governance_service.list_integration_reconciliation_logs(integration_id, principal)
+    try:
+        return governance_service.list_integration_reconciliation_logs(integration_id, principal)
+    except StopIteration:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Integration not found") from None
 
 
 @router.post("/integrations/{integration_id}/reconcile", response_model=list[ReconciliationLogRecord], status_code=status.HTTP_200_OK)
@@ -234,7 +252,10 @@ def reconcile_integration(
     principal: Annotated[Principal, Depends(get_principal)],
 ) -> list[ReconciliationLogRecord]:
     ensure_admin_principal(principal)
-    return governance_service.reconcile_integration(integration_id, principal)
+    try:
+        return governance_service.reconcile_integration(integration_id, principal)
+    except StopIteration:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Integration not found") from None
 
 
 @router.post("/projections/{projection_id}/resolve", response_model=ReconciliationLogRecord, status_code=status.HTTP_200_OK)
@@ -246,6 +267,8 @@ def resolve_projection(
     ensure_admin_principal(principal)
     try:
         return governance_service.resolve_integration_projection(projection_id, payload, principal)
+    except StopIteration:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Projection not found") from None
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 

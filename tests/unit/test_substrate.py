@@ -172,5 +172,126 @@ class ProtocolComplianceTest(unittest.TestCase):
         self.assertTrue(hasattr(adapter, "query_deployment_status"))
 
 
+class SbclAgentRuntimeAdapterTest(unittest.TestCase):
+    def test_dispatch_carries_governed_runtime_binding_contract(self) -> None:
+        from app.domain.substrate.adapters.sbcl_agent_runtime_adapter import SbclAgentRuntimeAdapter
+
+        adapter = SbclAgentRuntimeAdapter()
+        with patch("app.domain.substrate.adapters.sbcl_agent_runtime_adapter.runtime_dispatch_service") as mock_service:
+            mock_service.dispatch.return_value = {"external_reference": "sbcl-agent:run_1", "summary": "bound"}
+
+            payload = CanonicalRunDispatch(
+                request_id="req_1",
+                run_id="run_1",
+                integration_id="int_1",
+                metadata={"tenant_id": "tenant_1", "projection_id": "pm_1", "agent_session_id": "as_1"},
+            )
+            with patch.object(adapter, "_resolve_integration", return_value=SimpleNamespace(id="int_1", endpoint="sbcl://local-image", settings={})):
+                result = adapter.dispatch_run(payload)
+
+        self.assertEqual(result.status, "dispatched")
+        self.assertEqual(result.external_reference, "sbcl-agent:run_1")
+        dispatched_payload = mock_service.dispatch.call_args.kwargs["payload"]
+        self.assertEqual(dispatched_payload["runtime_subtype"], "sbcl_agent")
+        self.assertEqual(dispatched_payload["session_kind"], "stateful_runtime")
+        self.assertEqual(dispatched_payload["binding"]["agent_session_id"], "as_1")
+        self.assertEqual(dispatched_payload["projection_contract"]["artifact_import_rule"], "sbcl_agent_governed_runtime")
+
+    def test_query_run_status_returns_governed_runtime_payload(self) -> None:
+        from app.domain.substrate.adapters.sbcl_agent_runtime_adapter import SbclAgentRuntimeAdapter
+
+        adapter = SbclAgentRuntimeAdapter()
+        with patch("app.domain.substrate.adapters.sbcl_agent_runtime_adapter.runtime_dispatch_service.export_sbcl_agent_snapshot") as export_snapshot:
+            export_snapshot.return_value = {
+                "binding": {"request_id": "req_1"},
+                "governed_runtime": {"runtime_subtype": "sbcl_agent", "session_kind": "stateful_runtime"},
+                "approvals": [{"id": "wi_1"}],
+                "artifacts": [{"id": "art_1"}],
+            }
+            result = adapter.query_run_status("sbcl-agent:run_1")
+
+        self.assertEqual(result.run_id, "sbcl-agent:run_1")
+        self.assertEqual(result.status, "waiting_on_human")
+        self.assertEqual(result.current_step, "governed_runtime")
+        self.assertEqual(result.raw_payload["governed_runtime"]["runtime_subtype"], "sbcl_agent")
+        self.assertIn("import_runtime_artifact", result.raw_payload["resolution_actions"])
+
+    def test_runtime_control_actions_and_artifacts_are_specialized(self) -> None:
+        from app.domain.substrate.adapters.sbcl_agent_runtime_adapter import SbclAgentRuntimeAdapter
+
+        adapter = SbclAgentRuntimeAdapter()
+        with patch("app.domain.substrate.adapters.sbcl_agent_runtime_adapter.runtime_dispatch_service.resume_sbcl_agent_session") as resume_session, \
+             patch("app.domain.substrate.adapters.sbcl_agent_runtime_adapter.runtime_dispatch_service.approve_sbcl_agent_checkpoint") as approve_checkpoint, \
+             patch("app.domain.substrate.adapters.sbcl_agent_runtime_adapter.runtime_dispatch_service.list_sbcl_agent_artifacts") as list_artifacts:
+            resume_session.return_value = {"status": "resumed"}
+            approve_checkpoint.return_value = {"status": "approved"}
+            list_artifacts.return_value = [{
+                "artifact_key": "runtime-summary",
+                "import_rule": "sbcl_agent_governed_runtime",
+                "lineage": {"relation": "imported_from_sbcl_agent_session"},
+            }]
+
+            resumed = adapter.resume_session("session_ref", approval_token="wi_1")
+            approved = adapter.approve_operation("session_ref", "wi_1")
+            artifacts = adapter.list_artifacts("session_ref")
+
+        self.assertEqual(resumed["action"], "resume_runtime")
+        self.assertEqual(approved["action"], "approve_runtime_checkpoint")
+        self.assertEqual(artifacts[0]["import_rule"], "sbcl_agent_governed_runtime")
+        self.assertEqual(artifacts[0]["lineage"]["relation"], "imported_from_sbcl_agent_session")
+
+
+class SbclAgentDeploymentAdapterTest(unittest.TestCase):
+    def test_query_deployment_status_uses_canonical_fields(self) -> None:
+        from app.domain.substrate.adapters.sbcl_agent_runtime_adapter import SbclAgentDeploymentAdapter
+
+        adapter = SbclAgentDeploymentAdapter()
+        with patch("app.domain.substrate.adapters.sbcl_agent_runtime_adapter.deployment_service") as mock_service:
+            mock_service.execute.return_value = {"external_reference": "dep_1", "summary": "queued"}
+
+            payload = CanonicalDeploymentRequest(
+                promotion_id="promo_1",
+                request_id="req_1",
+                target="production",
+                strategy="rolling",
+                integration_id="int_1",
+            )
+            result = adapter.execute_deployment(payload)
+        status = adapter.query_deployment_status("dep_1")
+
+        self.assertEqual(result.external_reference, "dep_1")
+        self.assertEqual(status.deployment_id, "dep_1")
+        self.assertEqual(status.raw_payload["deployment_subtype"], "sbcl_agent")
+
+
+class RuntimeDispatchServiceSbclAgentTest(unittest.TestCase):
+    def test_dispatch_supports_local_sbcl_endpoint(self) -> None:
+        from app.services.runtime_dispatch_service import RuntimeDispatchService
+
+        service = RuntimeDispatchService()
+        integration = SimpleNamespace(id="int_1", endpoint="sbcl://local-image", settings={"working_directory": "/tmp/sbcl-agent"})
+        with patch.object(service, "_run_sbcl_agent_command") as run_command:
+            run_command.return_value = {
+                "status": "bound",
+                "binding": {"request_id": "req_1"},
+                "governed_runtime": {"runtime_subtype": "sbcl_agent"},
+            }
+            result = service.dispatch(
+                integration,
+                {
+                    "request_id": "req_1",
+                    "run_id": "run_1",
+                    "binding": {"agent_session_id": "ags_1", "request_id": "req_1"},
+                },
+            )
+
+        self.assertEqual(result["status"], "bound")
+        self.assertIn("external_reference", result)
+        command = run_command.call_args.args[0]
+        self.assertEqual(command[0], "bind")
+        self.assertIn("--environment", command)
+        self.assertIn("--agent-session-id", command)
+
+
 if __name__ == "__main__":
     unittest.main()

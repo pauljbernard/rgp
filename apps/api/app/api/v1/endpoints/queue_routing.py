@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.core.auth import get_principal
 from app.models.queue_assignment import AssignmentGroupRecord, CreateAssignmentGroupRequest, CreateEscalationRuleRequest, CreateSlaDefinitionRequest, EscalationExecutionRecord, EscalationRuleRecord, RemediateSlaBreachRequest, RoutingRecommendationRecord, SlaBreachAuditRecord, SlaDefinitionRecord
@@ -69,7 +69,10 @@ def list_sla_breaches(
     request_id: str | None = None,
     principal: Annotated[Principal, Depends(get_principal)] = None,
 ):
-    return sla_enforcement_service.list_breaches(principal.tenant_id, request_id=request_id)
+    try:
+        return sla_enforcement_service.list_breaches(principal.tenant_id, request_id=request_id)
+    except StopIteration:
+        raise HTTPException(status_code=404, detail="Request not found") from None
 
 
 @router.post("/sla-breaches/{breach_id}/remediate", response_model=SlaBreachAuditRecord)
@@ -91,9 +94,12 @@ def get_routing_recommendation(
     request_id: str,
     principal: Annotated[Principal, Depends(get_principal)] = None,
 ):
-    recommendation = queue_routing_service.recommend_assignment(request_id, principal.tenant_id)
-    sla = sla_enforcement_service.evaluate_sla_compliance(request_id, principal.tenant_id)
-    escalations = queue_routing_service.evaluate_escalations(request_id, principal.tenant_id)
+    try:
+        recommendation = queue_routing_service.recommend_assignment(request_id, principal.tenant_id)
+        sla = sla_enforcement_service.evaluate_sla_compliance(request_id, principal.tenant_id)
+        escalations = queue_routing_service.evaluate_escalations(request_id, principal.tenant_id)
+    except StopIteration:
+        raise HTTPException(status_code=404, detail="Request not found") from None
     recommendation["sla_status"] = sla.get("status", "unknown")
     recommendation["escalation_targets"] = [item["escalation_target"] for item in escalations]
     return recommendation
@@ -104,7 +110,10 @@ def list_request_escalations(
     request_id: str,
     principal: Annotated[Principal, Depends(get_principal)] = None,
 ):
-    return queue_routing_service.evaluate_escalations(request_id, principal.tenant_id)
+    try:
+        return queue_routing_service.evaluate_escalations(request_id, principal.tenant_id)
+    except StopIteration:
+        raise HTTPException(status_code=404, detail="Request not found") from None
 
 
 @router.post("/requests/{request_id}/escalations/{rule_id}/execute", response_model=EscalationExecutionRecord)

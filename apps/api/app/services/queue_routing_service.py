@@ -5,10 +5,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from app.db.models import AssignmentGroupTable, EscalationRuleTable, RequestTable
+from app.db.models import AssignmentGroupTable, EscalationRuleTable
 from app.db.session import SessionLocal
 from app.domain.policy_dsl import evaluate_condition
 from app.services.event_store_service import event_store_service
+from app.services.request_state_bridge import get_request_state, record_request_event, update_request_state
 
 
 def _group_record(row: AssignmentGroupTable) -> dict:
@@ -203,29 +204,22 @@ class QueueRoutingService:
         condition using the policy DSL. Returns the list of triggered rules.
         """
         with SessionLocal() as session:
-            request_row = (
-                session.query(RequestTable)
-                .filter(
-                    RequestTable.id == request_id,
-                    RequestTable.tenant_id == tenant_id,
-                )
-                .first()
-            )
-            if not request_row:
-                return []
+            request = get_request_state(request_id, tenant_id)
+            if not request:
+                raise StopIteration(request_id)
 
             # Build context for condition evaluation
             now = datetime.now(timezone.utc)
-            created_at = request_row.created_at
+            created_at = request.created_at
             age_hours = (now - created_at).total_seconds() / 3600.0 if created_at else 0
 
             context = {
-                "request_id": request_row.id,
-                "status": request_row.status,
-                "priority": request_row.priority,
-                "request_type": request_row.request_type,
-                "owner_team_id": request_row.owner_team_id,
-                "tags": request_row.tags or [],
+                "request_id": request.id,
+                "status": request.status,
+                "priority": request.priority,
+                "request_type": request.request_type,
+                "owner_team_id": request.owner_team_id,
+                "tags": request.tags or [],
                 "age_hours": age_hours,
             }
 
@@ -254,16 +248,13 @@ class QueueRoutingService:
         actor: str,
     ) -> dict:
         now = datetime.now(timezone.utc)
+        request = get_request_state(request_id, tenant_id)
+        from app.persistence.dynamodb_governance_adapter import DynamoDbGovernancePersistenceAdapter
+
+        dynamodb_adapter = DynamoDbGovernancePersistenceAdapter()
+        is_dynamo_canonical = dynamodb_adapter._get_request_item(tenant_id, request_id) is not None
 
         with SessionLocal() as session:
-            request_row = (
-                session.query(RequestTable)
-                .filter(
-                    RequestTable.id == request_id,
-                    RequestTable.tenant_id == tenant_id,
-                )
-                .first()
-            )
             rule_row = (
                 session.query(EscalationRuleTable)
                 .filter(
@@ -273,17 +264,16 @@ class QueueRoutingService:
                 )
                 .first()
             )
-            if not request_row or not rule_row:
+            if request is None or not rule_row:
                 raise ValueError("Unknown request or escalation rule")
 
             outcome = f"escalated:{rule_row.escalation_type}"
+            updated_request_fields: dict = {}
             if rule_row.escalation_type == "reassign":
-                request_row.owner_team_id = rule_row.escalation_target
-                request_row.updated_at = now
-                request_row.updated_by = actor
+                updated_request_fields["owner_team_id"] = rule_row.escalation_target
                 outcome = f"reassigned:{rule_row.escalation_target}"
             else:
-                policy_context = dict(request_row.policy_context or {})
+                policy_context = dict(request.policy_context or {})
                 policy_context["last_escalation"] = {
                     "rule_id": rule_row.id,
                     "type": rule_row.escalation_type,
@@ -291,12 +281,8 @@ class QueueRoutingService:
                     "executed_at": now.isoformat(),
                     "executed_by": actor,
                 }
-                request_row.policy_context = policy_context
-                request_row.updated_at = now
-                request_row.updated_by = actor
+                updated_request_fields["policy_context"] = policy_context
                 outcome = f"{rule_row.escalation_type}:{rule_row.escalation_target}"
-
-            session.flush()
 
             event_store_service.append(
                 session,
@@ -315,6 +301,24 @@ class QueueRoutingService:
                 },
             )
             session.commit()
+
+            update_request_state(
+                request_id,
+                tenant_id,
+                actor,
+                **updated_request_fields,
+                updated_at=now,
+                updated_by=actor,
+            )
+            if is_dynamo_canonical:
+                record_request_event(
+                    request_id,
+                    tenant_id,
+                    actor,
+                    "Escalation Executed",
+                    f"Escalation rule '{rule_row.name}' executed",
+                    status=RequestStatus(request.status).value if isinstance(request.status, str) else request.status.value,
+                )
 
             return {
                 "request_id": request_id,
@@ -361,30 +365,15 @@ class QueueRoutingService:
         tenant_id: str,
     ) -> dict:
         with SessionLocal() as session:
-            request_row = (
-                session.query(RequestTable)
-                .filter(
-                    RequestTable.id == request_id,
-                    RequestTable.tenant_id == tenant_id,
-                )
-                .first()
-            )
-            if not request_row:
-                return {
-                    "request_id": request_id,
-                    "recommended_group_id": None,
-                    "recommended_group_name": None,
-                    "matched_skills": [],
-                    "route_basis": [],
-                    "current_load": None,
-                    "max_capacity": None,
-                }
+            request = get_request_state(request_id, tenant_id)
+            if not request:
+                raise StopIteration(request_id)
 
             required_skills = sorted(
                 {
-                    *(request_row.tags or []),
-                    request_row.request_type,
-                    str(request_row.priority),
+                    *(request.tags or []),
+                    request.request_type,
+                    str(request.priority),
                 }
             )
             recommended = self.route_by_skill(required_skills, tenant_id) or self.route_by_capacity(tenant_id)

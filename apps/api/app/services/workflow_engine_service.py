@@ -18,6 +18,7 @@ from app.models.workflow import (
     WorkflowStepStatus,
 )
 from app.services.event_store_service import event_store_service
+from app.services.request_state_bridge import get_request_state
 
 
 class WorkflowEngineService:
@@ -38,6 +39,9 @@ class WorkflowEngineService:
         """Create a new workflow execution and advance to the first step."""
         now = datetime.now(timezone.utc)
         execution_id = f"wfe_{uuid4().hex[:12]}"
+        request = get_request_state(request_id, tenant_id)
+        if request is None:
+            raise StopIteration(request_id)
 
         with SessionLocal() as session:
             steps_json: list[dict] = []
@@ -48,7 +52,7 @@ class WorkflowEngineService:
 
             execution = WorkflowExecutionTable(
                 id=execution_id,
-                tenant_id=tenant_id,
+                tenant_id=request.tenant_id,
                 run_id=run_id,
                 request_id=request_id,
                 workflow_definition_id=workflow_definition_id,
@@ -72,9 +76,9 @@ class WorkflowEngineService:
                 )
                 session.add(step)
 
-            session.commit()
             event_store_service.append(
-                tenant_id=tenant_id,
+                session,
+                tenant_id=request.tenant_id,
                 event_type="workflow.started",
                 aggregate_type="workflow_execution",
                 aggregate_id=execution_id,
@@ -83,13 +87,14 @@ class WorkflowEngineService:
                 request_id=request_id,
                 run_id=run_id,
             )
+            session.commit()
             return self._record_from_row(execution)
 
-    def advance_step(self, execution_id: str, actor_id: str = "system") -> WorkflowExecutionRecord:
+    def advance_step(self, execution_id: str, actor_id: str = "system", tenant_id: str | None = None) -> WorkflowExecutionRecord:
         """Complete the current step and advance to the next, or complete the workflow."""
         now = datetime.now(timezone.utc)
         with SessionLocal() as session:
-            execution = session.get(WorkflowExecutionTable, execution_id)
+            execution = self._get_execution_row(session, execution_id, tenant_id)
             if not execution:
                 raise ValueError(f"Workflow execution {execution_id} not found")
             if execution.status != WorkflowExecutionStatus.RUNNING:
@@ -128,8 +133,8 @@ class WorkflowEngineService:
                 detail = f"Advanced to step {next_index}"
 
             execution.updated_at = now
-            session.commit()
             event_store_service.append(
+                session,
                 tenant_id=execution.tenant_id,
                 event_type=event_type,
                 aggregate_type="workflow_execution",
@@ -139,16 +144,17 @@ class WorkflowEngineService:
                 request_id=execution.request_id,
                 run_id=execution.run_id,
             )
+            session.commit()
             return self._record_from_row(execution)
 
     # ------------------------------------------------------------------
     # Commands
     # ------------------------------------------------------------------
 
-    def pause_workflow(self, execution_id: str, reason: str = "", actor_id: str = "system") -> WorkflowExecutionRecord:
+    def pause_workflow(self, execution_id: str, reason: str = "", actor_id: str = "system", tenant_id: str | None = None) -> WorkflowExecutionRecord:
         now = datetime.now(timezone.utc)
         with SessionLocal() as session:
-            execution = session.get(WorkflowExecutionTable, execution_id)
+            execution = self._get_execution_row(session, execution_id, tenant_id)
             if not execution:
                 raise ValueError(f"Workflow execution {execution_id} not found")
             if execution.status != WorkflowExecutionStatus.RUNNING:
@@ -157,8 +163,8 @@ class WorkflowEngineService:
             execution.pause_reason = reason
             execution.paused_at = now
             execution.updated_at = now
-            session.commit()
             event_store_service.append(
+                session,
                 tenant_id=execution.tenant_id,
                 event_type="workflow.paused",
                 aggregate_type="workflow_execution",
@@ -168,12 +174,13 @@ class WorkflowEngineService:
                 request_id=execution.request_id,
                 run_id=execution.run_id,
             )
+            session.commit()
             return self._record_from_row(execution)
 
-    def resume_workflow(self, execution_id: str, actor_id: str = "system") -> WorkflowExecutionRecord:
+    def resume_workflow(self, execution_id: str, actor_id: str = "system", tenant_id: str | None = None) -> WorkflowExecutionRecord:
         now = datetime.now(timezone.utc)
         with SessionLocal() as session:
-            execution = session.get(WorkflowExecutionTable, execution_id)
+            execution = self._get_execution_row(session, execution_id, tenant_id)
             if not execution:
                 raise ValueError(f"Workflow execution {execution_id} not found")
             if execution.status != WorkflowExecutionStatus.PAUSED:
@@ -181,8 +188,8 @@ class WorkflowEngineService:
             execution.status = WorkflowExecutionStatus.RUNNING
             execution.resumed_at = now
             execution.updated_at = now
-            session.commit()
             event_store_service.append(
+                session,
                 tenant_id=execution.tenant_id,
                 event_type="workflow.resumed",
                 aggregate_type="workflow_execution",
@@ -192,12 +199,13 @@ class WorkflowEngineService:
                 request_id=execution.request_id,
                 run_id=execution.run_id,
             )
+            session.commit()
             return self._record_from_row(execution)
 
-    def cancel_workflow(self, execution_id: str, reason: str = "", actor_id: str = "system") -> WorkflowExecutionRecord:
+    def cancel_workflow(self, execution_id: str, reason: str = "", actor_id: str = "system", tenant_id: str | None = None) -> WorkflowExecutionRecord:
         now = datetime.now(timezone.utc)
         with SessionLocal() as session:
-            execution = session.get(WorkflowExecutionTable, execution_id)
+            execution = self._get_execution_row(session, execution_id, tenant_id)
             if not execution:
                 raise ValueError(f"Workflow execution {execution_id} not found")
             if execution.status in {WorkflowExecutionStatus.COMPLETED, WorkflowExecutionStatus.CANCELED}:
@@ -206,8 +214,8 @@ class WorkflowEngineService:
             execution.cancel_reason = reason
             execution.completed_at = now
             execution.updated_at = now
-            session.commit()
             event_store_service.append(
+                session,
                 tenant_id=execution.tenant_id,
                 event_type="workflow.canceled",
                 aggregate_type="workflow_execution",
@@ -217,12 +225,13 @@ class WorkflowEngineService:
                 request_id=execution.request_id,
                 run_id=execution.run_id,
             )
+            session.commit()
             return self._record_from_row(execution)
 
-    def retry_step(self, execution_id: str, step_index: int, actor_id: str = "system") -> WorkflowExecutionRecord:
+    def retry_step(self, execution_id: str, step_index: int, actor_id: str = "system", tenant_id: str | None = None) -> WorkflowExecutionRecord:
         now = datetime.now(timezone.utc)
         with SessionLocal() as session:
-            execution = session.get(WorkflowExecutionTable, execution_id)
+            execution = self._get_execution_row(session, execution_id, tenant_id)
             if not execution:
                 raise ValueError(f"Workflow execution {execution_id} not found")
 
@@ -249,8 +258,8 @@ class WorkflowEngineService:
             execution.retry_count += 1
             execution.failure_reason = None
             execution.updated_at = now
-            session.commit()
             event_store_service.append(
+                session,
                 tenant_id=execution.tenant_id,
                 event_type="workflow.step_retried",
                 aggregate_type="workflow_execution",
@@ -260,12 +269,13 @@ class WorkflowEngineService:
                 request_id=execution.request_id,
                 run_id=execution.run_id,
             )
+            session.commit()
             return self._record_from_row(execution)
 
-    def skip_step(self, execution_id: str, step_index: int, actor_id: str = "system") -> WorkflowExecutionRecord:
+    def skip_step(self, execution_id: str, step_index: int, actor_id: str = "system", tenant_id: str | None = None) -> WorkflowExecutionRecord:
         now = datetime.now(timezone.utc)
         with SessionLocal() as session:
-            execution = session.get(WorkflowExecutionTable, execution_id)
+            execution = self._get_execution_row(session, execution_id, tenant_id)
             if not execution:
                 raise ValueError(f"Workflow execution {execution_id} not found")
 
@@ -281,8 +291,8 @@ class WorkflowEngineService:
             step.status = WorkflowStepStatus.SKIPPED
             step.completed_at = now
             execution.updated_at = now
-            session.commit()
             event_store_service.append(
+                session,
                 tenant_id=execution.tenant_id,
                 event_type="workflow.step_skipped",
                 aggregate_type="workflow_execution",
@@ -292,15 +302,16 @@ class WorkflowEngineService:
                 request_id=execution.request_id,
                 run_id=execution.run_id,
             )
+            session.commit()
             return self._record_from_row(execution)
 
     # ------------------------------------------------------------------
     # Query
     # ------------------------------------------------------------------
 
-    def get_execution(self, execution_id: str) -> WorkflowExecutionDetail:
+    def get_execution(self, execution_id: str, tenant_id: str | None = None) -> WorkflowExecutionDetail:
         with SessionLocal() as session:
-            execution = session.get(WorkflowExecutionTable, execution_id)
+            execution = self._get_execution_row(session, execution_id, tenant_id)
             if not execution:
                 raise ValueError(f"Workflow execution {execution_id} not found")
             steps = session.scalars(
@@ -312,6 +323,16 @@ class WorkflowEngineService:
                 **self._record_from_row(execution).model_dump(),
                 steps=[self._step_record_from_row(s) for s in steps],
             )
+
+    @staticmethod
+    def _get_execution_row(session, execution_id: str, tenant_id: str | None = None) -> WorkflowExecutionTable | None:
+        execution = session.get(WorkflowExecutionTable, execution_id)
+        if execution is None or tenant_id is None:
+            return execution
+        request = get_request_state(execution.request_id, tenant_id)
+        if request is None or execution.tenant_id != request.tenant_id:
+            raise StopIteration(execution_id)
+        return execution
 
     # ------------------------------------------------------------------
     # Row mappers

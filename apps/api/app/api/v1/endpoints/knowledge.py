@@ -69,4 +69,7 @@ def get_request_knowledge_context(
     max_items: int = Query(default=5, ge=1, le=20),
     principal: Annotated[Principal, Depends(get_principal)] = None,
 ) -> list[KnowledgeArtifactRecord]:
-    return knowledge_service.retrieve_for_context(request_id, principal.tenant_id, max_items=max_items)
+    try:
+        return knowledge_service.retrieve_for_context(request_id, principal.tenant_id, max_items=max_items)
+    except StopIteration:
+        raise HTTPException(status_code=404, detail="Request not found") from None

@@ -1,4 +1,12 @@
 services:
+  dynamodb-local:
+    image: amazon/dynamodb-local:latest
+    command: "-jar DynamoDBLocal.jar -sharedDb -dbPath /home/dynamodblocal/data"
+    ports:
+      - "8000:8000"
+    volumes:
+      - dynamodb_data:/home/dynamodblocal/data
+
   postgres:
     image: postgres:16
     environment:
@@ -16,4 +24,5 @@ services:
       - "6379:6379"
 
 volumes:
+  dynamodb_data:
   postgres_data:

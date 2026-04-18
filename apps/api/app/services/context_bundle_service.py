@@ -14,7 +14,6 @@ from app.db.models import (
     ContextAccessLogTable,
     ContextBundleTable,
     RequestRelationshipTable,
-    RequestTable,
     ReviewQueueTable,
     RunTable,
     TemplateTable,
@@ -25,6 +24,7 @@ from app.models.context import (
     ContextBundleRecord,
 )
 from app.services.knowledge_service import knowledge_service
+from app.services.request_state_bridge import get_request_state
 
 
 class ContextBundleService:
@@ -32,20 +32,15 @@ class ContextBundleService:
 
     def _build_bundle_payload(self, request_id: str, tenant_id: str) -> tuple[dict, list[dict], str]:
         with SessionLocal() as session:
-            request_row = (
-                session.query(RequestTable)
-                .filter(
-                    RequestTable.id == request_id,
-                    RequestTable.tenant_id == tenant_id,
-                )
-                .one()
-            )
+            request = get_request_state(request_id, tenant_id)
+            if request is None:
+                raise StopIteration(request_id)
 
             template_data: dict = {}
             tpl = (
                 session.query(TemplateTable)
                 .filter(
-                    TemplateTable.id == request_row.template_id,
+                    TemplateTable.id == request.template_id,
                     TemplateTable.tenant_id == tenant_id,
                 )
                 .first()
@@ -59,8 +54,8 @@ class ContextBundleService:
                 }
 
             workflow_state: dict = {}
-            if request_row.current_run_id:
-                run = session.query(RunTable).filter(RunTable.id == request_row.current_run_id).first()
+            if request.current_run_id:
+                run = session.query(RunTable).filter(RunTable.id == request.current_run_id).first()
                 if run:
                     workflow_state = {
                         "run_id": run.id,
@@ -125,14 +120,14 @@ class ContextBundleService:
 
             contents = {
                 "request_data": {
-                    "id": request_row.id,
-                    "request_type": request_row.request_type,
-                    "title": request_row.title,
-                    "status": request_row.status,
-                    "priority": request_row.priority,
-                    "tags": request_row.tags or [],
-                    "input_payload": request_row.input_payload or {},
-                    "policy_context": request_row.policy_context or {},
+                    "id": request.id,
+                    "request_type": request.request_type,
+                    "title": request.title,
+                    "status": request.status,
+                    "priority": request.priority,
+                    "tags": request.tags or [],
+                    "input_payload": request.input_payload or {},
+                    "policy_context": request.policy_context or {},
                 },
                 "template_semantics": template_data,
                 "workflow_state": workflow_state,
@@ -143,13 +138,13 @@ class ContextBundleService:
             }
             provenance = [
                 {"source": "request", "id": request_id},
-                {"source": "template", "id": request_row.template_id},
+                {"source": "template", "id": request.template_id},
                 *[
                     {"source": "knowledge_artifact", "id": artifact.id}
                     for artifact in knowledge_artifacts
                 ],
             ]
-            return contents, provenance, request_row.template_id
+            return contents, provenance, request.template_id
 
     # ------------------------------------------------------------------
     # Assembly
@@ -221,15 +216,11 @@ class ContextBundleService:
     # ------------------------------------------------------------------
 
     def scope_bundle(
-        self, bundle_id: str, policy_scope: dict
+        self, bundle_id: str, policy_scope: dict, tenant_id: str | None = None
     ) -> ContextBundleRecord:
         """Apply a policy scope to an existing bundle, restricting its contents."""
         with SessionLocal() as session:
-            row = (
-                session.query(ContextBundleTable)
-                .filter(ContextBundleTable.id == bundle_id)
-                .one()
-            )
+            row = self._get_bundle_row(session, bundle_id, tenant_id)
             row.policy_scope = policy_scope
             row.version = row.version + 1
 
@@ -256,21 +247,23 @@ class ContextBundleService:
         resource: str,
         result: str,
         policy_basis: dict | None = None,
+        tenant_id: str | None = None,
     ) -> ContextAccessLogRecord:
         """Record an access attempt against a context bundle."""
         now = datetime.now(timezone.utc)
         log_id = f"cal_{uuid.uuid4().hex[:12]}"
-        row = ContextAccessLogTable(
-            id=log_id,
-            bundle_id=bundle_id,
-            accessor_type=accessor_type,
-            accessor_id=accessor_id,
-            accessed_resource=resource,
-            access_result=result,
-            policy_basis=policy_basis,
-            accessed_at=now,
-        )
         with SessionLocal() as session:
+            self._get_bundle_row(session, bundle_id, tenant_id)
+            row = ContextAccessLogTable(
+                id=log_id,
+                bundle_id=bundle_id,
+                accessor_type=accessor_type,
+                accessor_id=accessor_id,
+                accessed_resource=resource,
+                access_result=result,
+                policy_basis=policy_basis,
+                accessed_at=now,
+            )
             session.add(row)
             session.commit()
             session.refresh(row)
@@ -280,15 +273,25 @@ class ContextBundleService:
     # Retrieval
     # ------------------------------------------------------------------
 
-    def get_bundle(self, bundle_id: str) -> ContextBundleRecord:
+    def get_bundle(self, bundle_id: str, tenant_id: str | None = None) -> ContextBundleRecord:
         """Retrieve a context bundle by id."""
         with SessionLocal() as session:
-            row = (
-                session.query(ContextBundleTable)
-                .filter(ContextBundleTable.id == bundle_id)
-                .one()
-            )
+            row = self._get_bundle_row(session, bundle_id, tenant_id)
             return ContextBundleRecord.model_validate(row)
+
+    @staticmethod
+    def _get_bundle_row(session, bundle_id: str, tenant_id: str | None = None) -> ContextBundleTable:
+        row = (
+            session.query(ContextBundleTable)
+            .filter(ContextBundleTable.id == bundle_id)
+            .one()
+        )
+        if tenant_id is None:
+            return row
+        request = get_request_state(row.request_id, tenant_id)
+        if request is None or row.tenant_id != request.tenant_id:
+            raise StopIteration(bundle_id)
+        return row
 
 
 context_bundle_service = ContextBundleService()

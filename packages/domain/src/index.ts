@@ -1002,6 +1002,19 @@ export type AgentSessionMessageRecord = {
   created_at: string;
 };
 
+export type GovernedRuntimeSummary = {
+  runtime_family: string;
+  runtime_subtype?: string | null;
+  session_kind: string;
+  adapter_type?: string | null;
+  environment_ref?: string | null;
+  thread_ref?: string | null;
+  turn_ref?: string | null;
+  pending_approval_count: number;
+  pending_artifact_count: number;
+  external_bindings: Array<Record<string, unknown>>;
+};
+
 export type AgentSessionRecord = {
   id: string;
   request_id: string;
@@ -1011,6 +1024,8 @@ export type AgentSessionRecord = {
   collaboration_mode: string;
   agent_operating_profile: string;
   provider?: string | null;
+  runtime_subtype?: string | null;
+  session_kind: string;
   status: string;
   awaiting_human: boolean;
   summary: string;
@@ -1018,6 +1033,7 @@ export type AgentSessionRecord = {
   assigned_by: string;
   assigned_at: string;
   updated_at: string;
+  governed_runtime?: GovernedRuntimeSummary | null;
   latest_message?: AgentSessionMessageRecord | null;
   message_count: number;
 };
@@ -1063,11 +1079,33 @@ export type AgentSessionToolRecord = {
 
 export type AgentSessionContextDetail = {
   bundle: ContextBundleRecord;
+  governed_runtime?: GovernedRuntimeSummary | null;
   available_tools: AgentSessionToolRecord[];
   restricted_tools: AgentSessionToolRecord[];
   degraded_tools: AgentSessionToolRecord[];
   capability_warnings: string[];
   access_log: ContextAccessLogRecord[];
+};
+
+export type ImportAgentSessionArtifactInput = {
+  actor_id?: string;
+  artifact_key: string;
+  title: string;
+  artifact_type?: string;
+  summary?: string;
+  content?: string | null;
+  path?: string | null;
+  source_ref?: string | null;
+  image_ref?: string | null;
+  promotion_relevant?: boolean;
+  reason?: string;
+};
+
+export type CompleteAgentSessionInput = {
+  actor_id?: string;
+  reason?: string;
+  target_status?: string | null;
+  completion_action?: string;
 };
 
 export type CreateIntegrationInput = {

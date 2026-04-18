@@ -145,7 +145,7 @@ type TransitionRequestInput = RequestMutationInput & {
   target_status: RequestStatus;
 };
 
-const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8001";
+const apiBaseUrl = process.env.RGP_API_INTERNAL_BASE_URL ?? process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8001";
 const apiToken = process.env.RGP_API_TOKEN ?? process.env.NEXT_PUBLIC_RGP_API_TOKEN;
 const sessionCookieName = "rgp_access_token";
 

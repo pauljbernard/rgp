@@ -341,6 +341,57 @@ class AgentProjectionAdapter(BaseProjectionAdapter):
         return next_state
 
 
+class SbclAgentProjectionAdapter(AgentProjectionAdapter):
+    adapter_type = "sbcl_agent_projection"
+    capabilities = AgentProjectionAdapter.capabilities + [
+        "project_environment",
+        "project_thread",
+        "project_turn",
+        "project_operation",
+        "project_artifact",
+        "resume_runtime",
+        "approve_runtime_checkpoint",
+        "import_runtime_artifact",
+    ]
+
+    def _shadow(self, entity_type: str, entity_id: str, entity_data: dict) -> dict:
+        shadow = super()._shadow(entity_type, entity_id, entity_data)
+        governed_runtime = dict(entity_data.get("governed_runtime") or {})
+        shadow["projection_form"] = "sbcl_agent_runtime"
+        shadow["binding"] = dict(entity_data.get("binding") or {})
+        shadow["governed_runtime"] = governed_runtime
+        shadow["approvals"] = list(entity_data.get("approvals") or [])
+        shadow["artifacts"] = list(entity_data.get("artifacts") or [])
+        shadow["agent_state"] = {
+            **dict(shadow.get("agent_state") or {}),
+            "session_status": entity_data.get("session_status", "active"),
+            "runtime_subtype": governed_runtime.get("runtime_subtype", "sbcl_agent"),
+            "session_kind": governed_runtime.get("session_kind", "stateful_runtime"),
+            "environment_ref": entity_data.get("environment_ref") or governed_runtime.get("environment_ref"),
+            "thread_ref": entity_data.get("thread_ref") or governed_runtime.get("thread_ref"),
+            "turn_ref": entity_data.get("turn_ref") or governed_runtime.get("turn_ref"),
+            "operation_count": entity_data.get("operation_count", len(entity_data.get("operations") or [])),
+            "artifact_count": entity_data.get("artifact_count", len(entity_data.get("artifacts") or [])),
+            "pending_approval_count": governed_runtime.get("pending_approval_count", len(entity_data.get("approvals") or [])),
+        }
+        shadow["governed_entities"] = entity_data.get("governed_entities", [])
+        return shadow
+
+    def apply_resolution(self, action: str, current_state: dict, canonical_state: dict) -> dict:
+        next_state = super().apply_resolution(action, current_state, canonical_state)
+        agent_state = dict(next_state.get("agent_state") or {})
+        if action == "resume_runtime":
+            agent_state["session_status"] = "resume_requested"
+            next_state["resume_requested_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        elif action == "approve_runtime_checkpoint":
+            agent_state["checkpoint_state"] = "approved"
+            next_state["approval_recorded_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        elif action == "import_runtime_artifact":
+            next_state["artifact_import_status"] = "requested"
+        next_state["agent_state"] = agent_state
+        return next_state
+
+
 class OpenAiProjectionAdapter(AgentProjectionAdapter):
     adapter_type = "openai_projection"
 
@@ -376,6 +427,9 @@ class ProjectionAdapterService:
         if integration_type == "identity":
             return IdentityProjectionAdapter()
         if integration_type == "agent_runtime":
+            runtime_subtype = ((integration.settings or {}).get("runtime_subtype") or "").strip().lower()
+            if runtime_subtype == "sbcl_agent":
+                return SbclAgentProjectionAdapter()
             return AgentProjectionAdapter()
         return GenericProjectionAdapter()
 

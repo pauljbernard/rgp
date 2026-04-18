@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from sqlalchemy import func
 
-from app.db.models import PlanningConstructTable, PlanningMembershipTable, RequestTable
+from app.db.models import PlanningConstructTable, PlanningMembershipTable
 from app.db.session import SessionLocal
 from app.models.planning import (
     CreatePlanningConstructRequest,
@@ -18,10 +18,28 @@ from app.models.planning import (
     PlanningRoadmapEntry,
 )
 from app.services.event_store_service import event_store_service
+from app.services.request_state_bridge import get_request_state
 
 
 class PlanningService:
     """Manages planning constructs (initiatives, programs, releases, etc.)."""
+
+    _COMPLETED_STATUSES = {"completed", "closed", "promoted"}
+    _IN_PROGRESS_STATUSES = {
+        "submitted",
+        "validated",
+        "classified",
+        "ownership_resolved",
+        "planned",
+        "queued",
+        "in_execution",
+        "awaiting_input",
+        "awaiting_review",
+        "under_review",
+        "approved",
+        "promotion_pending",
+    }
+    _BLOCKED_STATUSES = {"validation_failed", "changes_requested", "rejected", "failed"}
 
     # ------------------------------------------------------------------
     # CRUD
@@ -78,13 +96,22 @@ class PlanningService:
 
     def list_memberships(self, construct_id: str) -> list[PlanningMembershipRecord]:
         with SessionLocal() as session:
+            construct = (
+                session.query(PlanningConstructTable)
+                .filter(PlanningConstructTable.id == construct_id)
+                .one()
+            )
             rows = (
                 session.query(PlanningMembershipTable)
                 .filter(PlanningMembershipTable.planning_construct_id == construct_id)
                 .order_by(PlanningMembershipTable.sequence.asc(), PlanningMembershipTable.priority.desc())
                 .all()
             )
-            return [PlanningMembershipRecord.model_validate(r) for r in rows]
+            return [
+                PlanningMembershipRecord.model_validate(row)
+                for row in rows
+                if get_request_state(row.request_id, construct.tenant_id) is not None
+            ]
 
     def list_constructs(
         self, tenant_id: str, type: str | None = None
@@ -113,6 +140,13 @@ class PlanningService:
         membership_id = f"pm_{uuid4().hex[:12]}"
 
         with SessionLocal() as session:
+            construct = (
+                session.query(PlanningConstructTable)
+                .filter(PlanningConstructTable.id == construct_id)
+                .one()
+            )
+            if get_request_state(request_id, construct.tenant_id) is None:
+                raise StopIteration(request_id)
             row = PlanningMembershipTable(
                 id=membership_id,
                 planning_construct_id=construct_id,
@@ -123,12 +157,6 @@ class PlanningService:
             )
             session.add(row)
             session.flush()
-
-            construct = (
-                session.query(PlanningConstructTable)
-                .filter(PlanningConstructTable.id == construct_id)
-                .one()
-            )
 
             event_store_service.append(
                 session,
@@ -148,6 +176,13 @@ class PlanningService:
         self, construct_id: str, request_id: str
     ) -> None:
         with SessionLocal() as session:
+            construct = (
+                session.query(PlanningConstructTable)
+                .filter(PlanningConstructTable.id == construct_id)
+                .one()
+            )
+            if get_request_state(request_id, construct.tenant_id) is None:
+                raise StopIteration(request_id)
             row = (
                 session.query(PlanningMembershipTable)
                 .filter(
@@ -157,12 +192,6 @@ class PlanningService:
                 .one()
             )
             session.delete(row)
-
-            construct = (
-                session.query(PlanningConstructTable)
-                .filter(PlanningConstructTable.id == construct_id)
-                .one()
-            )
 
             event_store_service.append(
                 session,
@@ -185,7 +214,14 @@ class PlanningService:
         ``sequence``, and optionally ``priority``.
         """
         with SessionLocal() as session:
+            construct = (
+                session.query(PlanningConstructTable)
+                .filter(PlanningConstructTable.id == construct_id)
+                .one()
+            )
             for entry in ordering:
+                if get_request_state(entry["request_id"], construct.tenant_id) is None:
+                    raise StopIteration(entry["request_id"])
                 row = (
                     session.query(PlanningMembershipTable)
                     .filter(
@@ -205,7 +241,11 @@ class PlanningService:
                 .order_by(PlanningMembershipTable.sequence.asc())
                 .all()
             )
-            return [PlanningMembershipRecord.model_validate(r) for r in rows]
+            return [
+                PlanningMembershipRecord.model_validate(row)
+                for row in rows
+                if get_request_state(row.request_id, construct.tenant_id) is not None
+            ]
 
     # ------------------------------------------------------------------
     # Aggregation
@@ -218,6 +258,11 @@ class PlanningService:
         completion percentage.
         """
         with SessionLocal() as session:
+            construct = (
+                session.query(PlanningConstructTable)
+                .filter(PlanningConstructTable.id == construct_id)
+                .one()
+            )
             memberships = (
                 session.query(PlanningMembershipTable)
                 .filter(PlanningMembershipTable.planning_construct_id == construct_id)
@@ -234,18 +279,16 @@ class PlanningService:
                 }
 
             status_counts: dict[str, int] = {}
-            rows = (
-                session.query(RequestTable.status, func.count(RequestTable.id))
-                .filter(RequestTable.id.in_(request_ids))
-                .group_by(RequestTable.status)
-                .all()
-            )
             total = 0
-            for status, count in rows:
-                status_counts[status] = count
-                total += count
+            for request_id in request_ids:
+                request = get_request_state(request_id, construct.tenant_id)
+                if request is None:
+                    continue
+                status = request.status.value if hasattr(request.status, "value") else str(request.status)
+                status_counts[status] = status_counts.get(status, 0) + 1
+                total += 1
 
-            completed = status_counts.get("completed", 0) + status_counts.get("closed", 0)
+            completed = sum(status_counts.get(status, 0) for status in self._COMPLETED_STATUSES)
             completion_pct = (completed / total * 100.0) if total > 0 else 0.0
 
             return {
@@ -300,9 +343,9 @@ class PlanningService:
                     .scalar()
                 )
                 progress = self.aggregate_progress(c.id)
-                completed_count = progress["status_counts"].get("completed", 0) + progress["status_counts"].get("closed", 0)
-                in_progress_count = progress["status_counts"].get("in_progress", 0) + progress["status_counts"].get("awaiting_review", 0)
-                blocked_count = progress["status_counts"].get("blocked", 0)
+                completed_count = sum(progress["status_counts"].get(status, 0) for status in self._COMPLETED_STATUSES)
+                in_progress_count = sum(progress["status_counts"].get(status, 0) for status in self._IN_PROGRESS_STATUSES)
+                blocked_count = sum(progress["status_counts"].get(status, 0) for status in self._BLOCKED_STATUSES)
                 completion_pct = progress["completion_pct"]
 
                 roadmap.append(

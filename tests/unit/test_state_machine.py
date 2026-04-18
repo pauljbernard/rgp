@@ -192,6 +192,12 @@ class SlaRiskTest(unittest.TestCase):
         level, reason = compute_sla_risk("failed", "medium", "nonexistent_policy", datetime.now(timezone.utc))
         self.assertEqual(level, "critical")
 
+    def test_naive_updated_at_is_treated_as_utc(self) -> None:
+        old = datetime.utcnow() - timedelta(hours=9)
+        level, reason = compute_sla_risk("queued", "medium", None, old)
+        self.assertEqual(level, "medium")
+        self.assertEqual(reason, "Execution delay")
+
     def test_sla_policy_rules_structure(self) -> None:
         self.assertIn("sla_standard_v1", SLA_POLICY_RULES)
         policy = SLA_POLICY_RULES["sla_standard_v1"]

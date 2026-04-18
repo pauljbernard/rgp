@@ -5,9 +5,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from app.db.models import EventStoreTable, EventReplayCheckpointTable
+from app.db.models import ArtifactTable, EventStoreTable, EventReplayCheckpointTable, PromotionTable, RunTable
 from app.db.session import SessionLocal
 from app.services.event_store_service import event_store_service
+from app.services.request_state_bridge import get_request_state
 
 
 def _checkpoint_record(row: EventReplayCheckpointTable) -> dict:
@@ -63,6 +64,7 @@ class EventReplayService:
         in chronological order.
         """
         with SessionLocal() as session:
+            self._assert_scope_access(session, scope, scope_id, tenant_id)
             q = session.query(EventStoreTable).filter(
                 EventStoreTable.tenant_id == tenant_id,
             )
@@ -104,6 +106,7 @@ class EventReplayService:
         self, scope: str, scope_id: str, tenant_id: str
     ) -> dict | None:
         with SessionLocal() as session:
+            self._assert_scope_access(session, scope, scope_id, tenant_id)
             row = (
                 session.query(EventReplayCheckpointTable)
                 .filter(
@@ -119,6 +122,7 @@ class EventReplayService:
         self, scope: str, scope_id: str, last_event_id: int, tenant_id: str
     ) -> dict:
         with SessionLocal() as session:
+            self._assert_scope_access(session, scope, scope_id, tenant_id)
             row = self._upsert_checkpoint(session, scope, scope_id, last_event_id, tenant_id)
             session.commit()
             session.refresh(row)
@@ -198,6 +202,28 @@ class EventReplayService:
             session.add(row)
         session.flush()
         return row
+
+    @staticmethod
+    def _assert_scope_access(session, scope: str, scope_id: str, tenant_id: str) -> None:
+        if scope == "request":
+            if get_request_state(scope_id, tenant_id) is None:
+                raise StopIteration(scope_id)
+            return
+        if scope == "run":
+            run_row = session.query(RunTable).filter(RunTable.id == scope_id).first()
+            if run_row is None or get_request_state(run_row.request_id, tenant_id) is None:
+                raise StopIteration(scope_id)
+            return
+        if scope == "artifact":
+            artifact_row = session.query(ArtifactTable).filter(ArtifactTable.id == scope_id).first()
+            if artifact_row is None or get_request_state(artifact_row.request_id, tenant_id) is None:
+                raise StopIteration(scope_id)
+            return
+        if scope == "promotion":
+            promotion_row = session.query(PromotionTable).filter(PromotionTable.id == scope_id).first()
+            if promotion_row is None or get_request_state(promotion_row.request_id, tenant_id) is None:
+                raise StopIteration(scope_id)
+            return
 
 
 event_replay_service = EventReplayService()

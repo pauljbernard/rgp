@@ -22,7 +22,10 @@ def list_review_queue(
     request_id: str | None = Query(default=None),
     principal: Annotated[Principal, Depends(get_principal)] = None,
 ) -> PaginatedResponse[ReviewQueueItem]:
-    return governance_service.list_review_queue(page, page_size, assigned_reviewer, blocking_only, stale_only, request_id, principal.tenant_id)
+    try:
+        return governance_service.list_review_queue(page, page_size, assigned_reviewer, blocking_only, stale_only, request_id, principal.tenant_id)
+    except StopIteration:
+        raise HTTPException(status_code=404, detail="Request not found") from None
 
 
 @router.post("/queue/{review_id}/decision", response_model=ReviewQueueItem, status_code=status.HTTP_200_OK)

@@ -5,9 +5,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from app.db.models import SlaDefinitionTable, SlaBreachAuditTable, RequestTable
+from app.db.models import SlaDefinitionTable, SlaBreachAuditTable
 from app.db.session import SessionLocal
 from app.services.event_store_service import event_store_service
+from app.services.request_state_bridge import get_request_state
 
 
 def _sla_definition_record(row: SlaDefinitionTable) -> dict:
@@ -114,18 +115,11 @@ class SlaEnforcementService:
         now = datetime.now(timezone.utc)
 
         with SessionLocal() as session:
-            request_row = (
-                session.query(RequestTable)
-                .filter(
-                    RequestTable.id == request_id,
-                    RequestTable.tenant_id == tenant_id,
-                )
-                .first()
-            )
-            if not request_row:
-                return {"request_id": request_id, "status": "unknown", "breaches": []}
+            request = get_request_state(request_id, tenant_id)
+            if not request:
+                raise StopIteration(request_id)
 
-            created_at = request_row.created_at
+            created_at = request.created_at
             elapsed_hours = (now - created_at).total_seconds() / 3600.0 if created_at else 0
 
             # Find applicable SLA definitions: global (scope_id IS NULL) or
@@ -143,9 +137,9 @@ class SlaEnforcementService:
             for sla in sla_rows:
                 if sla.scope_id is None:
                     applicable.append(sla)
-                elif sla.scope_type == "request_type" and sla.scope_id == request_row.request_type:
+                elif sla.scope_type == "request_type" and sla.scope_id == request.request_type:
                     applicable.append(sla)
-                elif sla.scope_type == "team" and sla.scope_id == request_row.owner_team_id:
+                elif sla.scope_type == "team" and sla.scope_id == request.owner_team_id:
                     applicable.append(sla)
 
             breaches: list[dict] = []
@@ -258,6 +252,8 @@ class SlaEnforcementService:
     def list_breaches(
         self, tenant_id: str, request_id: str | None = None
     ) -> list[dict]:
+        if request_id is not None and get_request_state(request_id, tenant_id) is None:
+            raise StopIteration(request_id)
         with SessionLocal() as session:
             q = session.query(SlaBreachAuditTable).filter(
                 SlaBreachAuditTable.tenant_id == tenant_id,

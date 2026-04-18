@@ -7,9 +7,10 @@ from uuid import uuid4
 
 from sqlalchemy import func
 
-from app.db.models import DataClassificationTable, RetentionPolicyTable, DataLineageTable
+from app.db.models import ArtifactTable, DataClassificationTable, DataLineageTable, RetentionPolicyTable
 from app.db.session import SessionLocal
 from app.services.event_store_service import event_store_service
+from app.services.request_state_bridge import get_request_state
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +84,7 @@ class DataGovernanceService:
         now = datetime.now(timezone.utc)
 
         with SessionLocal() as session:
+            self._assert_entity_tenant_access(session, entity_type, entity_id, tenant_id)
             existing = (
                 session.query(DataClassificationTable)
                 .filter(
@@ -134,6 +136,7 @@ class DataGovernanceService:
     ) -> dict | None:
         """Return the current classification for an entity, or None."""
         with SessionLocal() as session:
+            self._assert_entity_tenant_access(session, entity_type, entity_id, tenant_id)
             row = (
                 session.query(DataClassificationTable)
                 .filter(
@@ -214,6 +217,8 @@ class DataGovernanceService:
         lineage_id = f"dl_{uuid4().hex[:12]}"
 
         with SessionLocal() as session:
+            self._assert_entity_tenant_access(session, source_type, source_id, tenant_id)
+            self._assert_entity_tenant_access(session, target_type, target_id, tenant_id)
             row = DataLineageTable(
                 id=lineage_id,
                 tenant_id=tenant_id,
@@ -245,6 +250,7 @@ class DataGovernanceService:
     ) -> list[dict]:
         """Return all lineage records where the entity appears as source or target."""
         with SessionLocal() as session:
+            self._assert_entity_tenant_access(session, entity_type, entity_id, tenant_id)
             rows = (
                 session.query(DataLineageTable)
                 .filter(
@@ -262,6 +268,24 @@ class DataGovernanceService:
                 .all()
             )
             return [_lineage_record(r) for r in rows]
+
+    @staticmethod
+    def _assert_entity_tenant_access(session, entity_type: str, entity_id: str, tenant_id: str) -> None:
+        if entity_type == "request":
+            if get_request_state(entity_id, tenant_id) is None:
+                raise StopIteration(entity_id)
+            return
+        if entity_type == "artifact":
+            artifact_row = (
+                session.query(ArtifactTable)
+                .filter(ArtifactTable.id == entity_id)
+                .first()
+            )
+            if artifact_row is None:
+                raise StopIteration(entity_id)
+            if get_request_state(artifact_row.request_id, tenant_id) is None:
+                raise StopIteration(entity_id)
+            return
 
 
 data_governance_service = DataGovernanceService()

@@ -1,6 +1,6 @@
 import base64
 import hashlib
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -11,6 +11,9 @@ SECRET_SETTING_KEYS = {"api_key", "access_token"}
 
 
 class IntegrationSecurityService:
+    _LEGACY_RUNTIME_MOCK_URL = "http://localhost:8001/api/v1/runtime/mock"
+    _DEFAULT_INTERNAL_RUNTIME_MOCK_URL = "http://127.0.0.1:8000/api/v1/runtime/mock"
+
     def _fernet(self) -> Fernet:
         secret = settings.integration_secret_key or settings.auth_token_secret
         digest = hashlib.sha256(secret.encode("utf-8")).digest()
@@ -73,6 +76,23 @@ class IntegrationSecurityService:
             value = raw.strip()
             return value or None
         return raw if raw is not None else None
+
+    def normalize_runtime_mock_base_url(self, url: str | None, *, fallback_url: str | None = None) -> str:
+        candidate = (url or "").strip() or None
+        fallback = (fallback_url or "").strip() or None
+        default_target = (fallback or self._DEFAULT_INTERNAL_RUNTIME_MOCK_URL).rstrip("/")
+        if not candidate:
+            return default_target
+        if candidate == self._LEGACY_RUNTIME_MOCK_URL:
+            return default_target
+
+        parsed = urlparse(candidate)
+        is_legacy_loopback = parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1"} and parsed.port == 8001
+        is_runtime_mock_path = parsed.path.rstrip("/").startswith("/api/v1/runtime/mock")
+        if is_legacy_loopback and is_runtime_mock_path:
+            fallback_parsed = urlparse(default_target)
+            candidate = urlunparse(parsed._replace(scheme=fallback_parsed.scheme, netloc=fallback_parsed.netloc))
+        return candidate.rstrip("/")
 
     def validate_outbound_target(self, url: str, *, allowed_hosts: list[str], allow_http_loopback: bool = False) -> str:
         parsed = urlparse(url)

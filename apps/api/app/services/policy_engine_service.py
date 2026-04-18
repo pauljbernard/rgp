@@ -9,7 +9,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from app.db.models import PolicyRuleTable, RequestTable, TransitionGateTable
+from app.db.models import PolicyRuleTable, TransitionGateTable
 from app.db.session import SessionLocal
 from app.domain.policy_dsl import evaluate_rules
 from app.models.policy import (
@@ -17,6 +17,7 @@ from app.models.policy import (
     PolicyRuleRecord,
     UpdatePolicyRuleRequest,
 )
+from app.models.request import RequestRecord
 
 
 class PolicyEngineService:
@@ -34,7 +35,7 @@ class PolicyEngineService:
     def evaluate_for_transition(
         self,
         session,
-        request_row: RequestTable,
+        request_row: RequestRecord,
         target_status: str,
         tenant_id: str,
     ) -> list[dict]:
@@ -165,15 +166,15 @@ class PolicyEngineService:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _build_context(request_row: RequestTable, target_status: str) -> dict:
+    def _build_context(request_row: RequestRecord, target_status: str) -> dict:
         """Build a flat context dict suitable for the policy DSL evaluator."""
         return {
             "request_id": request_row.id,
             "request_type": request_row.request_type,
             "template_id": request_row.template_id,
-            "status": request_row.status,
+            "status": request_row.status.value if hasattr(request_row.status, "value") else str(request_row.status),
             "target_status": target_status,
-            "priority": request_row.priority,
+            "priority": request_row.priority.value if hasattr(request_row.priority, "value") else str(request_row.priority),
             "owner_team_id": request_row.owner_team_id,
             "submitter_id": request_row.submitter_id,
             "tags": request_row.tags or [],

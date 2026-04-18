@@ -3,7 +3,7 @@ import { NextResponse } from "next/server";
 
 const sessionCookieName = "rgp_access_token";
 const authStateCookieName = "rgp_auth_state";
-const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8001";
+const apiBaseUrl = process.env.RGP_API_INTERNAL_BASE_URL ?? process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8001";
 const webBaseUrl = process.env.NEXT_PUBLIC_WEB_BASE_URL ?? "http://localhost:3000";
 
 function publicAppUrl(path: string) {

@@ -105,6 +105,7 @@ class ReconciliationService:
         projection_id: str,
         action: str,
         resolved_by: str,
+        tenant_id: str | None = None,
     ) -> ReconciliationLogRecord:
         """Record a resolution action for a projection conflict.
 
@@ -119,11 +120,7 @@ class ReconciliationService:
 
         with SessionLocal() as session:
             # Mark the projection as reconciled.
-            proj = (
-                session.query(ProjectionMappingTable)
-                .filter(ProjectionMappingTable.id == projection_id)
-                .one()
-            )
+            proj = projection_service._get_projection_row(session, projection_id, tenant_id)
             canonical_state = projection_service._canonical_snapshot(session, proj)
             adapter_type = (proj.external_state or {}).get("adapter_type")
             supported_actions = self._supported_actions(adapter_type)
@@ -158,7 +155,7 @@ class ReconciliationService:
         """Determine the reconciliation action for a projection."""
         if proj.external_state is None:
             return "missing_external_state"
-        if projection_service.detect_conflicts(projection_id):
+        if projection_service.detect_conflicts(projection_id, proj.tenant_id):
             return "conflict"
         return "synced"
 

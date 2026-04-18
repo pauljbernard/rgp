@@ -12,6 +12,7 @@ from app.models.editorial import (
     EditorialWorkflowRecord,
 )
 from app.services.event_store_service import event_store_service
+from app.services.request_state_bridge import get_request_state
 
 
 class EditorialWorkflowService:
@@ -29,6 +30,9 @@ class EditorialWorkflowService:
     ) -> EditorialWorkflowRecord:
         now = datetime.now(timezone.utc)
         wf_id = f"ew_{uuid4().hex[:12]}"
+        request = get_request_state(payload.request_id, tenant_id)
+        if request is None:
+            raise StopIteration(payload.request_id)
 
         stages = payload.stages or []
         current_stage = stages[0]["name"] if stages else "drafting"
@@ -36,7 +40,7 @@ class EditorialWorkflowService:
         with SessionLocal() as session:
             row = EditorialWorkflowTable(
                 id=wf_id,
-                tenant_id=tenant_id,
+                tenant_id=request.tenant_id,
                 request_id=payload.request_id,
                 artifact_id=payload.artifact_id,
                 current_stage=current_stage,
@@ -50,7 +54,7 @@ class EditorialWorkflowService:
 
             event_store_service.append(
                 session,
-                tenant_id=tenant_id,
+                tenant_id=request.tenant_id,
                 event_type="editorial_workflow.created",
                 aggregate_type="editorial_workflow",
                 aggregate_id=wf_id,
@@ -63,24 +67,23 @@ class EditorialWorkflowService:
             session.refresh(row)
             return EditorialWorkflowRecord.model_validate(row)
 
-    def get_workflow(self, workflow_id: str) -> EditorialWorkflowRecord:
+    def get_workflow(self, workflow_id: str, tenant_id: str | None = None) -> EditorialWorkflowRecord:
         with SessionLocal() as session:
-            row = (
-                session.query(EditorialWorkflowTable)
-                .filter(EditorialWorkflowTable.id == workflow_id)
-                .one()
-            )
+            row = self._get_workflow_row(session, workflow_id, tenant_id)
             return EditorialWorkflowRecord.model_validate(row)
 
     def list_workflows(
         self, request_id: str, tenant_id: str
     ) -> list[EditorialWorkflowRecord]:
+        request = get_request_state(request_id, tenant_id)
+        if request is None:
+            raise StopIteration(request_id)
         with SessionLocal() as session:
             rows = (
                 session.query(EditorialWorkflowTable)
                 .filter(
                     EditorialWorkflowTable.request_id == request_id,
-                    EditorialWorkflowTable.tenant_id == tenant_id,
+                    EditorialWorkflowTable.tenant_id == request.tenant_id,
                 )
                 .order_by(EditorialWorkflowTable.created_at.desc())
                 .all()
@@ -92,7 +95,7 @@ class EditorialWorkflowService:
     # ------------------------------------------------------------------
 
     def advance_stage(
-        self, workflow_id: str, actor_id: str
+        self, workflow_id: str, actor_id: str, tenant_id: str | None = None
     ) -> EditorialWorkflowRecord:
         """Move the workflow to its next stage.
 
@@ -103,11 +106,7 @@ class EditorialWorkflowService:
         now = datetime.now(timezone.utc)
 
         with SessionLocal() as session:
-            row = (
-                session.query(EditorialWorkflowTable)
-                .filter(EditorialWorkflowTable.id == workflow_id)
-                .one()
-            )
+            row = self._get_workflow_row(session, workflow_id, tenant_id)
 
             stages: list[dict] = list(row.stages or [])
             stage_names = [s["name"] for s in stages]
@@ -157,15 +156,12 @@ class EditorialWorkflowService:
         role: str,
         user_id: str,
         actor_id: str,
+        tenant_id: str | None = None,
     ) -> EditorialWorkflowRecord:
         now = datetime.now(timezone.utc)
 
         with SessionLocal() as session:
-            row = (
-                session.query(EditorialWorkflowTable)
-                .filter(EditorialWorkflowTable.id == workflow_id)
-                .one()
-            )
+            row = self._get_workflow_row(session, workflow_id, tenant_id)
 
             assignments = dict(row.role_assignments or {})
             assignments[role] = user_id
@@ -187,6 +183,20 @@ class EditorialWorkflowService:
             session.commit()
             session.refresh(row)
             return EditorialWorkflowRecord.model_validate(row)
+
+    @staticmethod
+    def _get_workflow_row(session, workflow_id: str, tenant_id: str | None = None) -> EditorialWorkflowTable:
+        row = (
+            session.query(EditorialWorkflowTable)
+            .filter(EditorialWorkflowTable.id == workflow_id)
+            .one()
+        )
+        if tenant_id is None:
+            return row
+        request = get_request_state(row.request_id, tenant_id)
+        if request is None or row.tenant_id != request.tenant_id:
+            raise StopIteration(workflow_id)
+        return row
 
 
 editorial_workflow_service = EditorialWorkflowService()

@@ -44,6 +44,22 @@ class DeploymentAdapter(Protocol):
         ...
 
 
+class GovernedSessionRuntimeAdapter(RuntimeAdapter, Protocol):
+    """Contract for stateful governed runtimes that expose durable session semantics."""
+
+    def resume_session(self, session_ref: str, *, approval_token: str | None = None) -> dict:
+        """Resume a previously paused governed runtime session."""
+        ...
+
+    def approve_operation(self, session_ref: str, operation_ref: str) -> dict:
+        """Approve a governed runtime checkpoint or operation."""
+        ...
+
+    def list_artifacts(self, session_ref: str) -> list[dict]:
+        """Return importable artifacts visible to the governed runtime session."""
+        ...
+
+
 class EventSink(Protocol):
     """Contract for emitting canonical events to an external sink."""
 

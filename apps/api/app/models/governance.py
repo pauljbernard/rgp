@@ -318,6 +318,77 @@ class ReviewDecisionRequest(RgpModel):
     reason: str = "Review decision recorded"
 
 
+class InstructionalWorkflowStatus(StrEnum):
+    NOT_SUBMITTED = "NOT_SUBMITTED"
+    IN_REVIEW = "IN_REVIEW"
+    CHANGES_REQUESTED = "CHANGES_REQUESTED"
+    APPROVED_FOR_RELEASE = "APPROVED_FOR_RELEASE"
+    RELEASED = "RELEASED"
+
+
+class InstructionalContentKind(StrEnum):
+    CURRICULUM_COURSE = "CURRICULUM_COURSE"
+    ASSESSMENT = "ASSESSMENT"
+
+
+class InstructionalWorkflowStageId(StrEnum):
+    INSTRUCTIONAL_DESIGN_REVIEW = "INSTRUCTIONAL_DESIGN_REVIEW"
+    SME_REVIEW = "SME_REVIEW"
+    ASSESSMENT_REVIEW = "ASSESSMENT_REVIEW"
+    CERTIFICATION_COMPLIANCE_REVIEW = "CERTIFICATION_COMPLIANCE_REVIEW"
+
+
+class InstructionalWorkflowStageStatus(StrEnum):
+    PENDING = "PENDING"
+    ACTIVE = "ACTIVE"
+    APPROVED = "APPROVED"
+    CHANGES_REQUESTED = "CHANGES_REQUESTED"
+    SKIPPED = "SKIPPED"
+
+
+class InstructionalWorkflowDecision(StrEnum):
+    APPROVE = "APPROVE"
+    REQUEST_CHANGES = "REQUEST_CHANGES"
+
+
+class InstructionalWorkflowStageRecord(RgpModel):
+    stage_id: InstructionalWorkflowStageId
+    label: str
+    status: InstructionalWorkflowStageStatus
+    required: bool = True
+    sequence: int
+    decision: InstructionalWorkflowDecision | None = None
+    decided_at: str | None = None
+    decided_by_user_id: str | None = None
+    notes: str | None = None
+
+
+class InstructionalWorkflowProjectionRecord(RgpModel):
+    request_id: str
+    tenant_id: str
+    flightos_content_entry_id: str
+    flightos_schema_id: str | None = None
+    template_id: str
+    template_version: str
+    title: str
+    request_status: RequestStatus
+    workflow_status: InstructionalWorkflowStatus
+    content_kind: InstructionalContentKind
+    current_stage_id: InstructionalWorkflowStageId | None = None
+    submitted_at: str | None = None
+    submitted_by_user_id: str | None = None
+    approved_for_release_at: str | None = None
+    released_at: str | None = None
+    stages: list[InstructionalWorkflowStageRecord] = Field(default_factory=list)
+
+
+class InstructionalWorkflowDecisionRequest(RgpModel):
+    actor_id: str = "user_demo"
+    stage_id: InstructionalWorkflowStageId
+    decision: InstructionalWorkflowDecision
+    notes: str | None = None
+
+
 class ReviewAssignmentOverrideRequest(RgpModel):
     actor_id: str = "user_demo"
     assigned_reviewer: str
@@ -759,6 +830,19 @@ class AgentSessionMessageRecord(RgpModel):
     created_at: str
 
 
+class GovernedRuntimeSummary(RgpModel):
+    runtime_family: str = "agent_runtime"
+    runtime_subtype: str | None = None
+    session_kind: str = "interactive_agent"
+    adapter_type: str | None = None
+    environment_ref: str | None = None
+    thread_ref: str | None = None
+    turn_ref: str | None = None
+    pending_approval_count: int = 0
+    pending_artifact_count: int = 0
+    external_bindings: list[dict] = Field(default_factory=list)
+
+
 class AgentSessionRecord(RgpModel):
     id: str
     request_id: str
@@ -768,6 +852,8 @@ class AgentSessionRecord(RgpModel):
     collaboration_mode: str = "agent_assisted"
     agent_operating_profile: str = "general"
     provider: str | None = None
+    runtime_subtype: str | None = None
+    session_kind: str = "interactive_agent"
     status: str
     awaiting_human: bool
     summary: str
@@ -776,6 +862,7 @@ class AgentSessionRecord(RgpModel):
     assigned_by: str
     assigned_at: str
     updated_at: str
+    governed_runtime: GovernedRuntimeSummary | None = None
     latest_message: AgentSessionMessageRecord | None = None
     message_count: int = 0
 
@@ -796,6 +883,7 @@ class AgentSessionToolRecord(RgpModel):
 
 class AgentSessionContextDetail(RgpModel):
     bundle: ContextBundleRecord
+    governed_runtime: GovernedRuntimeSummary | None = None
     available_tools: list[AgentSessionToolRecord] = Field(default_factory=list)
     restricted_tools: list[AgentSessionToolRecord] = Field(default_factory=list)
     degraded_tools: list[AgentSessionToolRecord] = Field(default_factory=list)
@@ -831,6 +919,21 @@ class CompleteAgentSessionRequest(RgpModel):
     actor_id: str = "user_demo"
     reason: str = "Accepted agent response and resumed workflow"
     target_status: str | None = None
+    completion_action: str = "accept_response"
+
+
+class ImportAgentSessionArtifactRequest(RgpModel):
+    actor_id: str = "user_demo"
+    artifact_key: str
+    title: str
+    artifact_type: str = "sbcl_agent.artifact"
+    summary: str = "Imported from governed sbcl-agent session"
+    content: str | None = None
+    path: str | None = None
+    source_ref: str | None = None
+    image_ref: str | None = None
+    promotion_relevant: bool = True
+    reason: str = "Imported governed sbcl-agent artifact into RGP"
 
 
 class RequestDetail(RgpModel):
@@ -1264,7 +1367,7 @@ def seed_integrations() -> list[IntegrationRecord]:
             type="runtime",
             status="connected",
             endpoint="foundry://rgp-primary",
-            settings={"provider": "microsoft", "base_url": "http://localhost:8001/api/v1/runtime/mock"},
+            settings={"provider": "microsoft", "base_url": "http://127.0.0.1:8000/api/v1/runtime/mock"},
         ),
         IntegrationRecord(id="int_002", name="GitHub MCP", type="repository", status="connected", endpoint="github://rgp"),
         IntegrationRecord(id="int_003", name="Enterprise IdP", type="identity", status="connected", endpoint="oidc://enterprise"),

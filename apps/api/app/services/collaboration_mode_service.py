@@ -10,7 +10,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from app.db.models import CollaborationModeTransitionTable, RequestTable
+from app.db.models import CollaborationModeTransitionTable
 from app.db.session import SessionLocal
 from app.models.collaboration import (
     CollaborationMode,
@@ -18,6 +18,7 @@ from app.models.collaboration import (
     SwitchModeRequest,
 )
 from app.services.event_store_service import event_store_service
+from app.services.request_state_bridge import get_request_state
 
 # Allowed directed transitions between collaboration modes.
 _ALLOWED_TRANSITIONS: dict[str, set[str]] = {
@@ -45,6 +46,8 @@ class CollaborationModeService:
         ``human_led``.
         """
         with SessionLocal() as session:
+            if get_request_state(request_id, tenant_id) is None:
+                raise StopIteration(request_id)
             latest = (
                 session.query(CollaborationModeTransitionTable)
                 .filter(
@@ -69,15 +72,8 @@ class CollaborationModeService:
         Raises ``ValueError`` if the transition is not allowed.
         """
         with SessionLocal() as session:
-            # Ensure request exists and belongs to tenant.
-            request_row = (
-                session.query(RequestTable)
-                .filter(
-                    RequestTable.id == request_id,
-                    RequestTable.tenant_id == tenant_id,
-                )
-                .one()
-            )
+            if get_request_state(request_id, tenant_id) is None:
+                raise StopIteration(request_id)
 
             current_mode = self.get_current_mode(request_id, tenant_id)
             target_mode = payload.target_mode.value
@@ -136,6 +132,8 @@ class CollaborationModeService:
     ) -> list[ModeTransitionRecord]:
         """Return the full transition history for a request."""
         with SessionLocal() as session:
+            if get_request_state(request_id, tenant_id) is None:
+                raise StopIteration(request_id)
             rows = (
                 session.query(CollaborationModeTransitionTable)
                 .filter(

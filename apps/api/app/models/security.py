@@ -15,16 +15,31 @@ class PrincipalRole(StrEnum):
     OBSERVER = "observer"
 
 
+class PrincipalType(StrEnum):
+    USER = "user"
+    MACHINE = "machine"
+
+
 class Principal(RgpModel):
     user_id: str
-    tenant_id: str
+    tenant_id: str = ""
+    principal_type: PrincipalType = PrincipalType.USER
+    client_id: str | None = None
     roles: list[PrincipalRole] = Field(default_factory=list)
+    scopes: list[str] = Field(default_factory=list)
 
 
 class TokenClaims(RgpModel):
     sub: str
-    tenant_id: str
-    roles: list[PrincipalRole] = Field(default_factory=list)
+    tenant_id: str | None = None
+    iss: str | None = None
+    aud: str | list[str] | None = None
+    azp: str | None = None
+    client_id: str | None = None
+    scope: str | None = None
+    service_account: bool | None = None
+    roles: list[str] = Field(default_factory=list)
+    realm_roles: list[str] = Field(default_factory=list)
     exp: int | None = None
 
 

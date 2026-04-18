@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from sqlalchemy import desc, select
 
 from app.db.models import ArtifactTable, CheckOverrideTable, CheckResultTable, PromotionTable, RequestTable, ReviewQueueTable, TransitionGateTable
-from app.models.request import RequestStatus
+from app.models.request import RequestRecord, RequestStatus
 
 
 class PolicyCheckService:
@@ -59,7 +59,7 @@ class PolicyCheckService:
         }
 
     @classmethod
-    def ensure_request_check_records(cls, session, row: RequestTable, actor_id: str) -> None:
+    def ensure_request_check_records(cls, session, row: RequestTable | RequestRecord, actor_id: str) -> None:
         existing = session.scalars(select(CheckResultTable).where(CheckResultTable.request_id == row.id, CheckResultTable.promotion_id.is_(None))).all()
         if existing:
             return
@@ -82,7 +82,7 @@ class PolicyCheckService:
         session.flush()
 
     @classmethod
-    def run_request_checks(cls, session, row: RequestTable, actor_id: str) -> None:
+    def run_request_checks(cls, session, row: RequestTable | RequestRecord, actor_id: str) -> None:
         cls.ensure_request_check_records(session, row, actor_id)
         artifact_row = session.scalars(select(ArtifactTable).where(ArtifactTable.request_id == row.id).order_by(desc(ArtifactTable.updated_at))).first()
         review_row = session.scalars(select(ReviewQueueTable).where(ReviewQueueTable.request_id == row.id).order_by(desc(ReviewQueueTable.id))).first()
@@ -182,7 +182,7 @@ class PolicyCheckService:
         return cls.promotion_readiness(check_rows, override_rows, promotion_row.required_approvals)
 
     @classmethod
-    def run_promotion_checks(cls, session, request_row: RequestTable, promotion_row: PromotionTable, actor_id: str) -> None:
+    def run_promotion_checks(cls, session, request_row: RequestTable | RequestRecord, promotion_row: PromotionTable, actor_id: str) -> None:
         cls.ensure_promotion_check_records(session, promotion_row, actor_id)
         artifact_row = session.scalars(select(ArtifactTable).where(ArtifactTable.request_id == request_row.id).order_by(desc(ArtifactTable.updated_at))).first()
         review_row = session.scalars(select(ReviewQueueTable).where(ReviewQueueTable.request_id == request_row.id).order_by(desc(ReviewQueueTable.id))).first()

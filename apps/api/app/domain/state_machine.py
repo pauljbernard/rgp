@@ -148,6 +148,9 @@ def compute_sla_risk(
     """
     policy_id = sla_policy_id or "sla_standard_v1"
     policy = SLA_POLICY_RULES.get(policy_id, SLA_POLICY_RULES["sla_standard_v1"])
+    if updated_at.tzinfo is None:
+        # SQLite commonly returns naive datetimes even when the application stores UTC values.
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
     age_hours = max((datetime.now(timezone.utc) - updated_at).total_seconds() / 3600, 0)
     norm_priority = priority if priority in {"medium", "high", "urgent"} else "medium"
 

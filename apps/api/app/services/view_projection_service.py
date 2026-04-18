@@ -6,17 +6,17 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import func
+from sqlalchemy import func, text
 
 from app.db.models import (
     ViewDefinitionTable,
-    RequestTable,
     RequestRelationshipTable,
     PlanningConstructTable,
     PlanningMembershipTable,
 )
 from app.db.session import SessionLocal
 from app.services.event_store_service import event_store_service
+from app.services.request_state_bridge import get_request_state
 
 
 def _view_definition_record(row: ViewDefinitionTable) -> dict:
@@ -35,6 +35,22 @@ def _view_definition_record(row: ViewDefinitionTable) -> dict:
 
 class ViewProjectionService:
     """Projects request data into board, graph, and roadmap views."""
+    _COMPLETED_STATUSES = {"completed", "closed", "promoted"}
+
+    @staticmethod
+    def _request_projection_record(request) -> dict:
+        status = request.status.value if hasattr(request.status, "value") else str(request.status)
+        priority = request.priority.value if hasattr(request.priority, "value") else str(request.priority)
+        updated_at = request.updated_at.isoformat() if request.updated_at else None
+        return {
+            "id": request.id,
+            "title": request.title,
+            "status": status,
+            "priority": priority,
+            "owner_team_id": request.owner_team_id,
+            "request_type": request.request_type,
+            "updated_at": updated_at,
+        }
 
     # ------------------------------------------------------------------
     # View definitions
@@ -106,34 +122,43 @@ class ViewProjectionService:
         filters = filters or {}
 
         with SessionLocal() as session:
-            q = session.query(RequestTable).filter(
-                RequestTable.tenant_id == tenant_id,
-                RequestTable.is_archived.is_(False),
-            )
+            sql_request_ids = {
+                row[0]
+                for row in session.execute(
+                    text("select id from requests where tenant_id = :tenant_id"),
+                    {"tenant_id": tenant_id},
+                ).fetchall()
+            }
+            from app.persistence.dynamodb_governance_adapter import DynamoDbGovernancePersistenceAdapter
+
+            dynamodb_adapter = DynamoDbGovernancePersistenceAdapter()
+            dynamo_request_ids = {
+                item["id"]
+                for item in dynamodb_adapter._scan_items()
+                if item.get("record_type") == "request" and item.get("tenant_id") == tenant_id
+            }
+            request_ids = sql_request_ids | dynamo_request_ids
+            requests = [get_request_state(request_id, tenant_id) for request_id in request_ids]
+            records = [
+                self._request_projection_record(request)
+                for request in requests
+                if request is not None and not request.is_archived
+            ]
 
             if filters.get("status"):
-                q = q.filter(RequestTable.status == filters["status"])
+                records = [record for record in records if record["status"] == filters["status"]]
             if filters.get("priority"):
-                q = q.filter(RequestTable.priority == filters["priority"])
+                records = [record for record in records if record["priority"] == filters["priority"]]
             if filters.get("owner_team_id"):
-                q = q.filter(RequestTable.owner_team_id == filters["owner_team_id"])
+                records = [record for record in records if record["owner_team_id"] == filters["owner_team_id"]]
             if filters.get("request_type"):
-                q = q.filter(RequestTable.request_type == filters["request_type"])
-
-            rows = q.order_by(RequestTable.updated_at.desc()).all()
+                records = [record for record in records if record["request_type"] == filters["request_type"]]
+            records.sort(key=lambda record: record["updated_at"] or "", reverse=True)
 
             lanes: dict[str, list[dict]] = defaultdict(list)
-            for r in rows:
-                lane_key = getattr(r, group_by, "unknown") or "unassigned"
-                lanes[lane_key].append({
-                    "id": r.id,
-                    "title": r.title,
-                    "status": r.status,
-                    "priority": r.priority,
-                    "owner_team_id": r.owner_team_id,
-                    "request_type": r.request_type,
-                    "updated_at": r.updated_at.isoformat() if r.updated_at else None,
-                })
+            for record in records:
+                lane_key = record.get(group_by) or "unassigned"
+                lanes[lane_key].append(record)
 
             return {
                 "group_by": group_by,
@@ -153,14 +178,7 @@ class ViewProjectionService:
         includes the request itself as the root node.
         """
         with SessionLocal() as session:
-            root = (
-                session.query(RequestTable)
-                .filter(
-                    RequestTable.id == request_id,
-                    RequestTable.tenant_id == tenant_id,
-                )
-                .first()
-            )
+            root = get_request_state(request_id, tenant_id)
             if not root:
                 return {"nodes": [], "edges": []}
 
@@ -171,7 +189,7 @@ class ViewProjectionService:
             nodes[root.id] = {
                 "id": root.id,
                 "title": root.title,
-                "status": root.status,
+                "status": root.status.value if hasattr(root.status, "value") else str(root.status),
                 "type": "root",
             }
 
@@ -188,16 +206,12 @@ class ViewProjectionService:
                     "type": rel.relationship_type,
                 })
                 if rel.target_request_id not in nodes:
-                    target = (
-                        session.query(RequestTable)
-                        .filter(RequestTable.id == rel.target_request_id)
-                        .first()
-                    )
+                    target = get_request_state(rel.target_request_id, tenant_id)
                     if target:
                         nodes[target.id] = {
                             "id": target.id,
                             "title": target.title,
-                            "status": target.status,
+                            "status": target.status.value if hasattr(target.status, "value") else str(target.status),
                             "type": "related",
                         }
 
@@ -214,16 +228,12 @@ class ViewProjectionService:
                     "type": rel.relationship_type,
                 })
                 if rel.source_request_id not in nodes:
-                    source = (
-                        session.query(RequestTable)
-                        .filter(RequestTable.id == rel.source_request_id)
-                        .first()
-                    )
+                    source = get_request_state(rel.source_request_id, tenant_id)
                     if source:
                         nodes[source.id] = {
                             "id": source.id,
                             "title": source.title,
-                            "status": source.status,
+                            "status": source.status.value if hasattr(source.status, "value") else str(source.status),
                             "type": "related",
                         }
 
@@ -271,16 +281,13 @@ class ViewProjectionService:
                     .filter(PlanningMembershipTable.planning_construct_id == c.id)
                     .all()
                 ]
-                completed_count = 0
-                if member_request_ids:
-                    completed_count = (
-                        session.query(func.count(RequestTable.id))
-                        .filter(
-                            RequestTable.id.in_(member_request_ids),
-                            RequestTable.status.in_(["completed", "closed"]),
-                        )
-                        .scalar()
-                    )
+                completed_count = sum(
+                    1
+                    for request_id in member_request_ids
+                    for request in [get_request_state(request_id, tenant_id)]
+                    if request is not None
+                    and (request.status.value if hasattr(request.status, "value") else str(request.status)) in self._COMPLETED_STATUSES
+                )
 
                 completion_pct = (
                     round(completed_count / member_count * 100.0, 1)

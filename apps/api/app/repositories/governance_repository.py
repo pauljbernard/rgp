@@ -6,7 +6,7 @@ import time
 from types import SimpleNamespace
 from uuid import uuid4
 
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, select, update
 
 from app.core.config import settings
 from app.db.models import AgentSessionMessageTable, AgentSessionTable, ArtifactEventTable, ArtifactLineageEdgeTable, ArtifactTable, CapabilityTable, CheckOverrideTable, CheckResultTable, CheckRunTable, ContextAccessLogTable, ContextBundleTable, DeploymentExecutionTable, EventOutboxTable, EventStoreTable, IntegrationTable, OrganizationTable, PolicyTable, PortfolioScopeTable, PortfolioTable, ProjectionMappingTable, PromotionTable, ReconciliationLogTable, RequestEventTable, RequestRelationshipTable, RequestTable, ReviewQueueTable, RunTable, RuntimeDispatchTable, RuntimeSignalTable, TeamMembershipTable, TeamTable, TemplateTable, TenantTable, TransitionGateTable, UserTable
@@ -28,6 +28,8 @@ from app.models.governance import (
     AnalyticsWorkflowRow,
     AgentTrendPoint,
     AssignAgentSessionRequest,
+    GovernedRuntimeSummary,
+    ImportAgentSessionArtifactRequest,
     ArtifactDetail,
     ArtifactEvent,
     ArtifactLineageEdge,
@@ -52,6 +54,14 @@ from app.models.governance import (
     OrganizationRecord,
     EventLedgerRecord,
     EventOutboxRecord,
+    InstructionalContentKind,
+    InstructionalWorkflowDecision,
+    InstructionalWorkflowDecisionRequest,
+    InstructionalWorkflowProjectionRecord,
+    InstructionalWorkflowStageId,
+    InstructionalWorkflowStageRecord,
+    InstructionalWorkflowStageStatus,
+    InstructionalWorkflowStatus,
     DeliveryDoraRow,
     DeliveryForecastPoint,
     DeliveryForecastSummary,
@@ -102,6 +112,7 @@ from app.services.local_account_service import local_account_service
 from app.services.object_store_service import object_store_service
 from app.services.policy_check_service import policy_check_service
 from app.services.projection_service import projection_service
+from app.services.request_state_bridge import get_request_state, record_request_event, update_request_state
 from app.services.runtime_dispatch_service import runtime_dispatch_service
 from app.domain.state_machine import (
     TRANSITION_RULES as _SM_TRANSITION_RULES,
@@ -129,6 +140,25 @@ from app.models.template import (
 class GovernanceRepository:
     _agent_stream_lock = threading.Lock()
     _agent_stream_inflight: set[str] = set()
+    _instructional_template_stages = {
+        "tmpl_assessment": [
+            InstructionalWorkflowStageId.INSTRUCTIONAL_DESIGN_REVIEW,
+            InstructionalWorkflowStageId.SME_REVIEW,
+            InstructionalWorkflowStageId.ASSESSMENT_REVIEW,
+            InstructionalWorkflowStageId.CERTIFICATION_COMPLIANCE_REVIEW,
+        ],
+        "tmpl_curriculum": [
+            InstructionalWorkflowStageId.INSTRUCTIONAL_DESIGN_REVIEW,
+            InstructionalWorkflowStageId.SME_REVIEW,
+            InstructionalWorkflowStageId.CERTIFICATION_COMPLIANCE_REVIEW,
+        ],
+    }
+    _instructional_stage_labels = {
+        InstructionalWorkflowStageId.INSTRUCTIONAL_DESIGN_REVIEW: "Instructional Design Review",
+        InstructionalWorkflowStageId.SME_REVIEW: "Subject Matter Expert Review",
+        InstructionalWorkflowStageId.ASSESSMENT_REVIEW: "Assessment Review",
+        InstructionalWorkflowStageId.CERTIFICATION_COMPLIANCE_REVIEW: "Certification Compliance Review",
+    }
 
     # Delegated to app.domain.state_machine — kept as class attrs for backward compat
     SLA_POLICY_RULES = _SM_SLA_POLICY_RULES
@@ -147,6 +177,163 @@ class GovernanceRepository:
         end = start + page_size
         return PaginatedResponse.create(items=items[start:end], page=page, page_size=page_size, total_count=len(items))
 
+    @staticmethod
+    def _as_utc(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    @classmethod
+    def _is_instructional_template(cls, template_id: str) -> bool:
+        return template_id in cls._instructional_template_stages
+
+    @classmethod
+    def _instructional_stage_ids(cls, template_id: str) -> list[InstructionalWorkflowStageId]:
+        if not cls._is_instructional_template(template_id):
+            raise ValueError(f"Template {template_id} is not an instructional governance template")
+        return list(cls._instructional_template_stages[template_id])
+
+    @staticmethod
+    def _instructional_content_kind(template_id: str) -> InstructionalContentKind:
+        return InstructionalContentKind.ASSESSMENT if template_id == "tmpl_assessment" else InstructionalContentKind.CURRICULUM_COURSE
+
+    @staticmethod
+    def _instructional_flightos_entry_id(row: RequestTable) -> str | None:
+        value = (row.input_payload or {}).get("flightos_content_entry_id")
+        return value if isinstance(value, str) and value.strip() else None
+
+    @staticmethod
+    def _instructional_flightos_schema_id(row: RequestTable) -> str | None:
+        value = (row.input_payload or {}).get("flightos_schema_id")
+        if isinstance(value, str) and value.strip():
+            return value
+        return "assessment" if row.template_id == "tmpl_assessment" else "course"
+
+    @staticmethod
+    def _instructional_submitted_actor(audit_entries: list[AuditEntry]) -> str | None:
+        for entry in audit_entries:
+            if entry.action == "Submitted":
+                return entry.actor
+        return None
+
+    @staticmethod
+    def _instructional_timestamp_for_action(audit_entries: list[AuditEntry], action: str) -> str | None:
+        for entry in reversed(audit_entries):
+            if entry.action == action:
+                return entry.timestamp
+        return None
+
+    @classmethod
+    def _instructional_decisions_from_audit(
+        cls,
+        audit_entries: list[AuditEntry],
+    ) -> dict[InstructionalWorkflowStageId, tuple[InstructionalWorkflowDecision, AuditEntry]]:
+        decisions: dict[InstructionalWorkflowStageId, tuple[InstructionalWorkflowDecision, AuditEntry]] = {}
+        for entry in audit_entries:
+            if entry.action.startswith("Instructional Stage Approved: "):
+                stage_name = entry.action.removeprefix("Instructional Stage Approved: ").strip()
+                decisions[InstructionalWorkflowStageId(stage_name)] = (InstructionalWorkflowDecision.APPROVE, entry)
+            elif entry.action.startswith("Instructional Stage Changes Requested: "):
+                stage_name = entry.action.removeprefix("Instructional Stage Changes Requested: ").strip()
+                decisions[InstructionalWorkflowStageId(stage_name)] = (InstructionalWorkflowDecision.REQUEST_CHANGES, entry)
+        return decisions
+
+    @staticmethod
+    def _instructional_workflow_status(request_status: RequestStatus) -> InstructionalWorkflowStatus:
+        if request_status == RequestStatus.DRAFT:
+            return InstructionalWorkflowStatus.NOT_SUBMITTED
+        if request_status in {RequestStatus.CHANGES_REQUESTED, RequestStatus.FAILED, RequestStatus.REJECTED, RequestStatus.VALIDATION_FAILED}:
+            return InstructionalWorkflowStatus.CHANGES_REQUESTED
+        if request_status in {RequestStatus.APPROVED, RequestStatus.PROMOTION_PENDING}:
+            return InstructionalWorkflowStatus.APPROVED_FOR_RELEASE
+        if request_status in {RequestStatus.PROMOTED, RequestStatus.COMPLETED, RequestStatus.ARCHIVED}:
+            return InstructionalWorkflowStatus.RELEASED
+        return InstructionalWorkflowStatus.IN_REVIEW
+
+    @classmethod
+    def _build_instructional_projection_from_row(
+        cls,
+        row: RequestTable,
+        audit_entries: list[AuditEntry],
+    ) -> InstructionalWorkflowProjectionRecord:
+        stage_ids = cls._instructional_stage_ids(row.template_id)
+        decisions = cls._instructional_decisions_from_audit(audit_entries)
+        stages: list[InstructionalWorkflowStageRecord] = []
+        blocking_stage: InstructionalWorkflowStageId | None = None
+        approved_prefix = True
+
+        for index, stage_id in enumerate(stage_ids, start=1):
+            decision_entry = decisions.get(stage_id)
+            status = InstructionalWorkflowStageStatus.PENDING
+            decision = None
+            decided_at = None
+            decided_by_user_id = None
+            notes = None
+            if decision_entry:
+                decision, entry = decision_entry
+                decided_at = entry.timestamp
+                decided_by_user_id = entry.actor
+                notes = entry.reason_or_evidence
+                if decision == InstructionalWorkflowDecision.APPROVE and approved_prefix:
+                    status = InstructionalWorkflowStageStatus.APPROVED
+                elif decision == InstructionalWorkflowDecision.REQUEST_CHANGES:
+                    status = InstructionalWorkflowStageStatus.CHANGES_REQUESTED
+                    approved_prefix = False
+                    blocking_stage = stage_id
+                else:
+                    status = InstructionalWorkflowStageStatus.PENDING
+                    approved_prefix = False
+            elif approved_prefix:
+                status = InstructionalWorkflowStageStatus.ACTIVE
+                approved_prefix = False
+                blocking_stage = stage_id
+            stages.append(
+                InstructionalWorkflowStageRecord(
+                    stage_id=stage_id,
+                    label=cls._instructional_stage_labels[stage_id],
+                    status=status,
+                    sequence=index,
+                    decision=decision,
+                    decided_at=decided_at,
+                    decided_by_user_id=decided_by_user_id,
+                    notes=notes,
+                )
+            )
+
+        workflow_status = cls._instructional_workflow_status(RequestStatus(row.status))
+        if workflow_status in {InstructionalWorkflowStatus.APPROVED_FOR_RELEASE, InstructionalWorkflowStatus.RELEASED}:
+            stages = [
+                stage.model_copy(update={"status": InstructionalWorkflowStageStatus.APPROVED})
+                for stage in stages
+            ]
+            blocking_stage = stage_ids[-1] if stage_ids else None
+        elif workflow_status == InstructionalWorkflowStatus.NOT_SUBMITTED:
+            stages = [
+                stage.model_copy(update={"status": InstructionalWorkflowStageStatus.PENDING, "decision": None, "decided_at": None, "decided_by_user_id": None, "notes": None})
+                for stage in stages
+            ]
+            blocking_stage = None
+
+        return InstructionalWorkflowProjectionRecord(
+            request_id=row.id,
+            tenant_id=row.tenant_id,
+            flightos_content_entry_id=cls._instructional_flightos_entry_id(row) or row.id,
+            flightos_schema_id=cls._instructional_flightos_schema_id(row),
+            template_id=row.template_id,
+            template_version=row.template_version,
+            title=row.title,
+            request_status=RequestStatus(row.status),
+            workflow_status=workflow_status,
+            content_kind=cls._instructional_content_kind(row.template_id),
+            current_stage_id=blocking_stage,
+            submitted_at=cls._instructional_timestamp_for_action(audit_entries, "Submitted"),
+            submitted_by_user_id=cls._instructional_submitted_actor(audit_entries),
+            approved_for_release_at=cls._instructional_timestamp_for_action(audit_entries, "Transitioned to approved"),
+            released_at=cls._instructional_timestamp_for_action(audit_entries, "Transitioned to promoted")
+            or cls._instructional_timestamp_for_action(audit_entries, "Transitioned to completed"),
+            stages=stages,
+        )
+
     def list_requests(
         self,
         page: int,
@@ -159,10 +346,7 @@ class GovernanceRepository:
         tenant_id: str | None = None,
     ) -> PaginatedResponse[RequestRecord]:
         with SessionLocal() as session:
-            query = select(RequestTable)
-            if tenant_id:
-                query = query.where(RequestTable.tenant_id == tenant_id)
-            rows = session.scalars(query.order_by(desc(RequestTable.updated_at))).all()
+            records = self._list_canonical_request_records(session, tenant_id=tenant_id)
             workflow_request_ids = None
             if workflow:
                 workflow_request_ids = {
@@ -171,16 +355,6 @@ class GovernanceRepository:
                         select(RunTable).where((RunTable.workflow == workflow) | (RunTable.workflow_identity == workflow))
                     ).all()
                 }
-            request_ids = [row.id for row in rows]
-            projection_rows = (
-                session.scalars(select(ProjectionMappingTable).where(ProjectionMappingTable.entity_type == "request", ProjectionMappingTable.entity_id.in_(request_ids))).all()
-                if request_ids
-                else []
-            )
-        projections_by_request: dict[str, list[ProjectionMappingTable]] = {}
-        for projection_row in projection_rows:
-            projections_by_request.setdefault(projection_row.entity_id, []).append(projection_row)
-        records = [self._request_from_row(row, projections_by_request.get(row.id, [])) for row in rows]
         if status:
             records = [record for record in records if record.status == status]
         if owner_team_id:
@@ -202,6 +376,10 @@ class GovernanceRepository:
     def get_request(self, request_id: str, tenant_id: str | None = None) -> RequestDetail:
         with SessionLocal() as session:
             request_row = session.get(RequestTable, request_id)
+            if request_row is None:
+                from app.persistence.dynamodb_governance_adapter import DynamoDbGovernancePersistenceAdapter
+
+                return DynamoDbGovernancePersistenceAdapter().get_request(request_id, tenant_id)
             self._ensure_request_tenant_access(request_row, tenant_id)
             run_row = session.scalars(select(RunTable).where(RunTable.request_id == request_id).order_by(desc(RunTable.updated_at))).first()
             artifact_rows = session.scalars(select(ArtifactTable).where(ArtifactTable.request_id == request_id).order_by(desc(ArtifactTable.updated_at))).all()
@@ -299,6 +477,43 @@ class GovernanceRepository:
             predecessors=[self._relationship_from_predecessor_row(row) for row in predecessor_rows],
             successors=[self._relationship_from_successor_row(row) for row in successor_rows],
         )
+
+    def list_instructional_workflow_projections(
+        self,
+        page: int,
+        page_size: int,
+        tenant_id: str | None = None,
+        flightos_content_entry_id: str | None = None,
+        template_id: str | None = None,
+        workflow_status: str | None = None,
+    ) -> PaginatedResponse[InstructionalWorkflowProjectionRecord]:
+        with SessionLocal() as session:
+            stmt = select(RequestTable).order_by(desc(RequestTable.updated_at))
+            if tenant_id:
+                stmt = stmt.where(RequestTable.tenant_id == tenant_id)
+            rows = [row for row in session.scalars(stmt).all() if self._is_instructional_template(row.template_id)]
+        projections = [
+            self._build_instructional_projection_from_row(row, self.list_audit_entries(row.id, row.tenant_id))
+            for row in rows
+            if self._instructional_flightos_entry_id(row)
+        ]
+        if flightos_content_entry_id:
+            projections = [projection for projection in projections if projection.flightos_content_entry_id == flightos_content_entry_id]
+        if template_id:
+            projections = [projection for projection in projections if projection.template_id == template_id]
+        if workflow_status:
+            projections = [projection for projection in projections if projection.workflow_status.value == workflow_status]
+        return self._paginate(projections, page, page_size)
+
+    def get_instructional_workflow_projection(self, request_id: str, tenant_id: str | None = None) -> InstructionalWorkflowProjectionRecord:
+        with SessionLocal() as session:
+            row = session.get(RequestTable, request_id)
+            if row is None:
+                raise StopIteration(request_id)
+            self._ensure_request_tenant_access(row, tenant_id)
+            if not self._is_instructional_template(row.template_id):
+                raise ValueError(f"Request {request_id} is not an instructional governance request")
+        return self._build_instructional_projection_from_row(row, self.list_audit_entries(request_id, row.tenant_id))
 
     def list_templates(self, tenant_id: str | None = None, include_non_published: bool = False) -> list[TemplateRecord]:
         with SessionLocal() as session:
@@ -520,6 +735,11 @@ class GovernanceRepository:
                 row.id: row.tenant_id
                 for row in session.scalars(select(RequestTable).where(RequestTable.id.in_([item.request_id for item in rows]))).all()
             } if rows else {}
+            for run_row in rows:
+                if run_row.request_id not in request_tenant_map:
+                    request = get_request_state(run_row.request_id, None)
+                    if request is not None:
+                        request_tenant_map[run_row.request_id] = request.tenant_id
             projection_rows = session.scalars(
                 select(ProjectionMappingTable).where(
                     ProjectionMappingTable.entity_type == "request",
@@ -554,9 +774,9 @@ class GovernanceRepository:
     def get_run(self, run_id: str, tenant_id: str | None = None) -> RunDetail:
         with SessionLocal() as session:
             row = session.get(RunTable, run_id)
-            request_row = None
+            request = None
             if row is not None:
-                request_row = self._ensure_request_access(session, row.request_id, tenant_id)
+                request = self._get_request_record(session, row.request_id, tenant_id)
             dispatch_rows = session.scalars(select(RuntimeDispatchTable).where(RuntimeDispatchTable.run_id == run_id).order_by(desc(RuntimeDispatchTable.dispatched_at))).all()
             signal_rows = session.scalars(select(RuntimeSignalTable).where(RuntimeSignalTable.run_id == run_id).order_by(desc(RuntimeSignalTable.received_at))).all()
             projection_rows = (
@@ -564,12 +784,12 @@ class GovernanceRepository:
                     select(ProjectionMappingTable)
                     .where(
                         ProjectionMappingTable.entity_type == "request",
-                        ProjectionMappingTable.entity_id == request_row.id,
-                        ProjectionMappingTable.tenant_id == request_row.tenant_id,
+                        ProjectionMappingTable.entity_id == request.id,
+                        ProjectionMappingTable.tenant_id == request.tenant_id,
                     )
                     .order_by(desc(ProjectionMappingTable.last_synced_at), desc(ProjectionMappingTable.last_projected_at))
                 ).all()
-                if request_row is not None
+                if request is not None
                 else []
             )
         if row is None:
@@ -581,12 +801,12 @@ class GovernanceRepository:
             run_row = session.get(RunTable, run_id)
             if run_row is None:
                 raise StopIteration(run_id)
-            request_row = self._get_request_row(session, run_row.request_id)
-            self._ensure_request_tenant_access(request_row, tenant_id)
+            request = self._get_request_record(session, run_row.request_id, tenant_id)
+            request_row = session.get(RequestTable, run_row.request_id)
             command = payload.command
             if command not in {"Pause", "Resume", "Retry Step", "Cancel Run"}:
                 raise ValueError(f"Unsupported run command {command}")
-            self._dispatch_run_to_runtime(session, request_row, run_id, command.lower().replace(" ", "_"), payload.actor_id, force=True)
+            self._dispatch_run_to_runtime(session, request, run_id, command.lower().replace(" ", "_"), payload.actor_id, force=True)
             now = datetime.now(timezone.utc)
             if command == "Pause":
                 run_row.status = RunStatus.PAUSED.value
@@ -606,17 +826,21 @@ class GovernanceRepository:
                 run_row.waiting_reason = "Canceled by operator command"
                 run_row.failure_reason = "Run canceled through governance control plane"
                 run_row.current_step_output_summary = "Runtime accepted cancel command."
-                request_row.status = RequestStatus.FAILED.value
-                request_row.updated_at = now
-                request_row.updated_by = payload.actor_id
-                request_row.version += 1
-                self._append_event(
-                    session=session,
-                    request_id=request_row.id,
-                    actor=payload.actor_id,
-                    action="Run Canceled",
-                    reason_or_evidence=payload.reason,
-                )
+                if request_row is not None:
+                    request_row.status = RequestStatus.FAILED.value
+                    request_row.updated_at = now
+                    request_row.updated_by = payload.actor_id
+                    request_row.version += 1
+                    self._append_event(
+                        session=session,
+                        request_id=request_row.id,
+                        actor=payload.actor_id,
+                        action="Run Canceled",
+                        reason_or_evidence=payload.reason,
+                    )
+                else:
+                    update_request_state(run_row.request_id, request.tenant_id, payload.actor_id, status=RequestStatus.FAILED)
+                    record_request_event(run_row.request_id, request.tenant_id, payload.actor_id, "Run Canceled", payload.reason)
             run_row.updated_at = now
             dispatch_rows = session.scalars(select(RuntimeDispatchTable).where(RuntimeDispatchTable.run_id == run_id).order_by(desc(RuntimeDispatchTable.dispatched_at))).all()
             signal_rows = session.scalars(select(RuntimeSignalTable).where(RuntimeSignalTable.run_id == run_id).order_by(desc(RuntimeSignalTable.received_at))).all()
@@ -624,8 +848,8 @@ class GovernanceRepository:
                 select(ProjectionMappingTable)
                 .where(
                     ProjectionMappingTable.entity_type == "request",
-                    ProjectionMappingTable.entity_id == request_row.id,
-                    ProjectionMappingTable.tenant_id == request_row.tenant_id,
+                    ProjectionMappingTable.entity_id == request.id,
+                    ProjectionMappingTable.tenant_id == request.tenant_id,
                 )
                 .order_by(desc(ProjectionMappingTable.last_synced_at), desc(ProjectionMappingTable.last_projected_at))
             ).all()
@@ -638,7 +862,8 @@ class GovernanceRepository:
             run_row = session.get(RunTable, run_id)
             if run_row is None:
                 raise StopIteration(run_id)
-            request_row = self._get_request_row(session, run_row.request_id)
+            request = self._get_request_record(session, run_row.request_id, None)
+            request_row = session.get(RequestTable, run_row.request_id)
             existing_signal = session.scalars(
                 select(RuntimeSignalTable).where(
                     RuntimeSignalTable.run_id == run_id,
@@ -652,8 +877,8 @@ class GovernanceRepository:
                     select(ProjectionMappingTable)
                     .where(
                         ProjectionMappingTable.entity_type == "request",
-                        ProjectionMappingTable.entity_id == request_row.id,
-                        ProjectionMappingTable.tenant_id == request_row.tenant_id,
+                        ProjectionMappingTable.entity_id == request.id,
+                        ProjectionMappingTable.tenant_id == request.tenant_id,
                     )
                     .order_by(desc(ProjectionMappingTable.last_synced_at), desc(ProjectionMappingTable.last_projected_at))
                 ).all()
@@ -661,9 +886,9 @@ class GovernanceRepository:
             now = datetime.now(timezone.utc)
             session.add(
                 RuntimeSignalTable(
-                    tenant_id=request_row.tenant_id,
+                    tenant_id=request.tenant_id,
                     run_id=run_id,
-                    request_id=request_row.id,
+                    request_id=request.id,
                     event_id=payload.event_id,
                     source=payload.source,
                     status=payload.status,
@@ -680,11 +905,11 @@ class GovernanceRepository:
             )
             event_store_service.append(
                 session,
-                tenant_id=request_row.tenant_id,
+                tenant_id=request.tenant_id,
                 event_type=f"runtime.signal.{payload.status}",
                 aggregate_type="run",
                 aggregate_id=run_id,
-                request_id=request_row.id,
+                request_id=request.id,
                 run_id=run_id,
                 actor=payload.source,
                 detail=payload.detail,
@@ -701,24 +926,35 @@ class GovernanceRepository:
             run_row.updated_at = now
 
             if payload.status == RunStatus.COMPLETED.value:
-                request_row.status = RequestStatus.COMPLETED.value
-                request_row.updated_at = now
-                request_row.updated_by = payload.source
-                request_row.version += 1
-                self._update_artifact_review_state(session, request_row.id, artifact_status="completed", review_state="approved", stale_review=False, promotion_relevant=True)
-                self._append_event(session, request_row.id, payload.source, "Runtime Completed", payload.detail)
+                if request_row is not None:
+                    request_row.status = RequestStatus.COMPLETED.value
+                    request_row.updated_at = now
+                    request_row.updated_by = payload.source
+                    request_row.version += 1
+                    self._append_event(session, request_row.id, payload.source, "Runtime Completed", payload.detail)
+                else:
+                    update_request_state(run_row.request_id, request.tenant_id, payload.source, status=RequestStatus.COMPLETED)
+                    record_request_event(run_row.request_id, request.tenant_id, payload.source, "Runtime Completed", payload.detail)
+                self._update_artifact_review_state(session, request.id, artifact_status="completed", review_state="approved", stale_review=False, promotion_relevant=True)
             elif payload.status == RunStatus.FAILED.value:
-                request_row.status = RequestStatus.FAILED.value
-                request_row.updated_at = now
-                request_row.updated_by = payload.source
-                request_row.version += 1
-                self._update_artifact_review_state(session, request_row.id, artifact_status="failed", review_state="pending", stale_review=False, promotion_relevant=True)
-                self._append_event(session, request_row.id, payload.source, "Runtime Failed", payload.detail)
-            elif payload.status == RunStatus.RUNNING.value and request_row.status == RequestStatus.QUEUED.value:
-                request_row.status = RequestStatus.IN_EXECUTION.value
-                request_row.updated_at = now
-                request_row.updated_by = payload.source
-                request_row.version += 1
+                if request_row is not None:
+                    request_row.status = RequestStatus.FAILED.value
+                    request_row.updated_at = now
+                    request_row.updated_by = payload.source
+                    request_row.version += 1
+                    self._append_event(session, request_row.id, payload.source, "Runtime Failed", payload.detail)
+                else:
+                    update_request_state(run_row.request_id, request.tenant_id, payload.source, status=RequestStatus.FAILED)
+                    record_request_event(run_row.request_id, request.tenant_id, payload.source, "Runtime Failed", payload.detail)
+                self._update_artifact_review_state(session, request.id, artifact_status="failed", review_state="pending", stale_review=False, promotion_relevant=True)
+            elif payload.status == RunStatus.RUNNING.value and request.status == RequestStatus.QUEUED.value:
+                if request_row is not None:
+                    request_row.status = RequestStatus.IN_EXECUTION.value
+                    request_row.updated_at = now
+                    request_row.updated_by = payload.source
+                    request_row.version += 1
+                else:
+                    update_request_state(run_row.request_id, request.tenant_id, payload.source, status=RequestStatus.IN_EXECUTION)
 
             session.flush()
             dispatch_rows = session.scalars(select(RuntimeDispatchTable).where(RuntimeDispatchTable.run_id == run_id).order_by(desc(RuntimeDispatchTable.dispatched_at))).all()
@@ -727,8 +963,8 @@ class GovernanceRepository:
                 select(ProjectionMappingTable)
                 .where(
                     ProjectionMappingTable.entity_type == "request",
-                    ProjectionMappingTable.entity_id == request_row.id,
-                    ProjectionMappingTable.tenant_id == request_row.tenant_id,
+                    ProjectionMappingTable.entity_id == request.id,
+                    ProjectionMappingTable.tenant_id == request.tenant_id,
                 )
                 .order_by(desc(ProjectionMappingTable.last_synced_at), desc(ProjectionMappingTable.last_projected_at))
             ).all()
@@ -743,6 +979,11 @@ class GovernanceRepository:
                 row.id: row.tenant_id
                 for row in session.scalars(select(RequestTable).where(RequestTable.id.in_([item.request_id for item in rows]))).all()
             } if rows else {}
+            for artifact_row in rows:
+                if artifact_row.request_id not in request_tenant_map:
+                    request = get_request_state(artifact_row.request_id, None)
+                    if request is not None:
+                        request_tenant_map[artifact_row.request_id] = request.tenant_id
         artifact_rows = [self._artifact_record_from_row(row) for row in rows]
         if tenant_id:
             artifact_rows = [row for row in artifact_rows if request_tenant_map.get(row.request_id) == tenant_id]
@@ -752,7 +993,7 @@ class GovernanceRepository:
         with SessionLocal() as session:
             row = session.get(ArtifactTable, artifact_id)
             if row is not None:
-                self._ensure_request_access(session, row.request_id, tenant_id)
+                self._get_request_record(session, row.request_id, tenant_id)
             event_rows = session.scalars(select(ArtifactEventTable).where(ArtifactEventTable.artifact_id == artifact_id).order_by(ArtifactEventTable.timestamp)).all()
             lineage_rows = session.scalars(select(ArtifactLineageEdgeTable).where(ArtifactLineageEdgeTable.artifact_id == artifact_id).order_by(ArtifactLineageEdgeTable.created_at)).all()
         if row is None:
@@ -771,13 +1012,25 @@ class GovernanceRepository:
     ) -> PaginatedResponse[ReviewQueueItem]:
         with SessionLocal() as session:
             rows = session.scalars(select(ReviewQueueTable).order_by(desc(ReviewQueueTable.priority), ReviewQueueTable.id)).all()
-            request_rows = {
+            sql_request_rows = {
                 row.id: row
                 for row in session.scalars(select(RequestTable).where(RequestTable.id.in_([item.request_id for item in rows]))).all()
             } if rows else {}
+        request_rows: dict[str, RequestTable | RequestRecord] = dict(sql_request_rows)
+        if tenant_id:
+            for queue_row in rows:
+                if queue_row.request_id in request_rows:
+                    continue
+                request_state = get_request_state(queue_row.request_id, tenant_id)
+                if request_state is not None:
+                    request_rows[queue_row.request_id] = request_state
         queue_rows = [self._review_queue_item_from_row(row, request_rows.get(row.request_id)) for row in rows]
         if tenant_id:
-            queue_rows = [row for row in queue_rows if request_rows.get(row.request_id) and request_rows[row.request_id].tenant_id == tenant_id]
+            queue_rows = [
+                row
+                for row in queue_rows
+                if request_rows.get(row.request_id) is not None and request_rows[row.request_id].tenant_id == tenant_id
+            ]
         if assigned_reviewer:
             queue_rows = [row for row in queue_rows if row.assigned_reviewer == assigned_reviewer]
         if blocking_only:
@@ -792,7 +1045,11 @@ class GovernanceRepository:
         with SessionLocal() as session:
             row = session.get(PromotionTable, promotion_id)
             if row is not None:
-                self._ensure_request_access(session, row.request_id, tenant_id)
+                request_row = session.get(RequestTable, row.request_id)
+                if request_row is not None:
+                    self._ensure_request_tenant_access(request_row, tenant_id)
+                elif tenant_id is not None and get_request_state(row.request_id, tenant_id) is None:
+                    raise StopIteration(row.request_id)
             check_rows = session.scalars(select(CheckResultTable).where(CheckResultTable.promotion_id == promotion_id).order_by(CheckResultTable.name)).all()
             override_rows = session.scalars(select(CheckOverrideTable).where(CheckOverrideTable.promotion_id == promotion_id).order_by(CheckOverrideTable.created_at)).all()
             check_run_rows = session.scalars(select(CheckRunTable).where(CheckRunTable.promotion_id == promotion_id).order_by(desc(CheckRunTable.queued_at))).all()
@@ -804,72 +1061,112 @@ class GovernanceRepository:
         return self._promotion_detail_from_row(row, check_rows, override_rows, check_run_rows, deployment_rows)
 
     def record_review_decision(self, review_id: str, payload: ReviewDecisionRequest, tenant_id: str | None = None) -> ReviewQueueItem:
+        if tenant_id is None:
+            raise ValueError("tenant_id is required")
+        request = None
         with SessionLocal() as session:
             review_row = session.get(ReviewQueueTable, review_id)
             if review_row is None:
                 raise StopIteration(review_id)
-            request_row = self._get_request_row(session, review_row.request_id)
-            self._ensure_request_tenant_access(request_row, tenant_id)
+            request = get_request_state(review_row.request_id, tenant_id)
+            if request is None:
+                raise StopIteration(review_row.request_id)
+            request_row = session.get(RequestTable, review_row.request_id)
+            if request_row is not None:
+                self._ensure_request_tenant_access(request_row, tenant_id)
             decision = payload.decision
+            now = datetime.now(timezone.utc)
             if decision == "approve":
                 review_row.blocking_status = "Approved"
                 review_row.stale = False
-                self._update_artifact_review_state(session, request_row.id, artifact_status="approved", review_state="approved", stale_review=False)
-                request_row.status = RequestStatus.APPROVED.value
-                if request_row.current_run_id:
-                    run_row = session.get(RunTable, request_row.current_run_id)
+                self._update_artifact_review_state(session, review_row.request_id, artifact_status="approved", review_state="approved", stale_review=False)
+                if request_row is not None:
+                    request_row.status = RequestStatus.APPROVED.value
+                current_run_id = request_row.current_run_id if request_row is not None else request.current_run_id
+                if current_run_id:
+                    run_row = session.get(RunTable, current_run_id)
                     if run_row is not None:
                         run_row.status = RunStatus.COMPLETED.value
                         run_row.current_step = "Review Approved"
                         run_row.progress_percent = 100
                         run_row.waiting_reason = None
-                        run_row.updated_at = datetime.now(timezone.utc)
+                        run_row.updated_at = now
             elif decision == "changes_requested":
                 review_row.blocking_status = "Changes requested"
                 review_row.stale = True
-                self._update_artifact_review_state(session, request_row.id, artifact_status="changes_requested", review_state="changes_requested", stale_review=True)
-                request_row.status = RequestStatus.CHANGES_REQUESTED.value
+                self._update_artifact_review_state(session, review_row.request_id, artifact_status="changes_requested", review_state="changes_requested", stale_review=True)
+                if request_row is not None:
+                    request_row.status = RequestStatus.CHANGES_REQUESTED.value
             else:
                 raise ValueError(f"Unsupported review decision {decision}")
-            request_row.updated_at = datetime.now(timezone.utc)
-            request_row.updated_by = payload.actor_id
-            request_row.version += 1
-            self._append_event(
-                session=session,
-                request_id=request_row.id,
-                actor=payload.actor_id,
-                action=f"Review {decision.replace('_', ' ').title()}",
-                reason_or_evidence=payload.reason,
-            )
+            if request_row is not None:
+                request_row.updated_at = now
+                request_row.updated_by = payload.actor_id
+                request_row.version += 1
+                self._append_event(
+                    session=session,
+                    request_id=request_row.id,
+                    actor=payload.actor_id,
+                    action=f"Review {decision.replace('_', ' ').title()}",
+                    reason_or_evidence=payload.reason,
+                )
             session.commit()
             session.refresh(review_row)
+            if request_row is None:
+                target_status = RequestStatus.APPROVED if decision == "approve" else RequestStatus.CHANGES_REQUESTED
+                update_request_state(
+                    review_row.request_id,
+                    request.tenant_id,
+                    payload.actor_id,
+                    status=target_status,
+                    updated_at=now,
+                    updated_by=payload.actor_id,
+                )
+                record_request_event(
+                    review_row.request_id,
+                    request.tenant_id,
+                    payload.actor_id,
+                    f"Review {decision.replace('_', ' ').title()}",
+                    payload.reason,
+                    status=target_status.value,
+                )
+                return self._review_queue_item_from_row(review_row, get_request_state(review_row.request_id, request.tenant_id))
             session.refresh(request_row)
             return self._review_queue_item_from_row(review_row, request_row)
 
     def override_review_assignment(self, review_id: str, payload: ReviewAssignmentOverrideRequest, tenant_id: str | None = None) -> ReviewQueueItem:
+        if tenant_id is None:
+            raise ValueError("tenant_id is required")
+        request = None
         with SessionLocal() as session:
             review_row = session.get(ReviewQueueTable, review_id)
             if review_row is None:
                 raise StopIteration(review_id)
-            request_row = self._get_request_row(session, review_row.request_id)
-            self._ensure_request_tenant_access(request_row, tenant_id)
+            request = get_request_state(review_row.request_id, tenant_id)
+            if request is None:
+                raise StopIteration(review_row.request_id)
+            request_row = session.get(RequestTable, review_row.request_id)
+            if request_row is not None:
+                self._ensure_request_tenant_access(request_row, tenant_id)
             previous_reviewer = review_row.assigned_reviewer
             review_row.assigned_reviewer = payload.assigned_reviewer
             review_row.blocking_status = f"Reassigned to {payload.assigned_reviewer}"
-            self._append_event(
-                session=session,
-                request_id=request_row.id,
-                actor=payload.actor_id,
-                action="Review Assignment Overridden",
-                reason_or_evidence=f"{payload.reason}. {previous_reviewer} -> {payload.assigned_reviewer}",
-            )
+            now = datetime.now(timezone.utc)
+            if request_row is not None:
+                self._append_event(
+                    session=session,
+                    request_id=request_row.id,
+                    actor=payload.actor_id,
+                    action="Review Assignment Overridden",
+                    reason_or_evidence=f"{payload.reason}. {previous_reviewer} -> {payload.assigned_reviewer}",
+                )
             event_store_service.append(
                 session,
-                tenant_id=request_row.tenant_id,
+                tenant_id=request.tenant_id,
                 event_type="review.assignment_overridden",
                 aggregate_type="review",
                 aggregate_id=review_row.id,
-                request_id=request_row.id,
+                request_id=review_row.request_id,
                 actor=payload.actor_id,
                 detail=payload.reason,
                 payload={
@@ -878,20 +1175,44 @@ class GovernanceRepository:
                     "to_reviewer": payload.assigned_reviewer,
                 },
             )
-            request_row.updated_at = datetime.now(timezone.utc)
-            request_row.updated_by = payload.actor_id
-            request_row.version += 1
+            if request_row is not None:
+                request_row.updated_at = now
+                request_row.updated_by = payload.actor_id
+                request_row.version += 1
             session.commit()
             session.refresh(review_row)
+            if request_row is None:
+                update_request_state(
+                    review_row.request_id,
+                    request.tenant_id,
+                    payload.actor_id,
+                    updated_at=now,
+                    updated_by=payload.actor_id,
+                )
+                record_request_event(
+                    review_row.request_id,
+                    request.tenant_id,
+                    payload.actor_id,
+                    "Review Assignment Overridden",
+                    f"{payload.reason}. {previous_reviewer} -> {payload.assigned_reviewer}",
+                )
+                return self._review_queue_item_from_row(review_row, get_request_state(review_row.request_id, request.tenant_id))
             return self._review_queue_item_from_row(review_row, request_row)
 
     def apply_promotion_action(self, promotion_id: str, payload: PromotionActionRequest, tenant_id: str | None = None) -> PromotionDetail:
+        if tenant_id is None:
+            raise ValueError("tenant_id is required")
+        request = None
         with SessionLocal() as session:
             promotion_row = session.get(PromotionTable, promotion_id)
             if promotion_row is None:
                 raise StopIteration(promotion_id)
-            request_row = self._get_request_row(session, promotion_row.request_id)
-            self._ensure_request_tenant_access(request_row, tenant_id)
+            request = get_request_state(promotion_row.request_id, tenant_id)
+            if request is None:
+                raise StopIteration(promotion_row.request_id)
+            request_row = session.get(RequestTable, promotion_row.request_id)
+            if request_row is not None:
+                self._ensure_request_tenant_access(request_row, tenant_id)
             check_rows = session.scalars(select(CheckResultTable).where(CheckResultTable.promotion_id == promotion_id)).all()
             override_rows = session.scalars(select(CheckOverrideTable).where(CheckOverrideTable.promotion_id == promotion_id)).all()
             action = payload.action
@@ -902,11 +1223,11 @@ class GovernanceRepository:
                 history.append({"timestamp": now.isoformat().replace("+00:00", "Z"), "actor": payload.actor_id, "action": "Dry run executed"})
                 event_store_service.append(
                     session,
-                    tenant_id=request_row.tenant_id,
+                    tenant_id=request.tenant_id,
                     event_type="promotion.dry_run",
                     aggregate_type="promotion",
                     aggregate_id=promotion_row.id,
-                    request_id=request_row.id,
+                    request_id=promotion_row.request_id,
                     promotion_id=promotion_row.id,
                     actor=payload.actor_id,
                     detail=payload.reason,
@@ -922,11 +1243,11 @@ class GovernanceRepository:
                 history.append({"timestamp": now.isoformat().replace("+00:00", "Z"), "actor": payload.actor_id, "action": "Promotion authorized"})
                 event_store_service.append(
                     session,
-                    tenant_id=request_row.tenant_id,
+                    tenant_id=request.tenant_id,
                     event_type="promotion.authorized",
                     aggregate_type="promotion",
                     aggregate_id=promotion_row.id,
-                    request_id=request_row.id,
+                    request_id=promotion_row.request_id,
                     promotion_id=promotion_row.id,
                     actor=payload.actor_id,
                     detail=payload.reason,
@@ -939,7 +1260,7 @@ class GovernanceRepository:
                     raise ValueError("Promotion cannot execute until required checks pass or are overridden and approvals are approved")
                 integration_row = session.scalars(
                     select(IntegrationTable).where(
-                        IntegrationTable.tenant_id == request_row.tenant_id,
+                        IntegrationTable.tenant_id == request.tenant_id,
                         IntegrationTable.type == "runtime",
                         IntegrationTable.status == "connected",
                     )
@@ -948,17 +1269,17 @@ class GovernanceRepository:
                     raise ValueError("No connected runtime integration is available for this tenant")
                 deployment_payload = {
                     "promotion_id": promotion_row.id,
-                    "request_id": request_row.id,
+                    "request_id": promotion_row.request_id,
                     "target": promotion_row.target,
                     "strategy": promotion_row.strategy,
-                    "artifact_ids": [row.id for row in session.scalars(select(ArtifactTable).where(ArtifactTable.request_id == request_row.id)).all()],
+                    "artifact_ids": [row.id for row in session.scalars(select(ArtifactTable).where(ArtifactTable.request_id == promotion_row.request_id)).all()],
                 }
                 deployment_response = deployment_service.execute(integration_row, deployment_payload)
                 deployment_row = DeploymentExecutionTable(
                     id=self._next_deployment_execution_id(session),
-                    tenant_id=request_row.tenant_id,
+                    tenant_id=request.tenant_id,
                     promotion_id=promotion_row.id,
-                    request_id=request_row.id,
+                    request_id=promotion_row.request_id,
                     integration_id=integration_row.id,
                     target=promotion_row.target,
                     strategy=promotion_row.strategy,
@@ -972,11 +1293,11 @@ class GovernanceRepository:
                 session.add(deployment_row)
                 event_store_service.append(
                     session,
-                    tenant_id=request_row.tenant_id,
+                    tenant_id=request.tenant_id,
                     event_type="promotion.executed",
                     aggregate_type="promotion",
                     aggregate_id=promotion_row.id,
-                    request_id=request_row.id,
+                    request_id=promotion_row.request_id,
                     promotion_id=promotion_row.id,
                     actor=payload.actor_id,
                     detail=str(deployment_response.get("summary", "Deployment executed successfully.")),
@@ -992,11 +1313,12 @@ class GovernanceRepository:
                     approval["state"] = "approved"
                 promotion_row.required_approvals = approvals
                 promotion_row.execution_readiness = f"Promotion executed successfully via {integration_row.name}."
-                request_row.status = RequestStatus.PROMOTED.value
-                request_row.updated_at = now
-                request_row.updated_by = payload.actor_id
-                request_row.version += 1
-                self._update_artifact_review_state(session, request_row.id, artifact_status="promoted", review_state="approved", stale_review=False, promotion_relevant=True)
+                if request_row is not None:
+                    request_row.status = RequestStatus.PROMOTED.value
+                    request_row.updated_at = now
+                    request_row.updated_by = payload.actor_id
+                    request_row.version += 1
+                self._update_artifact_review_state(session, promotion_row.request_id, artifact_status="promoted", review_state="approved", stale_review=False, promotion_relevant=True)
                 history.append(
                     {
                         "timestamp": now.isoformat().replace("+00:00", "Z"),
@@ -1004,17 +1326,35 @@ class GovernanceRepository:
                         "action": f"Promotion executed via {integration_row.name} ({deployment_row.external_reference or deployment_row.id})",
                     }
                 )
-                self._append_event(
-                    session=session,
-                    request_id=request_row.id,
-                    actor=payload.actor_id,
-                    action="Promotion Executed",
-                    reason_or_evidence=f"{payload.reason}; external_reference={deployment_row.external_reference or deployment_row.id}",
-                )
+                if request_row is not None:
+                    self._append_event(
+                        session=session,
+                        request_id=request_row.id,
+                        actor=payload.actor_id,
+                        action="Promotion Executed",
+                        reason_or_evidence=f"{payload.reason}; external_reference={deployment_row.external_reference or deployment_row.id}",
+                    )
             else:
                 raise ValueError(f"Unsupported promotion action {action}")
             promotion_row.promotion_history = history
             session.commit()
+            if request_row is None and action == "execute":
+                update_request_state(
+                    promotion_row.request_id,
+                    request.tenant_id,
+                    payload.actor_id,
+                    status=RequestStatus.PROMOTED,
+                    updated_at=now,
+                    updated_by=payload.actor_id,
+                )
+                record_request_event(
+                    promotion_row.request_id,
+                    request.tenant_id,
+                    payload.actor_id,
+                    "Promotion Executed",
+                    f"{payload.reason}; external_reference={deployment_row.external_reference or deployment_row.id}",
+                    status=RequestStatus.PROMOTED.value,
+                )
             session.refresh(promotion_row)
             refreshed_checks = session.scalars(select(CheckResultTable).where(CheckResultTable.promotion_id == promotion_id).order_by(CheckResultTable.name)).all()
             refreshed_overrides = session.scalars(select(CheckOverrideTable).where(CheckOverrideTable.promotion_id == promotion_id).order_by(CheckOverrideTable.created_at)).all()
@@ -1025,12 +1365,18 @@ class GovernanceRepository:
             return self._promotion_detail_from_row(promotion_row, refreshed_checks, refreshed_overrides, refreshed_runs, refreshed_deployments)
 
     def evaluate_check(self, promotion_id: str, check_id: str, payload: CheckEvaluationRequest, tenant_id: str | None = None) -> PromotionDetail:
+        if tenant_id is None:
+            raise ValueError("tenant_id is required")
         with SessionLocal() as session:
             promotion_row = session.get(PromotionTable, promotion_id)
             if promotion_row is None:
                 raise StopIteration(promotion_id)
-            request_row = self._get_request_row(session, promotion_row.request_id)
-            self._ensure_request_tenant_access(request_row, tenant_id)
+            request = get_request_state(promotion_row.request_id, tenant_id)
+            if request is None:
+                raise StopIteration(promotion_row.request_id)
+            request_row = session.get(RequestTable, promotion_row.request_id)
+            if request_row is not None:
+                self._ensure_request_tenant_access(request_row, tenant_id)
             check_row = session.get(CheckResultTable, check_id)
             if check_row is None or check_row.promotion_id != promotion_id:
                 raise StopIteration(check_id)
@@ -1055,12 +1401,18 @@ class GovernanceRepository:
             )
 
     def override_check(self, promotion_id: str, check_id: str, payload: CheckOverrideRequest, tenant_id: str | None = None) -> PromotionDetail:
+        if tenant_id is None:
+            raise ValueError("tenant_id is required")
         with SessionLocal() as session:
             promotion_row = session.get(PromotionTable, promotion_id)
             if promotion_row is None:
                 raise StopIteration(promotion_id)
-            request_row = self._get_request_row(session, promotion_row.request_id)
-            self._ensure_request_tenant_access(request_row, tenant_id)
+            request = get_request_state(promotion_row.request_id, tenant_id)
+            if request is None:
+                raise StopIteration(promotion_row.request_id)
+            request_row = session.get(RequestTable, promotion_row.request_id)
+            if request_row is not None:
+                self._ensure_request_tenant_access(request_row, tenant_id)
             check_row = session.get(CheckResultTable, check_id)
             if check_row is None or check_row.promotion_id != promotion_id:
                 raise StopIteration(check_id)
@@ -1070,7 +1422,7 @@ class GovernanceRepository:
                 CheckOverrideTable(
                     id=override_id,
                     check_result_id=check_row.id,
-                    request_id=request_row.id,
+                    request_id=promotion_row.request_id,
                     promotion_id=promotion_id,
                     state="approved",
                     reason=payload.reason,
@@ -1096,13 +1448,19 @@ class GovernanceRepository:
             )
 
     def run_promotion_checks(self, promotion_id: str, payload: CheckRunRequest, tenant_id: str | None = None) -> PromotionDetail:
+        if tenant_id is None:
+            raise ValueError("tenant_id is required")
         with SessionLocal() as session:
             promotion_row = session.get(PromotionTable, promotion_id)
             if promotion_row is None:
                 raise StopIteration(promotion_id)
-            request_row = self._get_request_row(session, promotion_row.request_id)
-            self._ensure_request_tenant_access(request_row, tenant_id)
-            check_dispatch_service.enqueue_promotion_checks(session, promotion_id, request_row.id, payload.actor_id, payload.reason)
+            request = get_request_state(promotion_row.request_id, tenant_id)
+            if request is None:
+                raise StopIteration(promotion_row.request_id)
+            request_row = session.get(RequestTable, promotion_row.request_id)
+            if request_row is not None:
+                self._ensure_request_tenant_access(request_row, tenant_id)
+            check_dispatch_service.enqueue_promotion_checks(session, promotion_id, promotion_row.request_id, payload.actor_id, payload.reason)
             history = list(promotion_row.promotion_history)
             history.append(
                 {
@@ -1123,12 +1481,18 @@ class GovernanceRepository:
             )
 
     def override_promotion_approval(self, promotion_id: str, payload: PromotionApprovalOverrideRequest, tenant_id: str | None = None) -> PromotionDetail:
+        if tenant_id is None:
+            raise ValueError("tenant_id is required")
         with SessionLocal() as session:
             promotion_row = session.get(PromotionTable, promotion_id)
             if promotion_row is None:
                 raise StopIteration(promotion_id)
-            request_row = self._get_request_row(session, promotion_row.request_id)
-            self._ensure_request_tenant_access(request_row, tenant_id)
+            request = get_request_state(promotion_row.request_id, tenant_id)
+            if request is None:
+                raise StopIteration(promotion_row.request_id)
+            request_row = session.get(RequestTable, promotion_row.request_id)
+            if request_row is not None:
+                self._ensure_request_tenant_access(request_row, tenant_id)
             approvals = [dict(approval) for approval in promotion_row.required_approvals]
             target_approval = next((approval for approval in approvals if approval.get("reviewer") == payload.reviewer), None)
             if target_approval is None:
@@ -1146,20 +1510,21 @@ class GovernanceRepository:
                 }
             )
             promotion_row.promotion_history = history
-            self._append_event(
-                session=session,
-                request_id=request_row.id,
-                actor=payload.actor_id,
-                action="Promotion Approval Overridden",
-                reason_or_evidence=f"{payload.reason}. {payload.reviewer} -> {payload.replacement_reviewer}",
-            )
+            if request_row is not None:
+                self._append_event(
+                    session=session,
+                    request_id=request_row.id,
+                    actor=payload.actor_id,
+                    action="Promotion Approval Overridden",
+                    reason_or_evidence=f"{payload.reason}. {payload.reviewer} -> {payload.replacement_reviewer}",
+                )
             event_store_service.append(
                 session,
-                tenant_id=request_row.tenant_id,
+                tenant_id=request.tenant_id,
                 event_type="promotion.approval_overridden",
                 aggregate_type="promotion",
                 aggregate_id=promotion_row.id,
-                request_id=request_row.id,
+                request_id=promotion_row.request_id,
                 promotion_id=promotion_row.id,
                 actor=payload.actor_id,
                 detail=payload.reason,
@@ -1170,6 +1535,14 @@ class GovernanceRepository:
                 },
             )
             session.commit()
+            if request_row is None:
+                record_request_event(
+                    promotion_row.request_id,
+                    request.tenant_id,
+                    payload.actor_id,
+                    "Promotion Approval Overridden",
+                    f"{payload.reason}. {payload.reviewer} -> {payload.replacement_reviewer}",
+                )
             session.refresh(promotion_row)
             return self._promotion_detail_from_row(
                 promotion_row,
@@ -1181,12 +1554,15 @@ class GovernanceRepository:
 
     def run_request_checks(self, request_id: str, payload: RequestCheckRun, tenant_id: str | None = None) -> RequestRecord:
         with SessionLocal() as session:
-            row = self._get_request_row(session, request_id)
-            self._ensure_request_tenant_access(row, tenant_id)
+            request = self._get_request_record(session, request_id, tenant_id)
+            row = session.get(RequestTable, request_id)
             check_dispatch_service.enqueue_request_checks(session, request_id, payload.actor_id, payload.reason)
             session.commit()
-            session.refresh(row)
-            return self._request_from_row(row)
+            if row is not None:
+                session.refresh(row)
+                return self._request_from_row(row)
+        refreshed = get_request_state(request_id, request.tenant_id)
+        return refreshed or request
 
     def _promotion_detail_from_row(
         self,
@@ -1286,7 +1662,7 @@ class GovernanceRepository:
     ) -> list[AnalyticsWorkflowRow]:
         with SessionLocal() as session:
             cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-            request_rows = session.scalars(select(RequestTable).where(RequestTable.updated_at >= cutoff)).all()
+            request_rows = self._list_canonical_request_records(session, tenant_id=tenant_id, cutoff=cutoff)
             scope_rows = session.scalars(select(PortfolioScopeTable).where(PortfolioScopeTable.tenant_id == tenant_id)).all() if tenant_id else []
             request_rows = self._filter_request_rows_for_analytics(request_rows, tenant_id, team_id, user_id, portfolio_id, scope_rows)
             request_ids = {row.id for row in request_rows}
@@ -1301,7 +1677,7 @@ class GovernanceRepository:
         grouped: dict[str, dict[str, object]] = {}
         for request_row in request_rows:
             workflow = request_row.workflow_binding_id or request_row.template_id
-            duration = request_row.updated_at - request_row.created_at
+            duration = self._as_utc(request_row.updated_at) - self._as_utc(request_row.created_at)
             bucket = grouped.setdefault(
                 workflow,
                 {
@@ -1365,7 +1741,7 @@ class GovernanceRepository:
             )
             bucket["projection_count"] += 1
             bucket["requests_with_projection"].add(projection_row.entity_id)
-            if projection_service.detect_conflicts(projection_row.id):
+            if projection_service.detect_conflicts(projection_row.id, projection_row.tenant_id):
                 bucket["conflict_count"] += 1
 
         rows: list[AnalyticsWorkflowRow] = []
@@ -1401,7 +1777,7 @@ class GovernanceRepository:
     ) -> list[WorkflowTrendPoint]:
         with SessionLocal() as session:
             cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-            request_rows = session.scalars(select(RequestTable).where(RequestTable.updated_at >= cutoff)).all()
+            request_rows = self._list_canonical_request_records(session, tenant_id=tenant_id, cutoff=cutoff)
             scope_rows = session.scalars(select(PortfolioScopeTable).where(PortfolioScopeTable.tenant_id == tenant_id)).all() if tenant_id else []
             request_rows = self._filter_request_rows_for_analytics(request_rows, tenant_id, team_id, user_id, portfolio_id, scope_rows)
             if workflow:
@@ -1415,14 +1791,14 @@ class GovernanceRepository:
 
         grouped: dict[str, dict[str, float]] = {}
         for request_row in request_rows:
-            period_start = request_row.updated_at.astimezone(timezone.utc).date().isoformat()
+            period_start = self._as_utc(request_row.updated_at).date().isoformat()
             bucket = grouped.setdefault(
                 period_start,
                 {"request_count": 0.0, "failed_count": 0.0, "cycle_hours": 0.0, "review_stale_count": 0.0, "cost_points": 0.0},
             )
             bucket["request_count"] += 1
             bucket["failed_count"] += 1 if request_row.status in {RequestStatus.FAILED.value, RequestStatus.REJECTED.value, RequestStatus.CANCELED.value} else 0
-            bucket["cycle_hours"] += max((request_row.updated_at - request_row.created_at).total_seconds() / 3600, 0.0)
+            bucket["cycle_hours"] += max((self._as_utc(request_row.updated_at) - self._as_utc(request_row.created_at)).total_seconds() / 3600, 0.0)
             bucket["review_stale_count"] += review_stale_by_request.get(request_row.id, 0)
             bucket["cost_points"] += 1.5 if request_row.priority == "high" else 2.25 if request_row.priority == "urgent" else 1.0
 
@@ -1452,7 +1828,7 @@ class GovernanceRepository:
     ) -> list[AnalyticsAgentRow]:
         with SessionLocal() as session:
             cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-            request_rows = session.scalars(select(RequestTable)).all()
+            request_rows = self._list_canonical_request_records(session, tenant_id=tenant_id)
             scope_rows = session.scalars(select(PortfolioScopeTable).where(PortfolioScopeTable.tenant_id == tenant_id)).all() if tenant_id else []
             request_rows = self._filter_request_rows_for_analytics(request_rows, tenant_id, team_id, user_id, portfolio_id, scope_rows)
             request_ids = {row.id for row in request_rows}
@@ -1497,7 +1873,7 @@ class GovernanceRepository:
     ) -> list[AgentTrendPoint]:
         with SessionLocal() as session:
             cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-            request_rows = session.scalars(select(RequestTable)).all()
+            request_rows = self._list_canonical_request_records(session, tenant_id=tenant_id)
             scope_rows = session.scalars(select(PortfolioScopeTable).where(PortfolioScopeTable.tenant_id == tenant_id)).all() if tenant_id else []
             request_rows = self._filter_request_rows_for_analytics(request_rows, tenant_id, team_id, user_id, portfolio_id, scope_rows)
             request_ids = {row.id for row in request_rows}
@@ -1509,7 +1885,7 @@ class GovernanceRepository:
             for owner in owners:
                 if agent and owner != agent:
                     continue
-                period_start = run_row.updated_at.astimezone(timezone.utc).date().isoformat()
+                period_start = self._as_utc(run_row.updated_at).date().isoformat()
                 bucket = grouped.setdefault(
                     period_start,
                     {"invocations": 0.0, "success": 0.0, "retry": 0.0, "duration_minutes": 0.0, "quality": 0.0},
@@ -1539,7 +1915,7 @@ class GovernanceRepository:
     def list_bottleneck_analytics(self, days: int = 30, tenant_id: str | None = None) -> list[AnalyticsBottleneckRow]:
         with SessionLocal() as session:
             cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-            request_rows = session.scalars(select(RequestTable)).all()
+            request_rows = self._list_canonical_request_records(session, tenant_id=tenant_id)
             request_ids = {row.id for row in request_rows if tenant_id is None or row.tenant_id == tenant_id}
             review_rows = [row for row in session.scalars(select(ReviewQueueTable)).all() if row.request_id in request_ids]
             run_rows = [row for row in session.scalars(select(RunTable).where(RunTable.updated_at >= cutoff)).all() if row.request_id in request_ids]
@@ -1571,14 +1947,22 @@ class GovernanceRepository:
         return rows
 
     def list_audit_entries(self, request_id: str, tenant_id: str | None = None) -> list[AuditEntry]:
+        request = get_request_state(request_id, tenant_id) if tenant_id is not None else None
+        if tenant_id is not None and request is None:
+            raise StopIteration(request_id)
+        if request is not None:
+            tenant_id = request.tenant_id
         with SessionLocal() as session:
-            self._ensure_request_access(session, request_id, tenant_id)
+            if request is None:
+                request_row = self._get_request_row(session, request_id)
+                self._ensure_request_tenant_access(request_row, tenant_id)
+                tenant_id = request_row.tenant_id
             rows = session.scalars(select(RequestEventTable).where(RequestEventTable.request_id == request_id).order_by(RequestEventTable.timestamp)).all()
             projection_rows = session.scalars(
                 select(ProjectionMappingTable).where(
                     ProjectionMappingTable.entity_type == "request",
                     ProjectionMappingTable.entity_id == request_id,
-                    ProjectionMappingTable.tenant_id == (tenant_id or session.get(RequestTable, request_id).tenant_id),
+                    ProjectionMappingTable.tenant_id == tenant_id,
                 )
             ).all()
             projection_logs: list[tuple[ProjectionMappingTable, ReconciliationLogTable]] = []
@@ -1595,22 +1979,44 @@ class GovernanceRepository:
                     for log_row in log_rows
                     if log_row.projection_id in projection_by_id
                 ]
-        entries = [
-            AuditEntry(
-                timestamp=row.timestamp.isoformat().replace("+00:00", "Z"),
-                actor=row.actor,
-                action=row.action,
-                object_type=row.object_type,
-                object_id=row.object_id,
-                reason_or_evidence=row.reason_or_evidence,
-                event_class="canonical",
-                source_system="RGP",
-                related_entity_type="request",
-                related_entity_id=request_id,
-                lineage=[f"request:{request_id}", f"{row.object_type}:{row.object_id}"],
-            )
-            for row in rows
-        ]
+        if request is None:
+            entries = [
+                AuditEntry(
+                    timestamp=row.timestamp.isoformat().replace("+00:00", "Z"),
+                    actor=row.actor,
+                    action=row.action,
+                    object_type=row.object_type,
+                    object_id=row.object_id,
+                    reason_or_evidence=row.reason_or_evidence,
+                    event_class="canonical",
+                    source_system="RGP",
+                    related_entity_type="request",
+                    related_entity_id=request_id,
+                    lineage=[f"request:{request_id}", f"{row.object_type}:{row.object_id}"],
+                )
+                for row in rows
+            ]
+        else:
+            from app.persistence.dynamodb_governance_adapter import DynamoDbGovernancePersistenceAdapter
+
+            dynamo_entries = DynamoDbGovernancePersistenceAdapter().list_audit_entries(request_id, tenant_id=request.tenant_id)
+            sql_entries = [
+                AuditEntry(
+                    timestamp=row.timestamp.isoformat().replace("+00:00", "Z"),
+                    actor=row.actor,
+                    action=row.action,
+                    object_type=row.object_type,
+                    object_id=row.object_id,
+                    reason_or_evidence=row.reason_or_evidence,
+                    event_class="canonical",
+                    source_system="RGP",
+                    related_entity_type="request",
+                    related_entity_id=request_id,
+                    lineage=[f"request:{request_id}", f"{row.object_type}:{row.object_id}"],
+                )
+                for row in rows
+            ]
+            entries = dynamo_entries if dynamo_entries else sql_entries
         entries.extend(
             AuditEntry(
                 timestamp=log_row.created_at.isoformat().replace("+00:00", "Z"),
@@ -1641,8 +2047,8 @@ class GovernanceRepository:
             run_row = session.get(RunTable, run_id)
             if run_row is None:
                 raise StopIteration(run_id)
-            request_row = self._ensure_request_access(session, run_row.request_id, tenant_id)
-        entries = self.list_audit_entries(run_row.request_id, request_row.tenant_id)
+            request = self._get_request_record(session, run_row.request_id, tenant_id)
+        entries = self.list_audit_entries(run_row.request_id, request.tenant_id)
         entries.append(
             AuditEntry(
                 timestamp=run_row.updated_at.isoformat().replace("+00:00", "Z"),
@@ -1662,14 +2068,12 @@ class GovernanceRepository:
 
     def list_workflow_audit_entries(self, workflow: str, tenant_id: str | None = None, limit: int = 200) -> list[AuditEntry]:
         with SessionLocal() as session:
-            request_rows = session.scalars(
-                select(RequestTable).where(
-                    (RequestTable.workflow_binding_id == workflow) | (RequestTable.template_id == workflow)
-                )
-            ).all()
-            if tenant_id:
-                request_rows = [row for row in request_rows if row.tenant_id == tenant_id]
-            request_ids = {row.id for row in request_rows}
+            request_records = [
+                row
+                for row in self._list_canonical_request_records(session, tenant_id=tenant_id)
+                if row.workflow_binding_id == workflow or row.template_id == workflow
+            ]
+            request_ids = {row.id for row in request_records}
             run_rows = session.scalars(
                 select(RunTable).where((RunTable.workflow == workflow) | (RunTable.workflow_identity == workflow))
             ).all()
@@ -1872,8 +2276,18 @@ class GovernanceRepository:
         )
 
     def list_request_check_runs(self, request_id: str, tenant_id: str | None = None) -> list[CheckRunRecord]:
+        request = get_request_state(request_id, tenant_id) if tenant_id is not None else None
+        if tenant_id is not None and request is None:
+            raise StopIteration(request_id)
+        if request is not None:
+            from app.persistence.dynamodb_governance_adapter import DynamoDbGovernancePersistenceAdapter
+
+            dynamo_rows = DynamoDbGovernancePersistenceAdapter().list_request_check_runs(request_id, tenant_id=request.tenant_id)
+            if dynamo_rows:
+                return dynamo_rows
         with SessionLocal() as session:
-            self._ensure_request_access(session, request_id, tenant_id)
+            if request is None:
+                self._ensure_request_access(session, request_id, tenant_id)
             rows = session.scalars(select(CheckRunTable).where(CheckRunTable.request_id == request_id).order_by(desc(CheckRunTable.queued_at))).all()
         return [self._check_run_from_row(row) for row in rows]
 
@@ -1882,7 +2296,11 @@ class GovernanceRepository:
             promotion_row = session.get(PromotionTable, promotion_id)
             if promotion_row is None:
                 raise StopIteration(promotion_id)
-            self._ensure_request_access(session, promotion_row.request_id, tenant_id)
+            request_row = session.get(RequestTable, promotion_row.request_id)
+            if request_row is not None:
+                self._ensure_request_tenant_access(request_row, tenant_id)
+            elif tenant_id is not None and get_request_state(promotion_row.request_id, tenant_id) is None:
+                raise StopIteration(promotion_row.request_id)
             rows = session.scalars(select(CheckRunTable).where(CheckRunTable.promotion_id == promotion_id).order_by(desc(CheckRunTable.queued_at))).all()
         return [self._check_run_from_row(row) for row in rows]
 
@@ -1921,9 +2339,8 @@ class GovernanceRepository:
         return records
 
     def list_agent_integrations_for_request(self, request_id: str, tenant_id: str | None = None) -> list[IntegrationRecord]:
-        with SessionLocal() as session:
-            request_row = session.get(RequestTable, request_id)
-            self._ensure_request_tenant_access(request_row, tenant_id)
+        if tenant_id is not None and get_request_state(request_id, tenant_id) is None:
+            raise StopIteration(request_id)
         return [item for item in self.list_integrations(tenant_id) if item.supports_direct_assignment and item.supports_interactive_sessions]
 
     def preview_agent_assignment_context(
@@ -1934,18 +2351,21 @@ class GovernanceRepository:
         agent_operating_profile: str = "general",
         tenant_id: str | None = None,
     ) -> AgentSessionContextDetail:
+        if tenant_id is None:
+            raise ValueError("tenant_id is required")
+        request = get_request_state(request_id, tenant_id)
+        if request is None:
+            raise StopIteration(request_id)
         with SessionLocal() as session:
-            request_row = session.get(RequestTable, request_id)
-            self._ensure_request_tenant_access(request_row, tenant_id)
             integration_row = session.get(IntegrationTable, integration_id)
-            if integration_row is None or integration_row.tenant_id != request_row.tenant_id:
+            if integration_row is None or integration_row.tenant_id != request.tenant_id:
                 raise StopIteration(integration_id)
         bundle = context_bundle_service.preview_bundle(
             request_id=request_id,
             session_id=None,
             bundle_type="assignment_preview",
             assembled_by="system",
-            tenant_id=request_row.tenant_id,
+            tenant_id=request.tenant_id,
         )
         tools, restricted_tools, degraded_tools, warnings = self._build_agent_session_tools(
             integration_row=integration_row,
@@ -1953,6 +2373,8 @@ class GovernanceRepository:
             collaboration_mode=collaboration_mode,
             agent_operating_profile=agent_operating_profile,
         )
+        runtime_subtype = self._runtime_subtype_for_integration(integration_row)
+        session_kind = self._session_kind_for_integration(integration_row)
         bundle.contents = {
             **(bundle.contents or {}),
             "available_tools": [tool.model_dump(mode="json") for tool in tools],
@@ -1964,8 +2386,19 @@ class GovernanceRepository:
                     "integration_name": integration_row.name,
                     "provider": self._provider_for_integration(integration_row),
                     "endpoint": integration_security_service.setting(integration_row, "base_url") or integration_row.endpoint,
+                    "runtime_subtype": runtime_subtype,
+                    "session_kind": session_kind,
                 }
             ],
+            **({
+                "sbcl_agent_runtime": {
+                    "environment_ref": f"environment:{request_id}",
+                    "thread_ref": f"thread:{request_id}",
+                    "turn_ref": f"turn:{request_id}:preview",
+                    "pending_approval_count": 0,
+                    "pending_artifact_count": 0,
+                }
+            } if runtime_subtype == "sbcl_agent" else {}),
         }
         bundle.policy_scope = {
             "collaboration_mode": collaboration_mode,
@@ -1975,8 +2408,26 @@ class GovernanceRepository:
             "degraded_tool_names": [tool.name for tool in degraded_tools],
             "warnings": warnings,
         }
+        preview_row = AgentSessionTable(
+            id=f"preview_{request_id}",
+            tenant_id=bundle.tenant_id,
+            request_id=request_id,
+            integration_id=integration_row.id,
+            agent_label=integration_row.name,
+            collaboration_mode=collaboration_mode,
+            agent_operating_profile=agent_operating_profile,
+            status="preview",
+            awaiting_human=False,
+            summary="Previewing governed agent assignment context",
+            external_session_ref=None,
+            resume_request_status=None,
+            assigned_by=actor_id,
+            assigned_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
         return AgentSessionContextDetail(
             bundle=bundle,
+            governed_runtime=self._governed_runtime_summary(preview_row, integration_row, bundle),
             available_tools=tools,
             restricted_tools=restricted_tools,
             degraded_tools=degraded_tools,
@@ -1985,20 +2436,25 @@ class GovernanceRepository:
         )
 
     def assign_agent_session(self, request_id: str, payload: AssignAgentSessionRequest, tenant_id: str | None = None) -> AgentSessionRecord:
+        if tenant_id is None:
+            raise ValueError("tenant_id is required")
+        request = get_request_state(request_id, tenant_id)
+        if request is None:
+            raise StopIteration(request_id)
         with SessionLocal() as session:
             request_row = session.get(RequestTable, request_id)
-            self._ensure_request_tenant_access(request_row, tenant_id)
             integration_row = session.get(IntegrationTable, payload.integration_id)
-            if integration_row is None or integration_row.tenant_id != request_row.tenant_id:
+            if integration_row is None or integration_row.tenant_id != request.tenant_id:
                 raise StopIteration(payload.integration_id)
             if integration_row.type != "agent_runtime":
                 raise ValueError("Selected integration does not support direct interactive agent assignment")
             now = datetime.now(timezone.utc)
             session_id = f"ags_{request_id}_{int(now.timestamp())}"
             agent_label = payload.agent_label or integration_row.name
+            runtime_subtype = self._runtime_subtype_for_integration(integration_row)
             session_row = AgentSessionTable(
                 id=session_id,
-                tenant_id=request_row.tenant_id,
+                tenant_id=request.tenant_id,
                 request_id=request_id,
                 integration_id=integration_row.id,
                 agent_label=agent_label,
@@ -2006,17 +2462,20 @@ class GovernanceRepository:
                 agent_operating_profile=payload.agent_operating_profile,
                 status="streaming",
                 awaiting_human=False,
-                summary=f"{agent_label} is generating a response",
+                summary=(f"{agent_label} is binding governed sbcl-agent runtime state" if runtime_subtype == "sbcl_agent" else f"{agent_label} is generating a response"),
                 external_session_ref=None,
-                resume_request_status=request_row.status,
+                resume_request_status=request.status.value if hasattr(request.status, "value") else str(request.status),
                 assigned_by=payload.actor_id,
                 assigned_at=now,
                 updated_at=now + timedelta(seconds=1),
             )
             session.add(session_row)
+            session.flush()
+            if runtime_subtype == "sbcl_agent":
+                session_row.external_session_ref = self._ensure_sbcl_agent_environment_ref(session_row, integration_row)
             kickoff_message = AgentSessionMessageTable(
                 id=f"{session_id}_m001",
-                tenant_id=request_row.tenant_id,
+                tenant_id=request.tenant_id,
                 session_id=session_id,
                 request_id=request_id,
                 sender_type="human",
@@ -2028,7 +2487,7 @@ class GovernanceRepository:
             session.add(kickoff_message)
             agent_reply = AgentSessionMessageTable(
                 id=f"{session_id}_m002",
-                tenant_id=request_row.tenant_id,
+                tenant_id=request.tenant_id,
                 session_id=session_id,
                 request_id=request_id,
                 sender_type="agent",
@@ -2038,20 +2497,22 @@ class GovernanceRepository:
                 created_at=now + timedelta(seconds=1),
             )
             session.add(agent_reply)
-            request_row.status = RequestStatus.AWAITING_INPUT.value
-            request_row.updated_at = now
-            request_row.updated_by = payload.actor_id
-            request_row.version += 1
-            self._append_event(
-                session=session,
-                request_id=request_id,
-                actor=payload.actor_id,
-                action="Agent Session Assigned",
-                reason_or_evidence=payload.reason,
-            )
+            if request_row is not None:
+                self._ensure_request_tenant_access(request_row, tenant_id)
+                request_row.status = RequestStatus.AWAITING_INPUT.value
+                request_row.updated_at = now
+                request_row.updated_by = payload.actor_id
+                request_row.version += 1
+                self._append_event(
+                    session=session,
+                    request_id=request_id,
+                    actor=payload.actor_id,
+                    action="Agent Session Assigned",
+                    reason_or_evidence=payload.reason,
+                )
             event_store_service.append(
                 session,
-                tenant_id=request_row.tenant_id,
+                tenant_id=request.tenant_id,
                 event_type="agent_session.assigned",
                 aggregate_type="agent_session",
                 aggregate_id=session_id,
@@ -2065,9 +2526,26 @@ class GovernanceRepository:
                 },
             )
             session.commit()
+            if request_row is None:
+                update_request_state(
+                    request_id,
+                    request.tenant_id,
+                    payload.actor_id,
+                    status=RequestStatus.AWAITING_INPUT,
+                    updated_at=now,
+                    updated_by=payload.actor_id,
+                )
+                record_request_event(
+                    request_id,
+                    request.tenant_id,
+                    payload.actor_id,
+                    "Agent Session Assigned",
+                    payload.reason,
+                    status=RequestStatus.AWAITING_INPUT.value,
+                )
             if payload.collaboration_mode in {"agent_assisted", "agent_led"}:
                 try:
-                    current_mode = collaboration_mode_service.get_current_mode(request_id, request_row.tenant_id)
+                    current_mode = collaboration_mode_service.get_current_mode(request_id, request.tenant_id)
                     if current_mode != payload.collaboration_mode:
                         from app.models.collaboration import SwitchModeRequest
 
@@ -2078,35 +2556,53 @@ class GovernanceRepository:
                                 target_mode=payload.collaboration_mode,
                                 reason="Agent session assignment selected collaboration mode",
                             ),
-                            tenant_id=request_row.tenant_id,
+                            tenant_id=request.tenant_id,
                         )
                 except ValueError:
                     pass
             self._refresh_agent_session_context(
                 request_id=request_id,
                 session_id=session_id,
-                tenant_id=request_row.tenant_id,
+                tenant_id=request.tenant_id,
                 actor_id=payload.actor_id,
                 integration_row=integration_row,
                 collaboration_mode=payload.collaboration_mode,
                 agent_operating_profile=payload.agent_operating_profile,
+                session_row=session_row,
             )
             result = self._agent_session_from_row(session_row, integration_row, [kickoff_message, agent_reply])
         self._start_agent_session_turn_async(request_id, session_id, tenant_id)
         return result
 
     def get_agent_session(self, request_id: str, session_id: str, tenant_id: str | None = None) -> AgentSessionDetail:
+        if tenant_id is None:
+            raise ValueError("tenant_id is required")
+        request = get_request_state(request_id, tenant_id)
+        if request is None:
+            raise StopIteration(request_id)
         with SessionLocal() as session:
-            request_row = session.get(RequestTable, request_id)
-            self._ensure_request_tenant_access(request_row, tenant_id)
             session_row = session.get(AgentSessionTable, session_id)
-            if session_row is None or session_row.request_id != request_id or session_row.tenant_id != request_row.tenant_id:
+            if session_row is None or session_row.request_id != request_id or session_row.tenant_id != request.tenant_id:
                 raise StopIteration(session_id)
             integration_row = session.get(IntegrationTable, session_row.integration_id)
             message_rows = session.scalars(
                 select(AgentSessionMessageTable).where(AgentSessionMessageTable.session_id == session_id).order_by(AgentSessionMessageTable.created_at)
             ).all()
+        bundle = None
+        if self._runtime_subtype_for_integration(integration_row) == "sbcl_agent":
+            bundle = self._refresh_agent_session_context(
+                request_id=request_id,
+                session_id=session_id,
+                tenant_id=request.tenant_id,
+                actor_id=session_row.assigned_by,
+                integration_row=integration_row,
+                collaboration_mode=session_row.collaboration_mode,
+                agent_operating_profile=session_row.agent_operating_profile,
+                session_row=session_row,
+            )
         summary = self._agent_session_from_row(session_row, integration_row, message_rows)
+        if bundle is not None:
+            summary.governed_runtime = self._governed_runtime_summary(session_row, integration_row, bundle)
         return AgentSessionDetail(**summary.model_dump(), messages=[self._agent_message_from_row(row) for row in message_rows])
 
     def get_agent_session_context(
@@ -2115,11 +2611,14 @@ class GovernanceRepository:
         session_id: str,
         tenant_id: str | None = None,
     ) -> AgentSessionContextDetail:
+        if tenant_id is None:
+            raise ValueError("tenant_id is required")
+        request = get_request_state(request_id, tenant_id)
+        if request is None:
+            raise StopIteration(request_id)
         with SessionLocal() as session:
-            request_row = session.get(RequestTable, request_id)
-            self._ensure_request_tenant_access(request_row, tenant_id)
             session_row = session.get(AgentSessionTable, session_id)
-            if session_row is None or session_row.request_id != request_id or session_row.tenant_id != request_row.tenant_id:
+            if session_row is None or session_row.request_id != request_id or session_row.tenant_id != request.tenant_id:
                 raise StopIteration(session_id)
             integration_row = session.get(IntegrationTable, session_row.integration_id)
             bundle_row = (
@@ -2127,7 +2626,7 @@ class GovernanceRepository:
                 .filter(
                     ContextBundleTable.request_id == request_id,
                     ContextBundleTable.session_id == session_id,
-                    ContextBundleTable.tenant_id == request_row.tenant_id,
+                    ContextBundleTable.tenant_id == request.tenant_id,
                 )
                 .order_by(desc(ContextBundleTable.assembled_at))
                 .first()
@@ -2146,11 +2645,12 @@ class GovernanceRepository:
             bundle = self._refresh_agent_session_context(
                 request_id=request_id,
                 session_id=session_id,
-                tenant_id=request_row.tenant_id,
+                tenant_id=request.tenant_id,
                 actor_id=session_row.assigned_by,
                 integration_row=integration_row,
                 collaboration_mode=session_row.collaboration_mode,
                 agent_operating_profile=session_row.agent_operating_profile,
+                session_row=session_row,
             )
             with SessionLocal() as refresh_session:
                 refreshed_access_rows = (
@@ -2162,7 +2662,19 @@ class GovernanceRepository:
                 )
             access_log = [ContextAccessLogRecord.model_validate(row) for row in refreshed_access_rows]
         else:
-            bundle = ContextBundleRecord.model_validate(bundle_row)
+            if self._runtime_subtype_for_integration(integration_row) == "sbcl_agent":
+                bundle = self._refresh_agent_session_context(
+                    request_id=request_id,
+                    session_id=session_id,
+                    tenant_id=request.tenant_id,
+                    actor_id=session_row.assigned_by,
+                    integration_row=integration_row,
+                    collaboration_mode=session_row.collaboration_mode,
+                    agent_operating_profile=session_row.agent_operating_profile,
+                    session_row=session_row,
+                )
+            else:
+                bundle = ContextBundleRecord.model_validate(bundle_row)
             access_log = [ContextAccessLogRecord.model_validate(row) for row in access_rows]
 
         tools, restricted_tools, degraded_tools, warnings = self._build_agent_session_tools(
@@ -2173,6 +2685,7 @@ class GovernanceRepository:
         )
         return AgentSessionContextDetail(
             bundle=bundle,
+            governed_runtime=self._governed_runtime_summary(session_row, integration_row, bundle),
             available_tools=tools,
             restricted_tools=restricted_tools,
             degraded_tools=degraded_tools,
@@ -2187,11 +2700,15 @@ class GovernanceRepository:
         payload: AgentSessionMessageCreateRequest,
         tenant_id: str | None = None,
     ) -> AgentSessionDetail:
+        if tenant_id is None:
+            raise ValueError("tenant_id is required")
+        request = get_request_state(request_id, tenant_id)
+        if request is None:
+            raise StopIteration(request_id)
         with SessionLocal() as session:
             request_row = session.get(RequestTable, request_id)
-            self._ensure_request_tenant_access(request_row, tenant_id)
             session_row = session.get(AgentSessionTable, session_id)
-            if session_row is None or session_row.request_id != request_id or session_row.tenant_id != request_row.tenant_id:
+            if session_row is None or session_row.request_id != request_id or session_row.tenant_id != request.tenant_id:
                 raise StopIteration(session_id)
             integration_row = session.get(IntegrationTable, session_row.integration_id)
             existing_count = session.scalar(
@@ -2200,7 +2717,7 @@ class GovernanceRepository:
             now = datetime.now(timezone.utc)
             human_message = AgentSessionMessageTable(
                 id=f"{session_id}_m{existing_count + 1:03d}",
-                tenant_id=request_row.tenant_id,
+                tenant_id=request.tenant_id,
                 session_id=session_id,
                 request_id=request_id,
                 sender_type="human",
@@ -2212,7 +2729,7 @@ class GovernanceRepository:
             session.add(human_message)
             agent_message = AgentSessionMessageTable(
                 id=f"{session_id}_m{existing_count + 2:03d}",
-                tenant_id=request_row.tenant_id,
+                tenant_id=request.tenant_id,
                 session_id=session_id,
                 request_id=request_id,
                 sender_type="agent",
@@ -2226,20 +2743,22 @@ class GovernanceRepository:
             session_row.awaiting_human = False
             session_row.summary = "Interactive agent response is streaming"
             session_row.updated_at = now + timedelta(seconds=1)
-            request_row.status = RequestStatus.AWAITING_INPUT.value
-            request_row.updated_at = now
-            request_row.updated_by = payload.actor_id
-            request_row.version += 1
-            self._append_event(
-                session=session,
-                request_id=request_id,
-                actor=payload.actor_id,
-                action="Agent Session Message Posted",
-                reason_or_evidence=payload.reason,
-            )
+            if request_row is not None:
+                self._ensure_request_tenant_access(request_row, tenant_id)
+                request_row.status = RequestStatus.AWAITING_INPUT.value
+                request_row.updated_at = now
+                request_row.updated_by = payload.actor_id
+                request_row.version += 1
+                self._append_event(
+                    session=session,
+                    request_id=request_id,
+                    actor=payload.actor_id,
+                    action="Agent Session Message Posted",
+                    reason_or_evidence=payload.reason,
+                )
             event_store_service.append(
                 session,
-                tenant_id=request_row.tenant_id,
+                tenant_id=request.tenant_id,
                 event_type="agent_session.message_posted",
                 aggregate_type="agent_session",
                 aggregate_id=session_id,
@@ -2249,10 +2768,27 @@ class GovernanceRepository:
                 payload={"message_type": payload.message_type},
             )
             session.commit()
+            if request_row is None:
+                update_request_state(
+                    request_id,
+                    request.tenant_id,
+                    payload.actor_id,
+                    status=RequestStatus.AWAITING_INPUT,
+                    updated_at=now,
+                    updated_by=payload.actor_id,
+                )
+                record_request_event(
+                    request_id,
+                    request.tenant_id,
+                    payload.actor_id,
+                    "Agent Session Message Posted",
+                    payload.reason,
+                    status=RequestStatus.AWAITING_INPUT.value,
+                )
             self._refresh_agent_session_context(
                 request_id=request_id,
                 session_id=session_id,
-                tenant_id=request_row.tenant_id,
+                tenant_id=request.tenant_id,
                 actor_id=payload.actor_id,
                 integration_row=integration_row,
                 collaboration_mode=session_row.collaboration_mode,
@@ -2268,26 +2804,32 @@ class GovernanceRepository:
         payload: UpdateAgentSessionGovernanceRequest,
         tenant_id: str | None = None,
     ) -> AgentSessionDetail:
+        if tenant_id is None:
+            raise ValueError("tenant_id is required")
+        request = get_request_state(request_id, tenant_id)
+        if request is None:
+            raise StopIteration(request_id)
         with SessionLocal() as session:
             request_row = session.get(RequestTable, request_id)
-            self._ensure_request_tenant_access(request_row, tenant_id)
             session_row = session.get(AgentSessionTable, session_id)
-            if session_row is None or session_row.request_id != request_id or session_row.tenant_id != request_row.tenant_id:
+            if session_row is None or session_row.request_id != request_id or session_row.tenant_id != request.tenant_id:
                 raise StopIteration(session_id)
             integration_row = session.get(IntegrationTable, session_row.integration_id)
             session_row.collaboration_mode = payload.collaboration_mode
             session_row.agent_operating_profile = payload.agent_operating_profile
             session_row.updated_at = datetime.now(timezone.utc)
-            self._append_event(
-                session=session,
-                request_id=request_id,
-                actor=payload.actor_id,
-                action="Agent Session Governance Updated",
-                reason_or_evidence=payload.reason,
-            )
+            if request_row is not None:
+                self._ensure_request_tenant_access(request_row, tenant_id)
+                self._append_event(
+                    session=session,
+                    request_id=request_id,
+                    actor=payload.actor_id,
+                    action="Agent Session Governance Updated",
+                    reason_or_evidence=payload.reason,
+                )
             event_store_service.append(
                 session,
-                tenant_id=request_row.tenant_id,
+                tenant_id=request.tenant_id,
                 event_type="agent_session.governance_updated",
                 aggregate_type="agent_session",
                 aggregate_id=session_id,
@@ -2300,8 +2842,16 @@ class GovernanceRepository:
                 },
             )
             session.commit()
+            if request_row is None:
+                record_request_event(
+                    request_id,
+                    request.tenant_id,
+                    payload.actor_id,
+                    "Agent Session Governance Updated",
+                    payload.reason,
+                )
             try:
-                current_mode = collaboration_mode_service.get_current_mode(request_id, request_row.tenant_id)
+                current_mode = collaboration_mode_service.get_current_mode(request_id, request.tenant_id)
                 if current_mode != payload.collaboration_mode:
                     from app.models.collaboration import SwitchModeRequest
 
@@ -2310,16 +2860,16 @@ class GovernanceRepository:
                         payload=SwitchModeRequest(
                             actor_id=payload.actor_id,
                             target_mode=payload.collaboration_mode,
-                            reason="Agent session governance updated collaboration mode",
-                        ),
-                        tenant_id=request_row.tenant_id,
-                    )
+                                reason="Agent session governance updated collaboration mode",
+                            ),
+                            tenant_id=request.tenant_id,
+                        )
             except ValueError:
                 pass
             self._refresh_agent_session_context(
                 request_id=request_id,
                 session_id=session_id,
-                tenant_id=request_row.tenant_id,
+                tenant_id=request.tenant_id,
                 actor_id=payload.actor_id,
                 integration_row=integration_row,
                 collaboration_mode=payload.collaboration_mode,
@@ -2334,47 +2884,85 @@ class GovernanceRepository:
         payload: CompleteAgentSessionRequest,
         tenant_id: str | None = None,
     ) -> AgentSessionDetail:
+        if tenant_id is None:
+            raise ValueError("tenant_id is required")
+        request = get_request_state(request_id, tenant_id)
+        if request is None:
+            raise StopIteration(request_id)
         with SessionLocal() as session:
             request_row = session.get(RequestTable, request_id)
-            self._ensure_request_tenant_access(request_row, tenant_id)
             session_row = session.get(AgentSessionTable, session_id)
-            if session_row is None or session_row.request_id != request_id or session_row.tenant_id != request_row.tenant_id:
+            if session_row is None or session_row.request_id != request_id or session_row.tenant_id != request.tenant_id:
                 raise StopIteration(session_id)
             if session_row.status == "streaming":
                 raise ValueError("Cannot accept the session while the agent response is still streaming")
+            integration_row = session.get(IntegrationTable, session_row.integration_id)
+            runtime_subtype = self._runtime_subtype_for_integration(integration_row)
+            completion_action = (payload.completion_action or "accept_response").strip().lower()
+            if completion_action in {"resume_runtime", "approve_runtime_checkpoint"} and runtime_subtype != "sbcl_agent":
+                raise ValueError("Specialized runtime completion actions require an sbcl-agent governed runtime session")
             target_status = payload.target_status or session_row.resume_request_status
             if not target_status or target_status == RequestStatus.AWAITING_INPUT.value:
-                target_status = RequestStatus.IN_EXECUTION.value if request_row.current_run_id else RequestStatus.PLANNED.value
+                target_status = RequestStatus.IN_EXECUTION.value if request.current_run_id else RequestStatus.PLANNED.value
 
             session_row.status = "completed"
             session_row.awaiting_human = False
-            session_row.summary = f"Accepted response and resumed {target_status.replace('_', ' ')}"
+            if completion_action == "resume_runtime":
+                session_row.summary = f"Approved runtime continuation and resumed {target_status.replace('_', ' ')}"
+                event_type = "agent_session.runtime_resumed"
+                action_label = "Agent Runtime Resumed"
+            elif completion_action == "approve_runtime_checkpoint":
+                session_row.summary = "Approved governed sbcl-agent runtime checkpoint"
+                event_type = "agent_session.runtime_checkpoint_approved"
+                action_label = "Agent Runtime Checkpoint Approved"
+            else:
+                session_row.summary = f"Accepted response and resumed {target_status.replace('_', ' ')}"
+                event_type = "agent_session.completed"
+                action_label = "Agent Session Completed"
             session_row.updated_at = datetime.now(timezone.utc)
 
-            request_row.status = target_status
-            request_row.updated_at = datetime.now(timezone.utc)
-            request_row.updated_by = payload.actor_id
-            request_row.version += 1
+            if request_row is not None:
+                self._ensure_request_tenant_access(request_row, tenant_id)
+                request_row.status = target_status
+                request_row.updated_at = datetime.now(timezone.utc)
+                request_row.updated_by = payload.actor_id
+                request_row.version += 1
 
-            self._append_event(
-                session=session,
-                request_id=request_id,
-                actor=payload.actor_id,
-                action="Agent Session Completed",
-                reason_or_evidence=payload.reason,
-            )
+                self._append_event(
+                    session=session,
+                    request_id=request_id,
+                    actor=payload.actor_id,
+                    action=action_label,
+                    reason_or_evidence=payload.reason,
+                )
             event_store_service.append(
                 session,
-                tenant_id=request_row.tenant_id,
-                event_type="agent_session.completed",
+                tenant_id=request.tenant_id,
+                event_type=event_type,
                 aggregate_type="agent_session",
                 aggregate_id=session_id,
                 request_id=request_id,
                 actor=payload.actor_id,
                 detail=payload.reason,
-                payload={"target_status": target_status},
+                payload={"target_status": target_status, "completion_action": completion_action, "runtime_subtype": runtime_subtype},
             )
             session.commit()
+            if request_row is None:
+                update_request_state(
+                    request_id,
+                    request.tenant_id,
+                    payload.actor_id,
+                    status=RequestStatus(target_status),
+                    updated_by=payload.actor_id,
+                )
+                record_request_event(
+                    request_id,
+                    request.tenant_id,
+                    payload.actor_id,
+                    action_label,
+                    payload.reason,
+                    status=target_status,
+                )
         return self.get_agent_session(request_id, session_id, tenant_id)
 
     def stream_agent_session_response(
@@ -2439,11 +3027,13 @@ class GovernanceRepository:
     def _execute_agent_session_turn(self, request_id: str, session_id: str, tenant_id: str | None = None) -> None:
         try:
             with SessionLocal() as session:
-                request_row = session.get(RequestTable, request_id)
-                self._ensure_request_tenant_access(request_row, tenant_id)
                 session_row = session.get(AgentSessionTable, session_id)
-                if session_row is None or session_row.request_id != request_id or session_row.tenant_id != request_row.tenant_id:
+                if session_row is None or session_row.request_id != request_id:
                     raise StopIteration(session_id)
+                effective_tenant_id = tenant_id or session_row.tenant_id
+                request = get_request_state(request_id, effective_tenant_id)
+                if request is None or session_row.tenant_id != request.tenant_id:
+                    raise StopIteration(request_id)
                 if session_row.status != "streaming":
                     return
                 integration_row = session.get(IntegrationTable, session_row.integration_id)
@@ -2463,7 +3053,7 @@ class GovernanceRepository:
                     .filter(
                         ContextBundleTable.request_id == request_id,
                         ContextBundleTable.session_id == session_id,
-                        ContextBundleTable.tenant_id == request_row.tenant_id,
+                        ContextBundleTable.tenant_id == request.tenant_id,
                     )
                     .order_by(desc(ContextBundleTable.assembled_at))
                     .first()
@@ -2539,7 +3129,7 @@ class GovernanceRepository:
                 if is_initial_turn:
                     provider_stream = agent_provider_service.stream_start_session(
                         integration=integration_row,
-                        request_title=request_row.title,
+                        request_title=request.title,
                         initial_prompt=latest_human_message.body,
                         transcript=self._agent_transcript_from_rows(transcript_rows),
                         context_bundle=context_bundle,
@@ -2563,23 +3153,137 @@ class GovernanceRepository:
                     session.flush()
                     session.commit()
 
-                session_row.status = "waiting_on_human"
-                session_row.awaiting_human = True
-                session_row.summary = f"{session_row.agent_label} requested follow-up guidance"
-                session_row.updated_at = datetime.now(timezone.utc)
-                session.flush()
+                transitioned_at = datetime.now(timezone.utc)
+                transition_result = session.execute(
+                    update(AgentSessionTable)
+                    .where(
+                        AgentSessionTable.id == session_id,
+                        AgentSessionTable.status == "streaming",
+                    )
+                    .values(
+                        status="waiting_on_human",
+                        awaiting_human=True,
+                        summary=f"{session_row.agent_label} requested follow-up guidance",
+                        updated_at=transitioned_at,
+                    )
+                )
+                if transition_result.rowcount == 0:
+                    session.rollback()
+                    return
                 session.commit()
         except Exception as exc:
             with SessionLocal() as session:
-                request_row = session.get(RequestTable, request_id)
-                session_row = session.get(AgentSessionTable, session_id)
-                if request_row is None or session_row is None:
+                failure_result = session.execute(
+                    update(AgentSessionTable)
+                    .where(
+                        AgentSessionTable.id == session_id,
+                        AgentSessionTable.status == "streaming",
+                    )
+                    .values(
+                        status="failed",
+                        awaiting_human=True,
+                        summary=f"Agent streaming failed: {exc}",
+                        updated_at=datetime.now(timezone.utc),
+                    )
+                )
+                if failure_result.rowcount == 0:
+                    session.rollback()
                     return
-                session_row.status = "failed"
-                session_row.awaiting_human = True
-                session_row.summary = f"Agent streaming failed: {exc}"
-                session_row.updated_at = datetime.now(timezone.utc)
                 session.commit()
+
+    def import_agent_session_artifact(
+        self,
+        request_id: str,
+        session_id: str,
+        payload: ImportAgentSessionArtifactRequest,
+        tenant_id: str | None = None,
+    ) -> ArtifactDetail:
+        if tenant_id is None:
+            raise ValueError("tenant_id is required")
+        request = get_request_state(request_id, tenant_id)
+        if request is None:
+            raise StopIteration(request_id)
+        now = datetime.now(timezone.utc)
+        with SessionLocal() as session:
+            session_row = session.get(AgentSessionTable, session_id)
+            if session_row is None or session_row.request_id != request_id or session_row.tenant_id != request.tenant_id:
+                raise StopIteration(session_id)
+            integration_row = session.get(IntegrationTable, session_row.integration_id)
+            if self._runtime_subtype_for_integration(integration_row) != "sbcl_agent":
+                raise ValueError("Artifact import rules are currently specialized for sbcl-agent governed runtime sessions")
+            artifact_id = f"art_{uuid4().hex[:12]}"
+            version_id = f"av_{uuid4().hex[:12]}"
+            content_ref = None
+            if payload.content:
+                content_ref = self._artifact_content_ref(artifact_id, version_id)
+                object_store_service.put_text(content_ref, payload.content)
+            defaults = self._artifact_import_defaults(payload)
+            artifact_row = ArtifactTable(
+                id=artifact_id,
+                type=payload.artifact_type,
+                name=payload.title,
+                current_version="v1",
+                status=defaults["status"],
+                request_id=request_id,
+                updated_at=now,
+                owner=payload.actor_id,
+                review_state=defaults["review_state"],
+                promotion_relevant=defaults["promotion_relevant"],
+                versions=[
+                    {
+                        "id": version_id,
+                        "label": "v1",
+                        "status": defaults["status"],
+                        "created_at": now.isoformat().replace("+00:00", "Z"),
+                        "author": payload.actor_id,
+                        "summary": payload.summary,
+                        "content": payload.content if payload.content and content_ref is None else None,
+                        "content_ref": content_ref,
+                        "path": payload.path,
+                        "source_ref": payload.source_ref,
+                        "image_ref": payload.image_ref,
+                        "artifact_key": self._normalize_artifact_key(payload.artifact_key),
+                        "import_rule": "sbcl_agent_governed_runtime",
+                        "session_id": session_id,
+                    }
+                ],
+                selected_version_id=version_id,
+                stale_review=False,
+            )
+            session.add(artifact_row)
+            session.flush()
+            self._append_artifact_event(
+                session,
+                artifact_id=artifact_id,
+                artifact_version_id=version_id,
+                actor=payload.actor_id,
+                action="imported_from_agent_session",
+                detail=payload.reason,
+            )
+            self._append_artifact_lineage(
+                session,
+                artifact_id=artifact_id,
+                from_version_id=(payload.source_ref or session_row.external_session_ref or session_id)[:64],
+                to_version_id=version_id,
+                relation="imported_from_sbcl_agent_session",
+            )
+            event_store_service.append(
+                session,
+                tenant_id=request.tenant_id,
+                event_type="artifact.imported_from_agent_session",
+                aggregate_type="artifact",
+                aggregate_id=artifact_id,
+                request_id=request_id,
+                artifact_id=artifact_id,
+                actor=payload.actor_id,
+                detail=payload.reason,
+                payload={"session_id": session_id, "artifact_key": payload.artifact_key, "runtime_subtype": "sbcl_agent"},
+            )
+            session.commit()
+            session.refresh(artifact_row)
+            event_rows = session.scalars(select(ArtifactEventTable).where(ArtifactEventTable.artifact_id == artifact_id).order_by(ArtifactEventTable.timestamp)).all()
+            lineage_rows = session.scalars(select(ArtifactLineageEdgeTable).where(ArtifactLineageEdgeTable.artifact_id == artifact_id).order_by(ArtifactLineageEdgeTable.created_at)).all()
+            return self._artifact_detail_from_row(artifact_row, event_rows, lineage_rows)
 
     def create_integration(self, payload: CreateIntegrationRequest, tenant_id: str) -> IntegrationRecord:
         with SessionLocal() as session:
@@ -3065,7 +3769,7 @@ class GovernanceRepository:
             scope_rows = session.scalars(select(PortfolioScopeTable).where(PortfolioScopeTable.tenant_id == tenant_id)).all()
             team_rows = session.scalars(select(TeamTable).where(TeamTable.tenant_id == tenant_id)).all()
             membership_rows = session.scalars(select(TeamMembershipTable).where(TeamMembershipTable.tenant_id == tenant_id)).all()
-            request_rows = session.scalars(select(RequestTable).where(RequestTable.tenant_id == tenant_id)).all()
+            request_rows = self._list_canonical_request_records(session, tenant_id=tenant_id)
             deployment_rows = session.scalars(select(DeploymentExecutionTable).where(DeploymentExecutionTable.tenant_id == tenant_id)).all()
         scopes_by_portfolio: dict[str, set[str]] = {}
         for scope in scope_rows:
@@ -3117,7 +3821,7 @@ class GovernanceRepository:
         user_id: str | None = None,
     ) -> list[DeliveryDoraRow]:
         with SessionLocal() as session:
-            request_rows = session.scalars(select(RequestTable).where(RequestTable.tenant_id == tenant_id)).all()
+            request_rows = self._list_canonical_request_records(session, tenant_id=tenant_id)
             deployment_rows = session.scalars(select(DeploymentExecutionTable).where(DeploymentExecutionTable.tenant_id == tenant_id)).all()
             signal_rows = session.scalars(select(RuntimeSignalTable).where(RuntimeSignalTable.tenant_id == tenant_id)).all()
             scope_rows = session.scalars(select(PortfolioScopeTable).where(PortfolioScopeTable.tenant_id == tenant_id)).all()
@@ -3145,7 +3849,7 @@ class GovernanceRepository:
         restored_at_by_request: dict[str, datetime] = {}
         for signal in signal_rows:
             if signal.status == "completed":
-                restored_at_by_request[signal.request_id] = signal.received_at
+                restored_at_by_request[signal.request_id] = self._as_utc(signal.received_at)
 
         rows: list[DeliveryDoraRow] = []
         for (scope_type, scope_key), scoped_requests in request_ids_by_scope.items():
@@ -3154,11 +3858,11 @@ class GovernanceRepository:
             deployed_requests = [row for row in scoped_requests if row.status in {RequestStatus.PROMOTED.value, RequestStatus.COMPLETED.value}]
             failures = [row for row in scoped_requests if row.status == RequestStatus.FAILED.value]
             lead_times = [
-                max((row.updated_at - row.created_at).total_seconds() / 3600, 0.0)
+                max((self._as_utc(row.updated_at) - self._as_utc(row.created_at)).total_seconds() / 3600, 0.0)
                 for row in deployed_requests
             ]
             mttrs = [
-                max((restored_at_by_request[row.id] - row.updated_at).total_seconds() / 3600, 0.0)
+                max((restored_at_by_request[row.id] - self._as_utc(row.updated_at)).total_seconds() / 3600, 0.0)
                 for row in failures
                 if row.id in restored_at_by_request
             ]
@@ -3183,7 +3887,7 @@ class GovernanceRepository:
         user_id: str | None = None,
     ) -> list[DeliveryLifecycleRow]:
         with SessionLocal() as session:
-            request_rows = session.scalars(select(RequestTable).where(RequestTable.tenant_id == tenant_id)).all()
+            request_rows = self._list_canonical_request_records(session, tenant_id=tenant_id)
             run_rows = session.scalars(select(RunTable)).all()
             review_rows = session.scalars(select(ReviewQueueTable)).all()
             promotion_rows = session.scalars(select(PromotionTable)).all()
@@ -3211,7 +3915,7 @@ class GovernanceRepository:
         for (scope_type, scope_key), scoped_requests in scoped_requests_by_scope.items():
             if not scoped_requests:
                 continue
-            throughput = sum(1 for row in scoped_requests if row.created_at >= cutoff)
+            throughput = sum(1 for row in scoped_requests if self._as_utc(row.created_at) >= cutoff)
             lead_times: list[float] = []
             cycle_times: list[float] = []
             execution_times: list[float] = []
@@ -3222,9 +3926,9 @@ class GovernanceRepository:
 
             for request_row in scoped_requests:
                 if request_row.status in {RequestStatus.COMPLETED.value, RequestStatus.PROMOTED.value, RequestStatus.PROMOTION_PENDING.value, RequestStatus.APPROVED.value}:
-                    lead_times.append(max((request_row.updated_at - request_row.created_at).total_seconds() / 3600, 0.0))
+                    lead_times.append(max((self._as_utc(request_row.updated_at) - self._as_utc(request_row.created_at)).total_seconds() / 3600, 0.0))
                 if request_row.status not in {RequestStatus.DRAFT.value, RequestStatus.CANCELED.value, RequestStatus.VALIDATION_FAILED.value}:
-                    cycle_times.append(max((request_row.updated_at - request_row.created_at).total_seconds() / 3600, 0.0))
+                    cycle_times.append(max((self._as_utc(request_row.updated_at) - self._as_utc(request_row.created_at)).total_seconds() / 3600, 0.0))
 
                 request_runs = runs_by_request.get(request_row.id, [])
                 for run in request_runs:
@@ -3235,7 +3939,7 @@ class GovernanceRepository:
                     enqueue = next((row for row in run_dispatches if row.dispatch_type == "enqueue"), None)
                     start = next((row for row in run_dispatches if row.dispatch_type == "start"), None)
                     if enqueue and start:
-                        queue_times.append(max((start.dispatched_at - enqueue.dispatched_at).total_seconds() / 3600, 0.0))
+                        queue_times.append(max((self._as_utc(start.dispatched_at) - self._as_utc(enqueue.dispatched_at)).total_seconds() / 3600, 0.0))
 
                 request_reviews = reviews_by_request.get(request_row.id, [])
                 if request_reviews:
@@ -3281,7 +3985,7 @@ class GovernanceRepository:
     ) -> list[DeliveryTrendPoint]:
         with SessionLocal() as session:
             cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-            request_rows = session.scalars(select(RequestTable).where(RequestTable.tenant_id == tenant_id, RequestTable.updated_at >= cutoff)).all()
+            request_rows = self._list_canonical_request_records(session, tenant_id=tenant_id, cutoff=cutoff)
             deployment_rows = session.scalars(select(DeploymentExecutionTable).where(DeploymentExecutionTable.tenant_id == tenant_id)).all()
             scope_rows = session.scalars(select(PortfolioScopeTable).where(PortfolioScopeTable.tenant_id == tenant_id)).all()
         request_rows = self._filter_request_rows_for_analytics(request_rows, tenant_id, team_id, user_id, portfolio_id, scope_rows)
@@ -3289,7 +3993,7 @@ class GovernanceRepository:
         deployment_request_ids = {row.request_id for row in deployment_rows if row.status == "succeeded"}
         grouped: dict[str, dict[str, float]] = {}
         for row in request_rows:
-            period_start = row.updated_at.astimezone(timezone.utc).date().isoformat()
+            period_start = self._as_utc(row.updated_at).date().isoformat()
             bucket = grouped.setdefault(
                 period_start,
                 {"completed": 0.0, "failed": 0.0, "deployments": 0.0, "throughput": 0.0, "lead_time_hours": 0.0, "lead_time_count": 0.0},
@@ -3299,7 +4003,7 @@ class GovernanceRepository:
             bucket["failed"] += 1 if row.status == RequestStatus.FAILED.value else 0
             bucket["deployments"] += 1 if row.id in deployment_request_ids else 0
             if row.status in {RequestStatus.COMPLETED.value, RequestStatus.PROMOTED.value, RequestStatus.PROMOTION_PENDING.value, RequestStatus.APPROVED.value}:
-                bucket["lead_time_hours"] += max((row.updated_at - row.created_at).total_seconds() / 3600, 0.0)
+                bucket["lead_time_hours"] += max((self._as_utc(row.updated_at) - self._as_utc(row.created_at)).total_seconds() / 3600, 0.0)
                 bucket["lead_time_count"] += 1
 
         rows: list[DeliveryTrendPoint] = []
@@ -3374,7 +4078,7 @@ class GovernanceRepository:
     def get_performance_operations_summary(self, tenant_id: str) -> PerformanceOperationsSummary:
         now = datetime.now(timezone.utc)
         with SessionLocal() as session:
-            requests = session.scalars(select(RequestTable).where(RequestTable.tenant_id == tenant_id)).all()
+            requests = self._list_canonical_request_records(session, tenant_id=tenant_id)
             runtime_dispatches = session.scalars(select(RuntimeDispatchTable).where(RuntimeDispatchTable.tenant_id == tenant_id)).all()
             request_ids = {row.id for row in requests}
             promotions = session.scalars(select(PromotionTable)).all()
@@ -3410,7 +4114,7 @@ class GovernanceRepository:
             enqueue = next((row for row in ordered if row.dispatch_type == "enqueue"), None)
             start = next((row for row in ordered if row.dispatch_type == "start"), None)
             if enqueue and start:
-                runtime_queue_minutes.append(max((start.dispatched_at - enqueue.dispatched_at).total_seconds() / 60, 0.0))
+                runtime_queue_minutes.append(max((self._as_utc(start.dispatched_at) - self._as_utc(enqueue.dispatched_at)).total_seconds() / 60, 0.0))
 
         return PerformanceOperationsSummary(
             queued_checks=len(queued_checks),
@@ -3426,7 +4130,7 @@ class GovernanceRepository:
     def list_performance_operations_trends(self, tenant_id: str, days: int = 30) -> list[PerformanceOperationsTrendPoint]:
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         with SessionLocal() as session:
-            requests = session.scalars(select(RequestTable).where(RequestTable.tenant_id == tenant_id, RequestTable.updated_at >= cutoff)).all()
+            requests = self._list_canonical_request_records(session, tenant_id=tenant_id, cutoff=cutoff)
             request_map = {row.id: row for row in requests}
             request_ids = {row.id for row in requests}
             promotions = session.scalars(select(PromotionTable)).all()
@@ -3457,14 +4161,14 @@ class GovernanceRepository:
             )
 
         for row in check_runs:
-            current = bucket(row.queued_at.astimezone(timezone.utc).date().isoformat())
+            current = bucket(self._as_utc(row.queued_at).date().isoformat())
             if row.status == "queued":
                 current["queued_checks"] += 1
             if row.status == "running":
                 current["running_checks"] += 1
 
         for row in requests:
-            current = bucket(row.updated_at.astimezone(timezone.utc).date().isoformat())
+            current = bucket(self._as_utc(row.updated_at).date().isoformat())
             if row.status in {RequestStatus.QUEUED.value, RequestStatus.AWAITING_INPUT.value, RequestStatus.AWAITING_REVIEW.value}:
                 current["waiting_runs"] += 1
             if row.status == RequestStatus.FAILED.value:
@@ -3474,7 +4178,7 @@ class GovernanceRepository:
             request_row = request_map.get(row.request_id)
             if request_row is None:
                 continue
-            current = bucket(request_row.updated_at.astimezone(timezone.utc).date().isoformat())
+            current = bucket(self._as_utc(request_row.updated_at).date().isoformat())
             if row.stale:
                 current["stale_reviews"] += 1
 
@@ -3491,7 +4195,7 @@ class GovernanceRepository:
                 continue
             if latest < cutoff:
                 continue
-            current = bucket(latest.astimezone(timezone.utc).date().isoformat())
+            current = bucket(self._as_utc(latest).date().isoformat())
             if any(str(approval.get("state", "")).lower() == "pending" for approval in (row.required_approvals or [])):
                 current["pending_promotions"] += 1
 
@@ -3541,6 +4245,45 @@ class GovernanceRepository:
             filtered = [row for row in filtered if row.owner_user_id == user_id or row.submitter_id == user_id]
         return filtered
 
+    def _list_canonical_request_records(
+        self,
+        session,
+        tenant_id: str | None = None,
+        cutoff: datetime | None = None,
+    ) -> list[RequestRecord]:
+        query = select(RequestTable)
+        if tenant_id is not None:
+            query = query.where(RequestTable.tenant_id == tenant_id)
+        if cutoff is not None:
+            query = query.where(RequestTable.updated_at >= cutoff)
+        sql_rows = session.scalars(query).all()
+        records: dict[str, RequestRecord] = {
+            row.id: self._request_from_row(row)
+            for row in sql_rows
+        }
+
+        request_backend = (settings.request_persistence_backend or settings.persistence_backend or "sqlalchemy").lower()
+        if request_backend != "dynamodb":
+            return sorted(records.values(), key=lambda row: row.updated_at, reverse=True)
+
+        from app.persistence.dynamodb_governance_adapter import DynamoDbGovernancePersistenceAdapter
+
+        dynamodb_adapter = DynamoDbGovernancePersistenceAdapter()
+        for item in dynamodb_adapter._scan_items():
+            if item.get("record_type") != "request":
+                continue
+            if tenant_id is not None and item.get("tenant_id") != tenant_id:
+                continue
+            request_id = item.get("id")
+            if not request_id or request_id in records:
+                continue
+            record = dynamodb_adapter._request_item_to_record(item)
+            if cutoff is not None and record.updated_at < cutoff:
+                continue
+            records[record.id] = record
+
+        return sorted(records.values(), key=lambda row: row.updated_at, reverse=True)
+
     def _parse_duration_to_hours(self, duration: str) -> float:
         if not duration:
             return 0.0
@@ -3581,6 +4324,38 @@ class GovernanceRepository:
                 stmt = stmt.where(EventStoreTable.event_type == event_type)
             rows = session.scalars(stmt.order_by(desc(EventStoreTable.occurred_at), desc(EventStoreTable.id))).all()
         records = [self._event_ledger_record_from_row(row) for row in rows]
+        if event_type in {None, "request.event_recorded"}:
+            from app.persistence.dynamodb_governance_adapter import DynamoDbGovernancePersistenceAdapter
+
+            dynamodb_adapter = DynamoDbGovernancePersistenceAdapter()
+            dynamo_items = [
+                item
+                for item in dynamodb_adapter._scan_items()
+                if item.get("record_type") == "request_event" and item.get("tenant_id") == tenant_id
+            ]
+            if request_id:
+                dynamo_items = [item for item in dynamo_items if item.get("request_id") == request_id]
+            sql_request_event_keys = {
+                (
+                    row.request_id,
+                    row.actor,
+                    row.detail,
+                    (row.payload or {}).get("reason_or_evidence"),
+                )
+                for row in rows
+                if row.event_type == "request.event_recorded"
+            }
+            for item in dynamo_items:
+                dedupe_key = (
+                    item.get("request_id"),
+                    item.get("actor"),
+                    item.get("action"),
+                    item.get("reason_or_evidence"),
+                )
+                if dedupe_key in sql_request_event_keys:
+                    continue
+                records.append(self._event_ledger_record_from_request_event_item(item))
+        records = sorted(records, key=lambda row: row.occurred_at, reverse=True)
         return self._paginate(records, page, page_size)
 
     def list_event_outbox(
@@ -3657,7 +4432,13 @@ class GovernanceRepository:
 
     def submit_request(self, request_id: str, payload: SubmitRequest, tenant_id: str | None = None) -> RequestRecord:
         with SessionLocal() as session:
-            row = self._get_request_row(session, request_id)
+            row = session.get(RequestTable, request_id)
+            if row is None:
+                if tenant_id is None:
+                    raise StopIteration(request_id)
+                from app.persistence.dynamodb_governance_adapter import DynamoDbGovernancePersistenceAdapter
+
+                return DynamoDbGovernancePersistenceAdapter().submit_request(request_id, payload, tenant_id)
             self._ensure_request_tenant_access(row, tenant_id)
             template_row = session.scalars(
                 select(TemplateTable).where(
@@ -3714,7 +4495,13 @@ class GovernanceRepository:
 
     def amend_request(self, request_id: str, payload: AmendRequest, tenant_id: str | None = None) -> RequestRecord:
         with SessionLocal() as session:
-            row = self._get_request_row(session, request_id)
+            row = session.get(RequestTable, request_id)
+            if row is None:
+                if tenant_id is None:
+                    raise StopIteration(request_id)
+                from app.persistence.dynamodb_governance_adapter import DynamoDbGovernancePersistenceAdapter
+
+                return DynamoDbGovernancePersistenceAdapter().amend_request(request_id, payload, tenant_id)
             self._ensure_request_tenant_access(row, tenant_id)
             current_status = RequestStatus(row.status)
             if current_status not in self.AMENDABLE_STATUSES:
@@ -3744,7 +4531,13 @@ class GovernanceRepository:
 
     def cancel_request(self, request_id: str, payload: CancelRequest, tenant_id: str | None = None) -> RequestRecord:
         with SessionLocal() as session:
-            row = self._get_request_row(session, request_id)
+            row = session.get(RequestTable, request_id)
+            if row is None:
+                if tenant_id is None:
+                    raise StopIteration(request_id)
+                from app.persistence.dynamodb_governance_adapter import DynamoDbGovernancePersistenceAdapter
+
+                return DynamoDbGovernancePersistenceAdapter().cancel_request(request_id, payload, tenant_id)
             self._ensure_request_tenant_access(row, tenant_id)
             current_status = RequestStatus(row.status)
             if current_status not in self.CANCELABLE_STATUSES:
@@ -3766,7 +4559,13 @@ class GovernanceRepository:
 
     def transition_request(self, request_id: str, payload: TransitionRequest, tenant_id: str | None = None) -> RequestRecord:
         with SessionLocal() as session:
-            row = self._get_request_row(session, request_id)
+            row = session.get(RequestTable, request_id)
+            if row is None:
+                if tenant_id is None:
+                    raise StopIteration(request_id)
+                from app.persistence.dynamodb_governance_adapter import DynamoDbGovernancePersistenceAdapter
+
+                return DynamoDbGovernancePersistenceAdapter().transition_request(request_id, payload, tenant_id)
             self._ensure_request_tenant_access(row, tenant_id)
             current_status = RequestStatus(row.status)
             target_status = payload.target_status
@@ -3806,9 +4605,93 @@ class GovernanceRepository:
             session.refresh(row)
         return self._request_from_row(row)
 
+    def decide_instructional_workflow_stage(
+        self,
+        request_id: str,
+        payload: InstructionalWorkflowDecisionRequest,
+        tenant_id: str,
+    ) -> InstructionalWorkflowProjectionRecord:
+        with SessionLocal() as session:
+            row = session.get(RequestTable, request_id)
+            if row is None:
+                raise StopIteration(request_id)
+            self._ensure_request_tenant_access(row, tenant_id)
+            if not self._is_instructional_template(row.template_id):
+                raise ValueError(f"Request {request_id} is not an instructional governance request")
+            if row.status in {RequestStatus.CANCELED.value, RequestStatus.ARCHIVED.value, RequestStatus.COMPLETED.value}:
+                raise ValueError(f"Request {request_id} cannot accept instructional stage decisions from status {row.status}")
+
+            projection = self._build_instructional_projection_from_row(row, self.list_audit_entries(request_id, row.tenant_id))
+            if projection.current_stage_id is None:
+                raise ValueError(f"Request {request_id} does not have an active instructional review stage")
+            if projection.current_stage_id != payload.stage_id:
+                raise ValueError(
+                    f"Instructional stage decision must target the active stage {projection.current_stage_id.value}, not {payload.stage_id.value}"
+                )
+
+            current_status = RequestStatus(row.status)
+            stage_ids = self._instructional_stage_ids(row.template_id)
+            current_index = stage_ids.index(payload.stage_id)
+            is_final_stage = current_index == len(stage_ids) - 1
+
+            if payload.decision == InstructionalWorkflowDecision.REQUEST_CHANGES:
+                row.status = RequestStatus.CHANGES_REQUESTED.value
+                row.updated_at = datetime.now(timezone.utc)
+                row.updated_by = payload.actor_id
+                row.version += 1
+                self._append_event(
+                    session=session,
+                    request_id=request_id,
+                    actor=payload.actor_id,
+                    action=f"Instructional Stage Changes Requested: {payload.stage_id.value}",
+                    reason_or_evidence=payload.notes or "Instructional review requested changes",
+                )
+                if current_status != RequestStatus.CHANGES_REQUESTED:
+                    self._apply_transition_side_effects(session, row, current_status, RequestStatus.CHANGES_REQUESTED, payload.actor_id)
+                    self._append_event(
+                        session=session,
+                        request_id=request_id,
+                        actor=payload.actor_id,
+                        action=f"Transitioned to {RequestStatus.CHANGES_REQUESTED.value}",
+                        reason_or_evidence=payload.notes or "Instructional stage decision requested changes",
+                    )
+            else:
+                target_status = RequestStatus.APPROVED if is_final_stage else RequestStatus.UNDER_REVIEW
+                row.status = target_status.value
+                row.updated_at = datetime.now(timezone.utc)
+                row.updated_by = payload.actor_id
+                row.version += 1
+                self._append_event(
+                    session=session,
+                    request_id=request_id,
+                    actor=payload.actor_id,
+                    action=f"Instructional Stage Approved: {payload.stage_id.value}",
+                    reason_or_evidence=payload.notes or "Instructional review stage approved",
+                )
+                if current_status != target_status:
+                    self._apply_transition_side_effects(session, row, current_status, target_status, payload.actor_id)
+                    self._append_event(
+                        session=session,
+                        request_id=request_id,
+                        actor=payload.actor_id,
+                        action=f"Transitioned to {target_status.value}",
+                        reason_or_evidence=payload.notes or "Instructional stage decision recorded",
+                    )
+
+            session.commit()
+            session.refresh(row)
+
+        return self._build_instructional_projection_from_row(row, self.list_audit_entries(request_id, row.tenant_id))
+
     def clone_request(self, request_id: str, payload: CloneRequest, tenant_id: str | None = None) -> RequestRecord:
         with SessionLocal() as session:
-            source_row = self._get_request_row(session, request_id)
+            source_row = session.get(RequestTable, request_id)
+            if source_row is None:
+                if tenant_id is None:
+                    raise StopIteration(request_id)
+                from app.persistence.dynamodb_governance_adapter import DynamoDbGovernancePersistenceAdapter
+
+                return DynamoDbGovernancePersistenceAdapter().clone_request(request_id, payload, tenant_id)
             self._ensure_request_tenant_access(source_row, tenant_id)
             now = datetime.now(timezone.utc)
             next_id = self._next_request_id(session)
@@ -3866,8 +4749,15 @@ class GovernanceRepository:
 
     def supersede_request(self, request_id: str, payload: SupersedeRequest, tenant_id: str | None = None) -> RequestRecord:
         with SessionLocal() as session:
-            row = self._get_request_row(session, request_id)
-            replacement_row = self._get_request_row(session, payload.replacement_request_id)
+            row = session.get(RequestTable, request_id)
+            replacement_row = session.get(RequestTable, payload.replacement_request_id)
+            if row is None or replacement_row is None:
+                if tenant_id is None:
+                    missing_id = request_id if row is None else payload.replacement_request_id
+                    raise StopIteration(missing_id)
+                from app.persistence.dynamodb_governance_adapter import DynamoDbGovernancePersistenceAdapter
+
+                return DynamoDbGovernancePersistenceAdapter().supersede_request(request_id, payload, tenant_id)
             self._ensure_request_tenant_access(row, tenant_id)
             self._ensure_request_tenant_access(replacement_row, tenant_id)
             if replacement_row.id == row.id:
@@ -4060,6 +4950,16 @@ class GovernanceRepository:
             raise StopIteration(request_id)
         return row
 
+    def _get_request_record(self, session, request_id: str, tenant_id: str | None) -> RequestRecord:
+        request = get_request_state(request_id, tenant_id)
+        if request is not None:
+            return request
+        row = session.get(RequestTable, request_id)
+        if row is None:
+            raise StopIteration(request_id)
+        self._ensure_request_tenant_access(row, tenant_id)
+        return self._request_from_row(row)
+
     def _ensure_request_access(self, session, request_id: str, tenant_id: str | None) -> RequestTable:
         row = self._get_request_row(session, request_id)
         self._ensure_request_tenant_access(row, tenant_id)
@@ -4168,10 +5068,11 @@ class GovernanceRepository:
         return RequestRelationship(request_id=row.target_request_id, relationship_type=row.relationship_type)
 
     @staticmethod
-    def _review_queue_item_from_row(row: ReviewQueueTable, request_row: RequestTable | None) -> ReviewQueueItem:
+    def _review_queue_item_from_row(row: ReviewQueueTable, request_row: RequestTable | RequestRecord | None) -> ReviewQueueItem:
         blocking_status = row.blocking_status
         if not blocking_status and request_row is not None:
-            if request_row.status in {
+            request_status = request_row.status.value if hasattr(request_row.status, "value") else str(request_row.status)
+            if request_status in {
                 RequestStatus.APPROVED.value,
                 RequestStatus.PROMOTION_PENDING.value,
                 RequestStatus.PROMOTED.value,
@@ -4435,7 +5336,15 @@ class GovernanceRepository:
         )
         row.current_run_id = run_id
 
-    def _dispatch_run_to_runtime(self, session, request_row: RequestTable, run_id: str, dispatch_type: str, actor_id: str, force: bool = False) -> None:
+    def _dispatch_run_to_runtime(
+        self,
+        session,
+        request_row: RequestTable | RequestRecord,
+        run_id: str,
+        dispatch_type: str,
+        actor_id: str,
+        force: bool = False,
+    ) -> None:
         integration_row = session.scalars(
             select(IntegrationTable).where(
                 IntegrationTable.tenant_id == request_row.tenant_id,
@@ -4684,19 +5593,21 @@ class GovernanceRepository:
             )
         )
         if artifact_row is not None:
-            request_row = self._get_request_row(session, artifact_row.request_id)
-            event_store_service.append(
-                session,
-                tenant_id=request_row.tenant_id,
-                event_type="artifact.event_recorded",
-                aggregate_type="artifact",
-                aggregate_id=artifact_id,
-                request_id=request_row.id,
-                artifact_id=artifact_id,
-                actor=actor,
-                detail=action,
-                payload={"artifact_version_id": artifact_version_id, "message": detail},
-            )
+            request_row = session.get(RequestTable, artifact_row.request_id)
+            request = request_row and self._request_from_row(request_row) or get_request_state(artifact_row.request_id, None)
+            if request is not None:
+                event_store_service.append(
+                    session,
+                    tenant_id=request.tenant_id,
+                    event_type="artifact.event_recorded",
+                    aggregate_type="artifact",
+                    aggregate_id=artifact_id,
+                    request_id=request.id,
+                    artifact_id=artifact_id,
+                    actor=actor,
+                    detail=action,
+                    payload={"artifact_version_id": artifact_version_id, "message": detail},
+                )
 
     @staticmethod
     def _append_artifact_lineage(
@@ -4895,6 +5806,29 @@ class GovernanceRepository:
         )
 
     @staticmethod
+    def _event_ledger_record_from_request_event_item(item: dict) -> EventLedgerRecord:
+        event_id = str(item.get("event_id") or item.get("SK") or uuid4().hex)
+        synthetic_id = -int(event_id.replace("-", "")[:12], 16)
+        return EventLedgerRecord.model_validate(
+            {
+                "id": synthetic_id,
+                "tenant_id": item["tenant_id"],
+                "event_type": "request.event_recorded",
+                "aggregate_type": "request",
+                "aggregate_id": item["request_id"],
+                "request_id": item["request_id"],
+                "run_id": None,
+                "artifact_id": None,
+                "promotion_id": None,
+                "check_run_id": None,
+                "actor": item["actor"],
+                "detail": item["action"],
+                "payload": {"reason_or_evidence": item.get("reason_or_evidence")},
+                "occurred_at": item["timestamp"],
+            }
+        )
+
+    @staticmethod
     def _event_outbox_record_from_row(row: EventOutboxTable) -> EventOutboxRecord:
         return EventOutboxRecord.model_validate(
             {
@@ -4929,6 +5863,140 @@ class GovernanceRepository:
             return "anthropic"
         return None
 
+    @staticmethod
+    def _runtime_subtype_for_integration(row: IntegrationTable | None) -> str | None:
+        if row is None:
+            return None
+        configured = (row.settings or {}).get("runtime_subtype")
+        if isinstance(configured, str) and configured.strip():
+            return configured.strip().lower()
+        provider = (row.settings or {}).get("provider")
+        if isinstance(provider, str) and provider.strip().lower() == "sbcl-agent":
+            return "sbcl_agent"
+        return None
+
+    def _session_kind_for_integration(self, row: IntegrationTable | None) -> str:
+        return "stateful_runtime" if self._runtime_subtype_for_integration(row) == "sbcl_agent" else "interactive_agent"
+
+    def _governed_runtime_summary(
+        self,
+        row: AgentSessionTable,
+        integration_row: IntegrationTable | None,
+        bundle: ContextBundleRecord | None = None,
+    ) -> GovernedRuntimeSummary | None:
+        runtime_subtype = self._runtime_subtype_for_integration(integration_row)
+        if runtime_subtype != "sbcl_agent":
+            return None
+        contents = bundle.contents if bundle and isinstance(bundle.contents, dict) else {}
+        runtime_binding = contents.get("sbcl_agent_runtime", {}) if isinstance(contents.get("sbcl_agent_runtime", {}), dict) else {}
+        binding = contents.get("sbcl_agent_binding", {}) if isinstance(contents.get("sbcl_agent_binding", {}), dict) else {}
+        approvals = list(contents.get("sbcl_agent_approvals", [])) if isinstance(contents.get("sbcl_agent_approvals", []), list) else []
+        artifacts = list(contents.get("sbcl_agent_artifacts", [])) if isinstance(contents.get("sbcl_agent_artifacts", []), list) else []
+        external_bindings = list(contents.get("external_bindings", [])) if isinstance(contents.get("external_bindings", []), list) else []
+        return GovernedRuntimeSummary(
+            runtime_subtype=runtime_subtype,
+            session_kind=self._session_kind_for_integration(integration_row),
+            adapter_type="sbcl_agent_runtime",
+            environment_ref=runtime_binding.get("environment_id") or runtime_binding.get("environment_ref") or binding.get("environment_ref") or row.external_session_ref,
+            thread_ref=runtime_binding.get("active_thread_id") or runtime_binding.get("thread_ref") or f"thread:{row.id}",
+            turn_ref=runtime_binding.get("turn_ref") or f"turn:{row.id}:latest",
+            pending_approval_count=int(runtime_binding.get("pending_approval_count") or len(approvals) or (1 if row.status == "waiting_on_human" else 0)),
+            pending_artifact_count=int(runtime_binding.get("pending_artifact_count") or len(artifacts) or 0),
+            external_bindings=external_bindings,
+        )
+
+    def _sbcl_agent_dispatch_payload(
+        self,
+        row: AgentSessionTable,
+        integration_row: IntegrationTable,
+    ) -> dict:
+        return {
+            "request_id": row.request_id,
+            "run_id": row.id,
+            "integration_id": integration_row.id,
+            "actor_id": row.assigned_by,
+            "metadata": {
+                "tenant_id": row.tenant_id,
+                "projection_id": f"projection:{row.id}",
+                "agent_session_id": row.id,
+            },
+        }
+
+    def _ensure_sbcl_agent_environment_ref(
+        self,
+        row: AgentSessionTable,
+        integration_row: IntegrationTable | None,
+    ) -> str | None:
+        if self._runtime_subtype_for_integration(integration_row) != "sbcl_agent" or integration_row is None:
+            return row.external_session_ref
+        if row.external_session_ref:
+            return row.external_session_ref
+        default_ref = runtime_dispatch_service.sbcl_agent_environment_ref(row.request_id, row.id)
+        try:
+            response = runtime_dispatch_service.dispatch(integration_row, self._sbcl_agent_dispatch_payload(row, integration_row))
+            return str(response.get("external_reference") or default_ref)
+        except Exception:
+            return default_ref
+
+    def _sbcl_agent_bundle_state(
+        self,
+        row: AgentSessionTable,
+        integration_row: IntegrationTable | None,
+    ) -> dict:
+        environment_ref = self._ensure_sbcl_agent_environment_ref(row, integration_row)
+        fallback_runtime = {
+            "environment_ref": environment_ref,
+            "thread_ref": f"thread:{row.id}",
+            "turn_ref": f"turn:{row.id}:latest",
+            "pending_approval_count": 1 if row.status == "waiting_on_human" else 0,
+            "pending_artifact_count": 0,
+            "runtime_subtype": "sbcl_agent",
+            "session_kind": "stateful_runtime",
+        }
+        if not environment_ref:
+            return {"binding": {}, "governed_runtime": fallback_runtime, "approvals": [], "artifacts": [], "snapshot": {}, "warning": None}
+        try:
+            snapshot = runtime_dispatch_service.export_sbcl_agent_snapshot(environment_ref)
+            approvals = list(snapshot.get("approvals") or [])
+            artifacts = list(snapshot.get("artifacts") or [])
+            binding = dict(snapshot.get("binding") or {})
+            governed_runtime = dict(snapshot.get("governed_runtime") or {})
+            governed_runtime.setdefault("environment_ref", environment_ref)
+            governed_runtime.setdefault("thread_ref", snapshot.get("thread", {}).get("id") if isinstance(snapshot.get("thread"), dict) else None)
+            governed_runtime.setdefault("turn_ref", snapshot.get("turn", {}).get("id") if isinstance(snapshot.get("turn"), dict) else None)
+            governed_runtime["pending_approval_count"] = len(approvals)
+            governed_runtime["pending_artifact_count"] = len(artifacts)
+            return {
+                "binding": binding,
+                "governed_runtime": governed_runtime,
+                "approvals": approvals,
+                "artifacts": artifacts,
+                "snapshot": snapshot,
+                "warning": None,
+            }
+        except Exception as exc:
+            return {
+                "binding": {"environment_ref": environment_ref},
+                "governed_runtime": fallback_runtime,
+                "approvals": [],
+                "artifacts": [],
+                "snapshot": {},
+                "warning": f"Live sbcl-agent snapshot unavailable: {exc}",
+            }
+
+    @staticmethod
+    def _normalize_artifact_key(value: str) -> str:
+        normalized = re.sub(r"[^a-zA-Z0-9._-]+", "-", value).strip("-._")
+        return normalized or "artifact"
+
+    @staticmethod
+    def _artifact_import_defaults(payload: ImportAgentSessionArtifactRequest) -> dict:
+        return {
+            "status": "imported",
+            "review_state": "pending",
+            "promotion_relevant": payload.promotion_relevant,
+        }
+
     def _refresh_agent_session_context(
         self,
         request_id: str,
@@ -4938,6 +6006,7 @@ class GovernanceRepository:
         integration_row: IntegrationTable,
         collaboration_mode: str = "agent_assisted",
         agent_operating_profile: str = "general",
+        session_row: AgentSessionTable | None = None,
     ) -> ContextBundleRecord:
         bundle = context_bundle_service.assemble_bundle(
             request_id=request_id,
@@ -4975,14 +6044,42 @@ class GovernanceRepository:
         contents["available_tools"] = [tool.model_dump(mode="json") for tool in tools]
         contents["restricted_tools"] = [tool.model_dump(mode="json") for tool in restricted_tools]
         contents["degraded_tools"] = [tool.model_dump(mode="json") for tool in degraded_tools]
+        runtime_subtype = self._runtime_subtype_for_integration(integration_row)
+        session_kind = self._session_kind_for_integration(integration_row)
         contents["external_bindings"] = [
             {
                 "integration_id": integration_row.id,
                 "integration_name": integration_row.name,
                 "provider": self._provider_for_integration(integration_row),
                 "endpoint": integration_security_service.setting(integration_row, "base_url") or integration_row.endpoint,
+                "runtime_subtype": runtime_subtype,
+                "session_kind": session_kind,
             }
         ]
+        if runtime_subtype == "sbcl_agent":
+            active_session_row = session_row
+            if active_session_row is None:
+                with SessionLocal() as lookup_session:
+                    active_session_row = lookup_session.get(AgentSessionTable, session_id)
+            if active_session_row is not None:
+                live_state = self._sbcl_agent_bundle_state(active_session_row, integration_row)
+                contents["sbcl_agent_binding"] = live_state.get("binding") or {}
+                contents["sbcl_agent_runtime"] = live_state.get("governed_runtime") or {}
+                contents["sbcl_agent_approvals"] = live_state.get("approvals") or []
+                contents["sbcl_agent_artifacts"] = live_state.get("artifacts") or []
+                if live_state.get("snapshot"):
+                    contents["sbcl_agent_snapshot"] = live_state.get("snapshot")
+                if live_state.get("warning"):
+                    warnings = [*warnings, live_state["warning"]]
+            else:
+                contents["sbcl_agent_runtime"] = {
+                    "environment_ref": f"environment:{session_id}",
+                    "thread_ref": f"thread:{session_id}",
+                    "turn_ref": f"turn:{session_id}:latest",
+                    "pending_approval_count": 0,
+                    "pending_artifact_count": 0,
+                }
+            policy_scope["warnings"] = warnings
         with SessionLocal() as session:
             row = session.get(ContextBundleTable, scoped_bundle.id)
             if row is not None:
@@ -5037,6 +6134,27 @@ class GovernanceRepository:
                 "required_collaboration_mode": "agent_assisted",
             },
         ]
+        if self._runtime_subtype_for_integration(integration_row) == "sbcl_agent":
+            base_tools.extend([
+                {
+                    "name": "runtime.environment",
+                    "description": "Inspect projected sbcl-agent environment, thread, and turn bindings.",
+                    "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+                    "required_collaboration_mode": "agent_assisted",
+                },
+                {
+                    "name": "runtime.approvals",
+                    "description": "Inspect governed runtime approval checkpoints and resumable work.",
+                    "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+                    "required_collaboration_mode": "agent_assisted",
+                },
+                {
+                    "name": "runtime.artifacts",
+                    "description": "Inspect importable artifacts projected from sbcl-agent runtime work.",
+                    "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+                    "required_collaboration_mode": "agent_assisted",
+                },
+            ])
         discovered_tools = mcp_tool_registry.discover_tools(
             session_context={
                 "tenant_id": bundle.tenant_id,
@@ -5106,6 +6224,8 @@ class GovernanceRepository:
             warnings.append("Human-led mode sharply limits agent autonomy and MCP capability access.")
         if agent_operating_profile != "general":
             warnings.append(f"Agent operating profile '{agent_operating_profile}' is active for this session.")
+        if self._runtime_subtype_for_integration(integration_row) == "sbcl_agent":
+            warnings.append("This governed session is bound to a stateful sbcl-agent runtime and supports runtime resume/import workflows.")
         if not allowed_tool_names:
             warnings.append("No MCP capabilities are currently available for this session.")
         if degraded_tools:
@@ -5153,6 +6273,12 @@ class GovernanceRepository:
             return "Workflow timeline state is currently unavailable."
         if tool_name == "request.policy_context" and not request_data.get("policy_context"):
             return "No explicit policy context is currently attached to the request."
+        if tool_name == "runtime.environment" and not contents.get("sbcl_agent_runtime"):
+            return "No sbcl-agent runtime binding has been projected for this session yet."
+        if tool_name == "runtime.approvals" and not contents.get("sbcl_agent_runtime"):
+            return "Runtime checkpoint data is not currently available."
+        if tool_name == "runtime.artifacts" and not contents.get("sbcl_agent_runtime"):
+            return "No importable sbcl-agent artifact summaries are currently attached."
         return None
 
     @staticmethod
@@ -5175,6 +6301,10 @@ class GovernanceRepository:
             actions.append({"type": "restrict_tool", "tool_name": "request.relationships"})
         if integration_row.status != "connected":
             actions.append({"type": "restrict_tool", "tool_name": "request.timeline"})
+        if ((integration_row.settings or {}).get("runtime_subtype") or "").strip().lower() == "sbcl_agent" and collaboration_mode == "human_led":
+            actions.append({"type": "restrict_tool", "tool_name": "runtime.environment"})
+            actions.append({"type": "restrict_tool", "tool_name": "runtime.approvals"})
+            actions.append({"type": "restrict_tool", "tool_name": "runtime.artifacts"})
         return [{"actions": actions}] if actions else []
 
     def _validate_integration_configuration(self, integration_type: str, endpoint: str, settings_dict: dict | None) -> None:
@@ -5248,6 +6378,8 @@ class GovernanceRepository:
             collaboration_mode=row.collaboration_mode,
             agent_operating_profile=row.agent_operating_profile,
             provider=self._provider_for_integration(integration_row),
+            runtime_subtype=self._runtime_subtype_for_integration(integration_row),
+            session_kind=self._session_kind_for_integration(integration_row),
             status=row.status,
             awaiting_human=row.awaiting_human,
             summary=row.summary,
@@ -5256,6 +6388,7 @@ class GovernanceRepository:
             assigned_by=row.assigned_by,
             assigned_at=row.assigned_at.isoformat().replace("+00:00", "Z"),
             updated_at=row.updated_at.isoformat().replace("+00:00", "Z"),
+            governed_runtime=self._governed_runtime_summary(row, integration_row),
             latest_message=latest_message,
             message_count=len(ordered_messages),
         )

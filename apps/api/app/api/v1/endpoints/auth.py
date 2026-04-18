@@ -5,7 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import RedirectResponse
 
-from app.core.auth import decode_auth_code, dev_jwks_document, encode_access_token, encode_auth_code, encode_dev_jwks_token, get_principal
+from app.core.auth import auth_mode_supports_local, decode_auth_code, dev_jwks_document, encode_access_token, encode_auth_code, encode_dev_jwks_token, get_principal
 from app.core.config import settings
 from app.models.security import DevJwksTokenRequest, DevTokenExchangeRequest, DevTokenRequest, LocalLoginRequest, Principal, PrincipalRole, PublicOrganizationOption, PublicRegistrationRequest, PublicTeamOption, PublicTenantOption, RegistrationOptionsResponse, RegistrationSubmissionResponse, TokenResponse
 from app.services.governance_service import governance_service
@@ -20,7 +20,7 @@ def get_current_principal(principal: Annotated[Principal, Depends(get_principal)
 
 @router.post("/dev-token", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
 def issue_dev_token(payload: DevTokenRequest) -> TokenResponse:
-    if settings.app_env.lower() != "development" or not settings.allow_dev_token_issuance or settings.auth_mode.lower() != "local":
+    if settings.app_env.lower() != "development" or not settings.allow_dev_token_issuance or not auth_mode_supports_local():
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Development token issuance is disabled")
     return TokenResponse(
         access_token=encode_access_token(
@@ -63,7 +63,7 @@ def dev_authorize(
     tenant_id: str = Query(default="tenant_demo"),
     roles: list[PrincipalRole] = Query(default=[PrincipalRole.PLATFORM_ADMIN, PrincipalRole.OPERATOR, PrincipalRole.REVIEWER, PrincipalRole.SUBMITTER]),
 ) -> RedirectResponse:
-    if settings.app_env.lower() != "development" or not settings.allow_dev_token_issuance or settings.auth_mode.lower() != "local":
+    if settings.app_env.lower() != "development" or not settings.allow_dev_token_issuance or not auth_mode_supports_local():
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Development authorization is disabled")
     if redirect_uri not in {f"{origin}/login/callback" for origin in settings.cors_origins}:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Redirect URI is not allowed")
@@ -78,7 +78,7 @@ def dev_authorize(
 
 @router.post("/dev-exchange", response_model=TokenResponse, status_code=status.HTTP_200_OK)
 def exchange_dev_code(payload: DevTokenExchangeRequest) -> TokenResponse:
-    if settings.app_env.lower() != "development" or not settings.allow_dev_token_issuance or settings.auth_mode.lower() != "local":
+    if settings.app_env.lower() != "development" or not settings.allow_dev_token_issuance or not auth_mode_supports_local():
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Development token exchange is disabled")
     claims = decode_auth_code(payload.code)
     if claims.redirect_uri != payload.redirect_uri:
@@ -95,7 +95,7 @@ def exchange_dev_code(payload: DevTokenExchangeRequest) -> TokenResponse:
 
 @router.post("/local-login", response_model=TokenResponse, status_code=status.HTTP_200_OK)
 def local_login(payload: LocalLoginRequest) -> TokenResponse:
-    if settings.auth_mode.lower() != "local":
+    if not auth_mode_supports_local():
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Local credential login is disabled")
     try:
         principal = governance_service.authenticate_local_user(payload)

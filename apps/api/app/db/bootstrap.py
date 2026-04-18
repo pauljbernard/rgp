@@ -13,6 +13,10 @@ def _as_datetime(value):
     return value and __import__("datetime").datetime.fromisoformat(str(value).replace("Z", "+00:00"))
 
 
+def _column_payload(table_model, payload: dict):
+    return {key: value for key, value in payload.items() if key in table_model.__table__.columns}
+
+
 def initialize_database() -> None:
     inspector = inspect(engine)
     table_names = set(inspector.get_table_names())
@@ -23,9 +27,10 @@ def initialize_database() -> None:
         has_requests = session.scalar(select(func.count()).select_from(RequestTable)) if "requests" in set(inspector.get_table_names()) else 0
         if not has_requests:
             for request in seed_requests():
+                payload = _column_payload(RequestTable, request.model_dump(mode="python"))
                 session.add(
                     RequestTable(
-                        **request.model_dump(mode="python"),
+                        **payload,
                     )
                 )
 

@@ -16,7 +16,11 @@ class DeploymentService:
                 allow_http_loopback=settings.integration_allow_http_loopback,
             )
         if integration.endpoint.startswith("foundry://"):
-            base_url = (settings.deployment_adapter_base_url or settings.runtime_adapter_base_url or "http://localhost:8001/api/v1/runtime/mock").rstrip("/")
+            configured_base_url = integration_security_service.setting(integration, "base_url")
+            base_url = integration_security_service.normalize_runtime_mock_base_url(
+                configured_base_url,
+                fallback_url=settings.deployment_adapter_base_url or settings.runtime_adapter_base_url,
+            )
             base_url = integration_security_service.validate_outbound_target(
                 base_url,
                 allowed_hosts=settings.integration_deployment_allowed_hosts,

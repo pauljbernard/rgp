@@ -20,7 +20,7 @@ The original source specifications currently live in the repository root:
 - Web: Next.js, React, TypeScript, Tailwind CSS
 - API: FastAPI, Pydantic
 - Worker: Celery scaffold
-- Data: PostgreSQL, Redis
+- Data: PostgreSQL, Redis, DynamoDB Local (migration target)
 
 ## Repository Layout
 
@@ -59,7 +59,7 @@ cd ../worker && python3 -m venv .venv && source .venv/bin/activate && pip instal
 3. Start the API:
 
 ```bash
-cd apps/api && source .venv/bin/activate && uvicorn app.main:app --reload --port 8000
+cd apps/api && source .venv/bin/activate && uvicorn app.transport:get_asgi_app --factory --reload --port 8000
 ```
 
 4. Start the web app:
@@ -73,6 +73,26 @@ pnpm --filter @rgp/web dev
 ```bash
 docker compose -f infra/docker/docker-compose.yml up -d
 ```
+
+## DynamoDB Migration Slice
+
+The first active DynamoDB migration slice is template persistence.
+
+Local development defaults remain SQL-backed. To exercise the template slice against DynamoDB Local:
+
+```bash
+cd apps/api
+export PYTHONPATH=.
+export RGP_DYNAMODB_ENDPOINT_URL=http://localhost:8000
+export RGP_TEMPLATE_PERSISTENCE_BACKEND=dynamodb
+python -m app.persistence.dynamodb_bootstrap
+python ../../scripts/verify-template-dynamodb-parity.py
+```
+
+That path:
+- ensures the `rgp-governance` table exists
+- seeds the template slice into DynamoDB
+- compares template operations across SQL and DynamoDB adapters
 
 ## Current Scope
 

@@ -57,7 +57,7 @@ Start the API:
 ```bash
 cd apps/api
 source .venv/bin/activate
-uvicorn app.main:app --port 8001
+uvicorn app.transport:get_asgi_app --factory --port 8001
 ```
 
 Start the web app:

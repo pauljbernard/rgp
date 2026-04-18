@@ -24,17 +24,28 @@ def list_event_ledger(
     check_run_id: str | None = Query(default=None),
     event_type: str | None = Query(default=None),
 ):
-    return governance_service.list_event_ledger(
-        page=page,
-        page_size=page_size,
-        principal=principal,
-        request_id=request_id,
-        run_id=run_id,
-        artifact_id=artifact_id,
-        promotion_id=promotion_id,
-        check_run_id=check_run_id,
-        event_type=event_type,
-    )
+    try:
+        return governance_service.list_event_ledger(
+            page=page,
+            page_size=page_size,
+            principal=principal,
+            request_id=request_id,
+            run_id=run_id,
+            artifact_id=artifact_id,
+            promotion_id=promotion_id,
+            check_run_id=check_run_id,
+            event_type=event_type,
+        )
+    except StopIteration:
+        if run_id is not None:
+            raise HTTPException(status_code=404, detail="Run not found") from None
+        if artifact_id is not None:
+            raise HTTPException(status_code=404, detail="Artifact not found") from None
+        if promotion_id is not None:
+            raise HTTPException(status_code=404, detail="Promotion not found") from None
+        if check_run_id is not None:
+            raise HTTPException(status_code=404, detail="Check run not found") from None
+        raise HTTPException(status_code=404, detail="Request not found") from None
 
 
 @router.get("/outbox")
@@ -46,14 +57,17 @@ def list_event_outbox(
     status: str | None = Query(default=None),
     topic: str | None = Query(default=None),
 ):
-    return governance_service.list_event_outbox(
-        page=page,
-        page_size=page_size,
-        principal=principal,
-        request_id=request_id,
-        status=status,
-        topic=topic,
-    )
+    try:
+        return governance_service.list_event_outbox(
+            page=page,
+            page_size=page_size,
+            principal=principal,
+            request_id=request_id,
+            status=status,
+            topic=topic,
+        )
+    except StopIteration:
+        raise HTTPException(status_code=404, detail="Request not found") from None
 
 
 @router.get("/check-runs")
@@ -78,9 +92,6 @@ async def stream_check_runs(
                     rows = governance_service.list_promotion_check_runs(promotion_id or "", principal)
             except StopIteration:
                 yield "event: error\ndata: not_found\n\n"
-                break
-            except PermissionError:
-                yield "event: error\ndata: forbidden\n\n"
                 break
 
             payload = json.dumps([row.model_dump(mode="json") for row in rows], sort_keys=True)

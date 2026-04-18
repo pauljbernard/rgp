@@ -13,6 +13,7 @@ import threading
 from celery import Celery
 
 from app.core.config import settings
+from app.persistence import PromotionPersistencePort, SqlAlchemyPromotionAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -22,8 +23,9 @@ celery_async_app = Celery("rgp-async-dispatch", broker=settings.redis_url, backe
 class AsyncDispatchService:
     """Enqueues async tasks for promotion, workflow, and deployment operations."""
 
-    def __init__(self) -> None:
+    def __init__(self, promotion_store: PromotionPersistencePort) -> None:
         self._local_lock = threading.Lock()
+        self._promotion_store = promotion_store
 
     @property
     def _backend(self) -> str:
@@ -101,13 +103,11 @@ class AsyncDispatchService:
         logger.info("Started local thread for %s", task_id)
         return task_id
 
-    @staticmethod
-    def _execute_promotion_local(promotion_id: str, actor_id: str, tenant_id: str) -> None:
-        from app.repositories.governance_repository import governance_repository
+    def _execute_promotion_local(self, promotion_id: str, actor_id: str, tenant_id: str) -> None:
         from app.models.governance import PromotionActionRequest
 
         payload = PromotionActionRequest(actor_id=actor_id, action="execute", reason="Async promotion execution")
-        governance_repository.apply_promotion_action(promotion_id, payload, tenant_id)
+        self._promotion_store.apply_promotion_action(promotion_id, payload, tenant_id)
 
     @staticmethod
     def _advance_workflow_local(execution_id: str, actor_id: str) -> None:
@@ -134,4 +134,4 @@ class AsyncDispatchService:
         http_deployment_adapter.execute_deployment(payload)
 
 
-async_dispatch_service = AsyncDispatchService()
+async_dispatch_service = AsyncDispatchService(SqlAlchemyPromotionAdapter())

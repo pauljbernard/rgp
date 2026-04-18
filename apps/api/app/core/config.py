@@ -4,8 +4,16 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     app_env: str = "development"
     cors_origins: list[str] = ["http://localhost:3000"]
+    persistence_backend: str = "sqlalchemy"
+    request_persistence_backend: str = "sqlalchemy"
+    template_persistence_backend: str = "sqlalchemy"
     database_url: str = "postgresql+psycopg://rgp:rgp@localhost:5432/rgp"
     sqlite_fallback_url: str = "sqlite:///./rgp.db"
+    dynamodb_region: str = "us-east-1"
+    dynamodb_endpoint_url: str | None = None
+    dynamodb_governance_table: str = "rgp-governance"
+    dynamodb_idempotency_table: str = "rgp-idempotency"
+    dynamodb_consistent_reads: bool = False
     redis_url: str = "redis://localhost:6379/0"
     check_dispatch_backend: str = "local"
     auth_mode: str = "local"
@@ -15,11 +23,16 @@ class Settings(BaseSettings):
     auth_jwks_url: str | None = None
     auth_jwt_issuer: str | None = None
     auth_jwt_audience: str | None = None
+    auth_user_jwt_audience: str | None = None
+    auth_machine_jwt_audience: str | None = None
+    auth_trusted_machine_client_ids: list[str] = []
     runtime_callback_secret: str = "rgp-runtime-secret"
     runtime_callback_hmac_secret: str = "rgp-runtime-hmac-secret"
     runtime_callback_max_skew_seconds: int = 300
     runtime_adapter_base_url: str | None = None
     deployment_adapter_base_url: str | None = None
+    sbcl_agent_runtime_cli_path: str = "/Volumes/data/development/sbcl-agent/bin/sbcl-agent"
+    sbcl_agent_runtime_state_root: str = "/tmp/rgp-sbcl-agent-runtime"
     integration_secret_key: str | None = None
     integration_allow_http_loopback: bool = True
     integration_openai_allowed_hosts: list[str] = ["api.openai.com"]

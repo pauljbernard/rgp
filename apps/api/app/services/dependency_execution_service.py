@@ -6,11 +6,11 @@ whether a request can proceed to a target status given its dependency graph.
 
 from __future__ import annotations
 
-from app.db.models import RequestRelationshipTable, RequestTable
+from app.db.models import RequestRelationshipTable
 from app.db.session import SessionLocal
-from app.services.relationship_graph_service import relationship_graph_service
+from app.services.request_state_bridge import get_request_state
 
-_TERMINAL_STATUSES = {"completed", "cancelled"}
+_TERMINAL_STATUSES = {"completed", "cancelled", "canceled", "promoted"}
 _BLOCKING_TYPES = {"blocks", "depends_on"}
 
 
@@ -43,15 +43,11 @@ class DependencyExecutionService:
 
             blockers: list[str] = []
             for rel in inbound:
-                source = (
-                    session.query(RequestTable)
-                    .filter(
-                        RequestTable.id == rel.source_request_id,
-                        RequestTable.tenant_id == tenant_id,
-                    )
-                    .first()
-                )
-                if source and source.status not in _TERMINAL_STATUSES:
+                source = get_request_state(rel.source_request_id, tenant_id)
+                if source is None:
+                    continue
+                source_status = source.status.value if hasattr(source.status, "value") else str(source.status)
+                if source_status not in _TERMINAL_STATUSES:
                     blockers.append(source.id)
 
             return blockers

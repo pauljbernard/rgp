@@ -270,6 +270,73 @@ All substrate integrations SHALL be implemented through explicit adapter contrac
 
 
 
+2.5 Core Runtime Standard
+
+
+
+
+
+2.5.1 Canonical Runtime
+
+
+
+
+
+RGP SHALL converge on a serverless runtime model for canonical platform services.
+
+Canonical request-processing, governance, review, promotion, policy, and orchestration APIs SHALL be designed for Lambda-compatible execution rather than long-lived stateful application servers.
+
+
+
+
+
+2.5.2 Canonical Persistence
+
+
+
+
+
+RGP SHALL converge on DynamoDB as the canonical persistence substrate for governance state.
+
+Canonical request state, review state, promotion state, workflow state, audit state, policy state, and projection state SHALL be modeled around DynamoDB access patterns rather than relational schema-first design.
+
+Large artifacts MAY use dedicated object-storage substrates, but SHALL NOT redefine canonical governance semantics.
+
+
+
+
+
+2.5.3 Transitional Allowance
+
+
+
+
+
+Relational persistence and long-lived application servers MAY exist only as transitional implementation mechanisms during migration.
+
+Such transitional mechanisms SHALL NOT be treated as the target architecture and SHALL be reduced over time behind explicit adapter boundaries.
+
+
+
+
+
+2.5.4 New Work Constraint
+
+
+
+
+
+New platform work SHALL NOT deepen direct coupling between domain services and relational persistence.
+
+New persistence access SHALL be introduced through explicit persistence ports and adapters so that DynamoDB-backed implementations can replace relational implementations without redefining governance semantics.
+
+
+
+
+
+
+
+
 3. HOMOICONIC PRINCIPLE
 
 

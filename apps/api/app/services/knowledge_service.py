@@ -16,6 +16,7 @@ from app.models.knowledge import (
     KnowledgeVersionRecord,
 )
 from app.services.event_store_service import event_store_service
+from app.services.request_state_bridge import get_request_state
 
 
 class KnowledgeService:
@@ -245,6 +246,8 @@ class KnowledgeService:
         incorporate semantic similarity against the request context.
         """
         with SessionLocal() as session:
+            if get_request_state(request_id, tenant_id) is None:
+                raise StopIteration(request_id)
             rows = (
                 session.query(KnowledgeArtifactTable)
                 .filter(
@@ -273,11 +276,15 @@ class KnowledgeService:
                 .filter(KnowledgeArtifactTable.id == artifact_id)
                 .one()
             )
+            request = get_request_state(request_id, row.tenant_id)
+            if request is None:
+                raise StopIteration(request_id)
 
             provenance = list(row.provenance or [])
             provenance.append(
                 {
                     "request_id": request_id,
+                    "tenant_id": request.tenant_id,
                     "actor_id": actor_id,
                     "reused_at": now.isoformat(),
                 }

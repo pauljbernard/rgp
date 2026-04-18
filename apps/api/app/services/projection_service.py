@@ -10,10 +10,11 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from app.db.models import ArtifactTable, IntegrationTable, RequestTable, ProjectionMappingTable, ReconciliationLogTable
+from app.db.models import AgentSessionTable, ArtifactTable, IntegrationTable, ProjectionMappingTable, ReconciliationLogTable
 from app.db.session import SessionLocal
 from app.models.federation import ProjectionMappingRecord
 from app.services.projection_adapter_service import projection_adapter_service
+from app.services.request_state_bridge import get_request_state
 
 
 class ProjectionService:
@@ -40,6 +41,9 @@ class ProjectionService:
         projection_id = f"pm_{uuid.uuid4().hex[:12]}"
 
         with SessionLocal() as session:
+            canonical_snapshot = self._canonical_snapshot_from_session(session, entity_type, entity_id, tenant_id)
+            if not canonical_snapshot:
+                raise StopIteration(entity_id)
             integration = (
                 session.query(IntegrationTable)
                 .filter(
@@ -62,7 +66,6 @@ class ProjectionService:
                 last_projected_at=now,
                 last_synced_at=None,
             )
-            canonical_snapshot = self._canonical_snapshot_from_session(session, entity_type, entity_id, tenant_id)
             adapter = projection_adapter_service.resolve_adapter(integration)
             row.external_state = {
                 **adapter.project_entity(entity_type, entity_id, canonical_snapshot),
@@ -83,7 +86,7 @@ class ProjectionService:
             session.commit()
             session.refresh(row)
             record = self._record_from_row(row)
-            record.conflicts = self.detect_conflicts(record.id)
+            record.conflicts = self.detect_conflicts(record.id, record.tenant_id)
             return record
 
     # ------------------------------------------------------------------
@@ -91,7 +94,7 @@ class ProjectionService:
     # ------------------------------------------------------------------
 
     def sync_external_state(
-        self, projection_id: str
+        self, projection_id: str, tenant_id: str | None = None
     ) -> ProjectionMappingRecord:
         """Refresh the projection mapping with latest external state.
 
@@ -102,11 +105,7 @@ class ProjectionService:
         now = datetime.now(timezone.utc)
 
         with SessionLocal() as session:
-            row = (
-                session.query(ProjectionMappingTable)
-                .filter(ProjectionMappingTable.id == projection_id)
-                .one()
-            )
+            row = self._get_projection_row(session, projection_id, tenant_id)
             canonical_snapshot = self._canonical_snapshot(session, row)
             integration = (
                 session.query(IntegrationTable)
@@ -142,7 +141,7 @@ class ProjectionService:
             session.commit()
             session.refresh(row)
             record = self._record_from_row(row)
-            record.conflicts = self.detect_conflicts(record.id)
+            record.conflicts = self.detect_conflicts(record.id, record.tenant_id)
             return record
 
     def update_external_state(
@@ -151,14 +150,11 @@ class ProjectionService:
         external_status: str | None,
         external_title: str | None,
         external_ref: str | None,
+        tenant_id: str | None = None,
     ) -> ProjectionMappingRecord:
         now = datetime.now(timezone.utc)
         with SessionLocal() as session:
-            row = (
-                session.query(ProjectionMappingTable)
-                .filter(ProjectionMappingTable.id == projection_id)
-                .one()
-            )
+            row = self._get_projection_row(session, projection_id, tenant_id)
             row.external_state = {
                 **(row.external_state or {}),
                 **({"status": external_status} if external_status else {}),
@@ -186,14 +182,14 @@ class ProjectionService:
             session.commit()
             session.refresh(row)
             record = self._record_from_row(row)
-            record.conflicts = self.detect_conflicts(record.id)
+            record.conflicts = self.detect_conflicts(record.id, record.tenant_id)
             return record
 
     # ------------------------------------------------------------------
     # Conflict detection
     # ------------------------------------------------------------------
 
-    def detect_conflicts(self, projection_id: str) -> list[dict]:
+    def detect_conflicts(self, projection_id: str, tenant_id: str | None = None) -> list[dict]:
         """Detect conflicts between internal and external state.
 
         Returns a list of conflict dicts, each describing a field-level
@@ -201,11 +197,7 @@ class ProjectionService:
         empty list is returned.
         """
         with SessionLocal() as session:
-            row = (
-                session.query(ProjectionMappingTable)
-                .filter(ProjectionMappingTable.id == projection_id)
-                .one()
-            )
+            row = self._get_projection_row(session, projection_id, tenant_id)
 
             if row.external_state is None:
                 return []
@@ -269,39 +261,52 @@ class ProjectionService:
             records: list[ProjectionMappingRecord] = []
             for row in rows:
                 record = self._record_from_row(row)
-                record.conflicts = self.detect_conflicts(record.id)
+                record.conflicts = self.detect_conflicts(record.id, record.tenant_id)
                 records.append(record)
             return records
 
     @staticmethod
     def _canonical_snapshot_from_session(session, entity_type: str, entity_id: str, tenant_id: str) -> dict:
         if entity_type == "request":
-            request_row = (
-                session.query(RequestTable)
-                .filter(
-                    RequestTable.id == entity_id,
-                    RequestTable.tenant_id == tenant_id,
-                )
-                .first()
-            )
-            if request_row is not None:
+            request = get_request_state(entity_id, tenant_id)
+            if request is not None:
                 return {
-                    "status": request_row.status,
-                    "title": request_row.title,
+                    "id": request.id,
+                    "entity_type": entity_type,
+                    "status": request.status.value if hasattr(request.status, "value") else str(request.status),
+                    "title": request.title,
                 }
         if entity_type == "artifact":
             artifact_row = (
                 session.query(ArtifactTable)
-                .filter(
-                    ArtifactTable.id == entity_id,
-                    ArtifactTable.tenant_id == tenant_id,
-                )
+                .filter(ArtifactTable.id == entity_id)
                 .first()
             )
-            if artifact_row is not None:
+            if artifact_row is not None and get_request_state(artifact_row.request_id, tenant_id) is not None:
                 return {
+                    "id": artifact_row.id,
+                    "entity_type": entity_type,
                     "status": artifact_row.status,
                     "title": artifact_row.name,
+                }
+        if entity_type == "agent_session":
+            session_row = session.query(AgentSessionTable).filter(AgentSessionTable.id == entity_id, AgentSessionTable.tenant_id == tenant_id).first()
+            if session_row is not None:
+                return {
+                    "id": session_row.id,
+                    "entity_type": entity_type,
+                    "status": session_row.status,
+                    "title": session_row.agent_label,
+                    "session_status": session_row.status,
+                    "environment_ref": f"environment:{session_row.external_session_ref}" if session_row.external_session_ref else None,
+                    "thread_ref": f"thread:{session_row.id}",
+                    "turn_ref": f"turn:{session_row.id}:latest",
+                    "operation_count": 0,
+                    "artifact_count": 0,
+                    "governed_entities": [
+                        {"entity_type": name, "summary": f"Projected {name} summary"}
+                        for name in ["environment", "thread", "turn", "operation", "artifact"]
+                    ],
                 }
         return {}
 
@@ -362,6 +367,8 @@ class ProjectionService:
             return ["accept_internal", "accept_external", "reprovision"]
         if adapter_type in {"agent_projection", "openai_projection", "anthropic_projection", "microsoft_projection"}:
             return ["accept_internal", "accept_external", "resume_session"]
+        if adapter_type == "sbcl_agent_projection":
+            return ["accept_internal", "accept_external", "resume_runtime", "approve_runtime_checkpoint", "import_runtime_artifact"]
         return ["accept_internal", "accept_external", "merge"]
 
     @staticmethod
@@ -374,7 +381,39 @@ class ProjectionService:
             return "Use reprovision when governance-approved identity state must be reapplied to the external identity system."
         if adapter_type in {"agent_projection", "openai_projection", "anthropic_projection", "microsoft_projection"}:
             return "Use resume_session when the external agent session should be resumed under governed state."
+        if adapter_type == "sbcl_agent_projection":
+            return "Use resume_runtime or approve_runtime_checkpoint when governed sbcl-agent work should continue, and import_runtime_artifact when a runtime-produced artifact should become a first-class RGP artifact."
         return "Select the resolution action that best preserves canonical governance intent."
+
+    @staticmethod
+    def _get_projection_row(session, projection_id: str, tenant_id: str | None = None) -> ProjectionMappingTable:
+        row = (
+            session.query(ProjectionMappingTable)
+            .filter(ProjectionMappingTable.id == projection_id)
+            .one()
+        )
+        if tenant_id is None:
+            return row
+        if row.entity_type == "request":
+            request = get_request_state(row.entity_id, tenant_id)
+            if request is None or row.tenant_id != request.tenant_id:
+                raise StopIteration(projection_id)
+            return row
+        if row.entity_type == "artifact":
+            artifact_row = (
+                session.query(ArtifactTable)
+                .filter(ArtifactTable.id == row.entity_id)
+                .first()
+            )
+            if artifact_row is None:
+                raise StopIteration(projection_id)
+            request = get_request_state(artifact_row.request_id, tenant_id)
+            if request is None or row.tenant_id != request.tenant_id:
+                raise StopIteration(projection_id)
+            return row
+        if row.tenant_id != tenant_id:
+            raise StopIteration(projection_id)
+        return row
 
 
 projection_service = ProjectionService()

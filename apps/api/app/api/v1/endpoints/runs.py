@@ -22,7 +22,10 @@ def list_runs(
     federation: str | None = Query(default=None),
     principal: Annotated[Principal, Depends(get_principal)] = None,
 ) -> PaginatedResponse[RunRecord]:
-    return governance_service.list_runs(page, page_size, status, workflow, owner, request_id, federation, principal.tenant_id)
+    try:
+        return governance_service.list_runs(page, page_size, status, workflow, owner, request_id, federation, principal.tenant_id)
+    except StopIteration:
+        raise HTTPException(status_code=404, detail="Request not found") from None
 
 
 @router.get("/{run_id}", response_model=RunDetail)

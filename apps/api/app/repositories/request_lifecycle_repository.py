@@ -7,7 +7,13 @@ will be migrated here incrementally as the monolith is decomposed.
 from __future__ import annotations
 
 from app.models.common import PaginatedResponse
-from app.models.governance import AuditEntry, CheckRunRecord, RequestDetail
+from app.models.governance import (
+    AuditEntry,
+    CheckRunRecord,
+    InstructionalWorkflowDecisionRequest,
+    InstructionalWorkflowProjectionRecord,
+    RequestDetail,
+)
 from app.models.request import (
     AmendRequest,
     CancelRequest,
@@ -74,6 +80,35 @@ class RequestLifecycleRepository:
 
     def list_request_check_runs(self, request_id: str, tenant_id: str | None = None) -> list[CheckRunRecord]:
         return governance_repository.list_request_check_runs(request_id, tenant_id)
+
+    def list_instructional_workflow_projections(
+        self,
+        page: int,
+        page_size: int,
+        tenant_id: str | None = None,
+        flightos_content_entry_id: str | None = None,
+        template_id: str | None = None,
+        workflow_status: str | None = None,
+    ):
+        return governance_repository.list_instructional_workflow_projections(
+            page=page,
+            page_size=page_size,
+            tenant_id=tenant_id,
+            flightos_content_entry_id=flightos_content_entry_id,
+            template_id=template_id,
+            workflow_status=workflow_status,
+        )
+
+    def get_instructional_workflow_projection(self, request_id: str, tenant_id: str | None = None) -> InstructionalWorkflowProjectionRecord:
+        return governance_repository.get_instructional_workflow_projection(request_id, tenant_id)
+
+    def decide_instructional_workflow_stage(
+        self,
+        request_id: str,
+        payload: InstructionalWorkflowDecisionRequest,
+        tenant_id: str,
+    ) -> InstructionalWorkflowProjectionRecord:
+        return governance_repository.decide_instructional_workflow_stage(request_id, payload, tenant_id)
 
 
 request_lifecycle_repository = RequestLifecycleRepository()

@@ -11,6 +11,7 @@ from app.db.session import SessionLocal
 from app.models.governance import CheckRunStatus
 from app.services.event_store_service import event_store_service
 from app.services.policy_check_service import policy_check_service
+from app.services.request_state_bridge import get_request_state, record_request_event
 
 
 celery_dispatch_app = Celery("rgp-check-dispatch", broker=settings.redis_url, backend=settings.redis_url)
@@ -50,9 +51,10 @@ class CheckDispatchService:
         )
         session.add(check_run)
         session.flush()
+        request_tenant_id = self._request_tenant_id(session, request_id)
         event_store_service.append(
             session,
-            tenant_id=request_row.tenant_id if (request_row := session.get(RequestTable, request_id)) is not None else "tenant_demo",
+            tenant_id=request_tenant_id,
             event_type="check_run.enqueued",
             aggregate_type="check_run",
             aggregate_id=check_run.id,
@@ -93,9 +95,10 @@ class CheckDispatchService:
         )
         session.add(check_run)
         session.flush()
+        request_tenant_id = self._request_tenant_id(session, request_id)
         event_store_service.append(
             session,
-            tenant_id=request_row.tenant_id if (request_row := session.get(RequestTable, request_id)) is not None else "tenant_demo",
+            tenant_id=request_tenant_id,
             event_type="check_run.enqueued",
             aggregate_type="check_run",
             aggregate_id=check_run.id,
@@ -135,6 +138,16 @@ class CheckDispatchService:
             is not None
         )
 
+    @staticmethod
+    def _request_tenant_id(session, request_id: str) -> str:
+        request_row = session.get(RequestTable, request_id)
+        if request_row is not None:
+            return request_row.tenant_id
+        request_state = get_request_state(request_id, None)
+        if request_state is not None:
+            return request_state.tenant_id
+        raise StopIteration(request_id)
+
     def execute_check_run(self, check_run_id: str) -> None:
         with SessionLocal() as session:
             check_run = session.get(CheckRunTable, check_run_id)
@@ -146,11 +159,24 @@ class CheckDispatchService:
             check_run.started_at = datetime.now(timezone.utc)
             check_run.error_message = None
             request_row = session.get(RequestTable, check_run.request_id)
-            if request_row is None:
+            request_state = request_row or get_request_state(check_run.request_id, None)
+            if request_state is None:
                 raise StopIteration(check_run.request_id)
+            tenant_id = request_row.tenant_id if request_row is not None else request_state.tenant_id
+            dynamodb_adapter = None
+            if request_row is None and check_run.scope == "request":
+                from app.persistence.dynamodb_governance_adapter import DynamoDbGovernancePersistenceAdapter
+
+                dynamodb_adapter = DynamoDbGovernancePersistenceAdapter()
+                dynamodb_adapter._update_request_check_run_item(
+                    check_run.id,
+                    status=CheckRunStatus.RUNNING.value,
+                    worker_task_id=check_run.worker_task_id,
+                    started_at=check_run.started_at.isoformat().replace("+00:00", "Z") if check_run.started_at else None,
+                )
             event_store_service.append(
                 session,
-                tenant_id=request_row.tenant_id,
+                tenant_id=tenant_id,
                 event_type="check_run.started",
                 aggregate_type="check_run",
                 aggregate_id=check_run.id,
@@ -164,23 +190,24 @@ class CheckDispatchService:
             session.flush()
             try:
                 if check_run.scope == "request":
-                    policy_check_service.run_request_checks(session, request_row, check_run.enqueued_by)
-                    session.add(
-                        RequestEventTable(
-                            request_id=request_row.id,
-                            timestamp=datetime.now(timezone.utc),
-                            actor=check_run.enqueued_by,
-                            action="Request Checks Executed",
-                            object_type="request",
-                            object_id=request_row.id,
-                            reason_or_evidence=check_run.trigger_reason,
+                    policy_check_service.run_request_checks(session, request_state, check_run.enqueued_by)
+                    if request_row is not None:
+                        session.add(
+                            RequestEventTable(
+                                request_id=request_row.id,
+                                timestamp=datetime.now(timezone.utc),
+                                actor=check_run.enqueued_by,
+                                action="Request Checks Executed",
+                                object_type="request",
+                                object_id=request_row.id,
+                                reason_or_evidence=check_run.trigger_reason,
+                            )
                         )
-                    )
                 elif check_run.scope == "promotion":
                     promotion_row = session.get(PromotionTable, check_run.promotion_id)
                     if promotion_row is None:
                         raise StopIteration(check_run.promotion_id)
-                    policy_check_service.run_promotion_checks(session, request_row, promotion_row, check_run.enqueued_by)
+                    policy_check_service.run_promotion_checks(session, request_state, promotion_row, check_run.enqueued_by)
                     promotion_row.execution_readiness = policy_check_service.promotion_readiness_from_db(session, promotion_row)
                     history = list(promotion_row.promotion_history)
                     history.append(
@@ -197,7 +224,7 @@ class CheckDispatchService:
                 check_run.completed_at = datetime.now(timezone.utc)
                 event_store_service.append(
                     session,
-                    tenant_id=request_row.tenant_id,
+                    tenant_id=tenant_id,
                     event_type="check_run.completed",
                     aggregate_type="check_run",
                     aggregate_id=check_run.id,
@@ -209,18 +236,35 @@ class CheckDispatchService:
                     payload={"scope": check_run.scope},
                 )
                 session.commit()
+                if dynamodb_adapter is not None:
+                    dynamodb_adapter._update_request_check_run_item(
+                        check_run.id,
+                        status=CheckRunStatus.COMPLETED.value,
+                        worker_task_id=check_run.worker_task_id,
+                        started_at=check_run.started_at.isoformat().replace("+00:00", "Z") if check_run.started_at else None,
+                        completed_at=check_run.completed_at.isoformat().replace("+00:00", "Z"),
+                    )
+                if request_row is None and check_run.scope == "request":
+                    record_request_event(
+                        check_run.request_id,
+                        tenant_id,
+                        check_run.enqueued_by,
+                        "Request Checks Executed",
+                        check_run.trigger_reason,
+                    )
             except Exception as exc:
                 session.rollback()
                 failed = session.get(CheckRunTable, check_run_id)
                 request_row = session.get(RequestTable, check_run.request_id)
+                request_state = request_row or get_request_state(check_run.request_id, None)
                 if failed is not None:
                     failed.status = CheckRunStatus.FAILED.value
                     failed.error_message = str(exc)
                     failed.completed_at = datetime.now(timezone.utc)
-                    if request_row is not None:
+                    if request_state is not None:
                         event_store_service.append(
                             session,
-                            tenant_id=request_row.tenant_id,
+                            tenant_id=request_row.tenant_id if request_row is not None else request_state.tenant_id,
                             event_type="check_run.failed",
                             aggregate_type="check_run",
                             aggregate_id=failed.id,
@@ -232,6 +276,17 @@ class CheckDispatchService:
                             payload={"scope": failed.scope},
                         )
                     session.commit()
+                    if request_state is not None and request_row is None and failed.scope == "request":
+                        from app.persistence.dynamodb_governance_adapter import DynamoDbGovernancePersistenceAdapter
+
+                        DynamoDbGovernancePersistenceAdapter()._update_request_check_run_item(
+                            failed.id,
+                            status=CheckRunStatus.FAILED.value,
+                            worker_task_id=failed.worker_task_id,
+                            error_message=str(exc),
+                            started_at=failed.started_at.isoformat().replace("+00:00", "Z") if failed.started_at else None,
+                            completed_at=failed.completed_at.isoformat().replace("+00:00", "Z") if failed.completed_at else None,
+                        )
                 raise
 
     def _dispatch(self, session, check_run_id: str) -> None:
@@ -273,7 +328,13 @@ class CheckDispatchService:
     @staticmethod
     def _next_check_run_id(session) -> str:
         existing_ids = session.scalars(select(CheckRunTable.id)).all()
-        next_number = max((int(identifier.split("_")[1]) for identifier in existing_ids), default=0) + 1
+        numeric_suffixes = []
+        for identifier in existing_ids:
+            parts = identifier.split("_", 1)
+            if len(parts) != 2 or not parts[1].isdigit():
+                continue
+            numeric_suffixes.append(int(parts[1]))
+        next_number = max(numeric_suffixes, default=0) + 1
         return f"cr_{next_number:03d}"
 
 
