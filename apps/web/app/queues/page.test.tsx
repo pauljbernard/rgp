@@ -57,6 +57,40 @@ vi.mock("@/lib/server-api", () => ({
       breached_at: "2026-04-03T12:00:00Z",
     },
   ]),
+  listNodes: vi.fn(async () => [
+    {
+      id: "node_001",
+      readiness_state: "ready",
+      employment_model: "employee",
+      drain_state: "active",
+      trust_tier: "trusted",
+      current_load: 4,
+    },
+    {
+      id: "node_002",
+      readiness_state: "ready",
+      employment_model: "contractor",
+      drain_state: "active",
+      trust_tier: "elevated",
+      current_load: 1,
+    },
+    {
+      id: "node_003",
+      readiness_state: "attention_required",
+      employment_model: "employee",
+      drain_state: "active",
+      trust_tier: "standard",
+      current_load: 0,
+    },
+    {
+      id: "node_004",
+      readiness_state: "ready",
+      employment_model: "employee",
+      drain_state: "draining",
+      trust_tier: "restricted",
+      current_load: 2,
+    },
+  ]),
 }));
 
 describe("QueuesPage", () => {
@@ -76,5 +110,26 @@ describe("QueuesPage", () => {
     expect(screen.getByText("Create Escalation Rule")).toBeInTheDocument();
     expect(screen.getByText("Create SLA Definition")).toBeInTheDocument();
     expect(screen.getByText("Create Assignment Group")).toBeInTheDocument();
+    expect(screen.getByText("Attention Nodes")).toBeInTheDocument();
+    expect(screen.getByText("Saturated Employee Nodes")).toBeInTheDocument();
+    expect(screen.getByText("Trusted or Elevated Ready Nodes")).toBeInTheDocument();
+    expect(screen.getByText("Contractor Fallback Nodes")).toBeInTheDocument();
+  });
+
+  it("renders empty-state guidance when queue governance data is absent", async () => {
+    const serverApi = await import("@/lib/server-api");
+    vi.mocked(serverApi.listAssignmentGroups).mockResolvedValueOnce([]);
+    vi.mocked(serverApi.listSlaDefinitions).mockResolvedValueOnce([]);
+    vi.mocked(serverApi.listEscalationRules).mockResolvedValueOnce([]);
+    vi.mocked(serverApi.listSlaBreaches).mockResolvedValueOnce([]);
+    vi.mocked(serverApi.listNodes).mockResolvedValueOnce([]);
+
+    render(await QueuesPage());
+
+    expect(screen.getByText("No assignment groups are configured.")).toBeInTheDocument();
+    expect(screen.getByText("No SLA definitions are configured.")).toBeInTheDocument();
+    expect(screen.getByText("No escalation rules are configured.")).toBeInTheDocument();
+    expect(screen.getByText("No SLA breaches have been recorded.")).toBeInTheDocument();
+    expect(screen.getAllByText("0").length).toBeGreaterThan(4);
   });
 });
