@@ -974,6 +974,51 @@ class PerformanceMetricsServiceTest(unittest.TestCase):
         self.assertEqual(request_trend.period_start, "2026-04-02")
         self.assertEqual(request_trend.request_count, 2)
 
+    def test_record_api_request_rounds_duration_and_commits(self) -> None:
+        captured = {"added": None, "committed": False}
+
+        class DummySession:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def add(self, row):
+                captured["added"] = row
+
+            def commit(self):
+                captured["committed"] = True
+
+        with patch("app.services.performance_metrics_service.SessionLocal", return_value=DummySession()):
+            self.service.record_api_request(
+                tenant_id="tenant_demo",
+                route="/api/v1/requests",
+                method="GET",
+                status_code=202,
+                duration_ms=12.3456,
+                trace_id="trace-123",
+                span_id="span-456",
+                correlation_id="corr-789",
+            )
+
+        self.assertIsNotNone(captured["added"])
+        self.assertEqual(captured["added"].tenant_id, "tenant_demo")
+        self.assertEqual(captured["added"].route, "/api/v1/requests")
+        self.assertEqual(captured["added"].status_code, 202)
+        self.assertEqual(captured["added"].duration_ms, 12.35)
+        self.assertEqual(captured["added"].trace_id, "trace-123")
+        self.assertTrue(captured["committed"])
+
+    def test_paginate_clamps_requested_page_to_available_bounds(self) -> None:
+        first_page = self.service._paginate([1, 2, 3], page=0, page_size=2)
+        last_page = self.service._paginate([1, 2, 3], page=99, page_size=2)
+
+        self.assertEqual(first_page.page, 1)
+        self.assertEqual(first_page.items, [1, 2])
+        self.assertEqual(last_page.page, 2)
+        self.assertEqual(last_page.items, [3])
+
 
 class IntegrationSecurityServiceTest(unittest.TestCase):
     def test_prepare_and_sanitize_settings_masks_secrets(self) -> None:
